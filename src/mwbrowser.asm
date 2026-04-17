@@ -1838,6 +1838,8 @@ PrintFileContent:
     ld      [EmitCellAttr], a
     ld      [HtmlAlign], a
     ld      [HtmlDir], a
+    ld      [HtmlDefaultAlign], a
+    ld      [HtmlDefaultDir], a
     ; .txt files: enable <pre>-style whitespace preservation so LF/CR
     ; produce real newlines and spaces/tabs aren't collapsed.
     ld      a, [PlainTextMode]
@@ -2847,9 +2849,9 @@ LineDrawCells:
     or      a
     ret     z
 
-    ; Width in byte-cols = len * 2.
+    ; Width in byte-cols = len * 2 (each cell is 8 pixels = 2 byte-cols).
     add     a, a
-    ld      c, a                        ; C = width (byte-cols)
+    ld      c, a
 
     ld      a, [HtmlAlign]
     cp      1
@@ -2894,7 +2896,7 @@ LineDrawCells:
     cp      b
     ret     z
 
-    ; byteCol = startCol + i*2
+    ; byteCol = startCol + i * 2  (each cell is 2 byte-cols wide)
     ld      a, [LineStartCol]
     ld      c, a
     ld      a, [LineDrawI]
@@ -3546,9 +3548,45 @@ TagHead:
     ld      [HtmlInHead], a
     ret
 
+; <body> and <html>: both carry a document-level dir/align that every
+; block inherits. ApplyDocAttrs snaps any align=/dir= on the tag into the
+; "default" slots; block-tag closes (ResetBlockAttrs) then fall back to
+; those defaults instead of hard-coded LTR+left.
+TagHtml:
 TagBody:
+    ld      a, [HtmlIsClose]
+    or      a
+    ret     nz
+    call    ApplyDocAttrs
+    ; <body>-specific: leave head mode.
     xor     a
     ld      [HtmlInHead], a
+    ret
+
+; ApplyDocAttrs: lift HtmlNextAlign / HtmlNextDir (if set) into both the
+; live HtmlAlign/HtmlDir AND the "default" slots so descendant blocks
+; inherit them after each ResetBlockAttrs. dir="rtl" without an explicit
+; align= implies align=right at the document level too.
+ApplyDocAttrs:
+    ld      a, [HtmlNextDir]
+    cp      0xFF
+    jr      z, .dadAlign
+    ld      [HtmlDefaultDir], a
+    ld      [HtmlDir], a
+    or      a
+    jr      z, .dadAlign
+    ld      a, [HtmlNextAlign]
+    cp      0xFF
+    jr      nz, .dadAlign
+    ld      a, 1
+    ld      [HtmlDefaultAlign], a
+    ld      [HtmlAlign], a
+.dadAlign:
+    ld      a, [HtmlNextAlign]
+    cp      0xFF
+    ret     z
+    ld      [HtmlDefaultAlign], a
+    ld      [HtmlAlign], a
     ret
 
 TagTitle:
@@ -3561,6 +3599,11 @@ TagTitle:
 .close:
     xor     a
     ld      [HtmlInTitle], a
+    ; Shape any Arabic runs in the title buffer in place before it gets
+    ; drawn -- the title bar uses BIOS GRPPRT (raw glyph blit, no shaping)
+    ; so we substitute the correct joining forms now and reverse each run
+    ; so it reads right-to-left on screen.
+    call    ShapeTitleBuf
     ; NUL-terminate captured title and repaint the titlebar.
     ld      a, [HtmlTitleLen]
     ld      e, a
@@ -3575,6 +3618,296 @@ TagTitle:
 
 TagNoOp:
     ret
+
+; ShapeTitleBuf: rewrite HtmlTitleBuf so Arabic reads right-to-left via
+; DrawString (which feeds BIOS GRPPRT straight through, no shaping). We
+; swap each Arabic byte for its final joining-form glyph (initial / medial
+; / final / isolated chosen from in-word logical neighbours -- spaces
+; break joining) and then reverse the whole buffer in place. Bails out
+; when the title has no Arabic letter at all (pure ASCII, chrome strings).
+ShapeTitleBuf:
+    ld      a, [HtmlTitleLen]
+    or      a
+    ret     z
+    ; Quick scan: return immediately if no Arabic letter is present.
+    ld      b, a
+    ld      hl, HtmlTitleBuf
+.stQuick:
+    ld      a, [hl]
+    cp      0x80
+    jr      c, .stQuickNext
+    push    hl
+    push    bc
+    sub     0x80
+    ld      e, a
+    ld      d, 0
+    ld      hl, IsoJoin
+    add     hl, de
+    ld      a, [hl]
+    pop     bc
+    pop     hl
+    and     IS_ARABIC
+    jr      nz, .stShape
+.stQuickNext:
+    inc     hl
+    djnz    .stQuick
+    ret                                 ; no Arabic -> leave raw bytes
+
+.stShape:
+    ld      a, [HtmlTitleLen]
+    ld      [TsN], a
+    ; Pass 1: shape every byte, WRITING into TitleShapedBuf so that each
+    ; shape decision sees the ORIGINAL (unshaped) neighbour bytes in
+    ; HtmlTitleBuf. If we wrote back in place, shaped glyphs (font codes
+    ; with IsoJoin=0) would look non-Arabic to later shape calls and
+    ; break middle/end detection for the rest of the word.
+    xor     a
+    ld      [TsI], a
+.stShapeLoop:
+    ld      a, [TsI]
+    ld      b, a
+    ld      a, [TsN]
+    cp      b
+    jr      z, .stCopyBack
+    call    ShapeTitleByte
+    ld      a, [TsI]
+    inc     a
+    ld      [TsI], a
+    jr      .stShapeLoop
+
+.stCopyBack:
+    ; Pass 2: TitleShapedBuf -> HtmlTitleBuf.
+    ld      a, [TsN]
+    or      a
+    jr      z, .stReverse
+    ld      b, a
+    ld      hl, TitleShapedBuf
+    ld      de, HtmlTitleBuf
+.stCopy:
+    ld      a, [hl]
+    ld      [de], a
+    inc     hl
+    inc     de
+    djnz    .stCopy
+
+.stReverse:
+    xor     a
+    ld      [TsI], a
+    ld      a, [TsN]
+    dec     a
+    ld      [TsJ], a
+.stRevLoop:
+    ld      a, [TsI]
+    ld      b, a
+    ld      a, [TsJ]
+    cp      b
+    ret     c
+    ret     z
+    ld      a, [TsI]
+    call    GetTitleByte
+    ld      [TsTemp], a
+    ld      a, [TsJ]
+    call    GetTitleByte
+    ld      c, a
+    ld      a, [TsI]
+    call    SetTitleByte
+    ld      a, [TsTemp]
+    ld      c, a
+    ld      a, [TsJ]
+    call    SetTitleByte
+    ld      a, [TsI]
+    inc     a
+    ld      [TsI], a
+    ld      a, [TsJ]
+    dec     a
+    ld      [TsJ], a
+    jr      .stRevLoop
+
+; ShapeTitleByte: if HtmlTitleBuf[TsI] is an Arabic letter, pick its joining
+; form by peeking the raw (not-yet-shaped) neighbours in the same word (a
+; space at [TsI-1] or [TsI+1] or a run edge kills the joining) and write
+; the final glyph back. Non-Arabic bytes are left as-is.
+ShapeTitleByte:
+    ld      a, [TsI]
+    call    GetTitleByte
+    ; First: copy the raw byte through to TitleShapedBuf. ShapeTitleByte's
+    ; later path overwrites this for Arabic bytes; non-Arabic bytes and
+    ; spaces land here unchanged.
+    ld      c, a
+    ld      a, [TsI]
+    call    SetShapedByte
+    ld      a, c
+    cp      0x80
+    ret     c                           ; ASCII: leave raw
+    sub     0x80
+    ld      hl, IsoJoin
+    ld      e, a
+    ld      d, 0
+    add     hl, de
+    ld      a, [hl]
+    ld      [TsCurFlags], a
+    and     IS_ARABIC
+    ret     z                           ; upper-ISO non-Arabic: leave
+
+    xor     a
+    ld      [TsConn], a
+
+    ; --- Prev neighbour ---
+    ld      a, [TsI]
+    or      a
+    jr      z, .stbNoPrev
+    ld      a, [TsCurFlags]
+    and     JOIN_RIGHT
+    jr      z, .stbNoPrev
+    ld      a, [TsI]
+    dec     a
+    call    GetTitleByte
+    cp      0x80
+    jr      c, .stbNoPrev               ; ASCII or space
+    sub     0x80
+    ld      hl, IsoJoin
+    ld      e, a
+    ld      d, 0
+    add     hl, de
+    ld      a, [hl]
+    ld      b, a
+    and     IS_ARABIC
+    jr      z, .stbNoPrev
+    ld      a, b
+    and     JOIN_LEFT
+    jr      z, .stbNoPrev
+    ld      a, [TsConn]
+    or      0x10                        ; SHAPE_MASK_PREV
+    ld      [TsConn], a
+.stbNoPrev:
+
+    ; --- Next neighbour ---
+    ld      a, [TsI]
+    inc     a
+    ld      b, a
+    ld      a, [TsN]
+    cp      b
+    jr      c, .stbNoNext
+    jr      z, .stbNoNext
+    ld      a, [TsCurFlags]
+    and     JOIN_LEFT
+    jr      z, .stbNoNext
+    ld      a, [TsI]
+    inc     a
+    call    GetTitleByte
+    cp      0x80
+    jr      c, .stbNoNext
+    sub     0x80
+    ld      hl, IsoJoin
+    ld      e, a
+    ld      d, 0
+    add     hl, de
+    ld      a, [hl]
+    ld      b, a
+    and     IS_ARABIC
+    jr      z, .stbNoNext
+    ld      a, b
+    and     JOIN_RIGHT
+    jr      z, .stbNoNext
+    ld      a, [TsConn]
+    or      0x20                        ; SHAPE_MASK_NEXT
+    ld      [TsConn], a
+.stbNoNext:
+
+    ; --- Connect mask -> form ---
+    ld      a, [TsConn]
+    cp      0x30
+    jr      z, .stbFMid
+    cp      0x10
+    jr      z, .stbFEnd
+    cp      0x20
+    jr      z, .stbFIni
+    xor     a
+    jr      .stbHaveForm
+.stbFEnd:
+    ld      a, 1
+    jr      .stbHaveForm
+.stbFIni:
+    ld      a, 2
+    jr      .stbHaveForm
+.stbFMid:
+    ld      a, 3
+.stbHaveForm:
+    ; Glyph = IsoMap[(byte-0x80)*4 + form]
+    ld      e, a
+    ld      a, c
+    sub     0x80
+    ld      h, 0
+    ld      l, a
+    add     hl, hl
+    add     hl, hl
+    ld      a, e
+    ld      d, 0
+    ld      e, a
+    add     hl, de
+    ld      de, IsoMap
+    add     hl, de
+    ld      a, [hl]
+    ld      c, a
+    ld      a, [TsI]
+    call    SetShapedByte
+    ret
+
+; SetShapedByte: A(in) = index, C = value. Writes TitleShapedBuf[A] = C.
+SetShapedByte:
+    push    hl
+    push    de
+    push    bc
+    ld      e, a
+    ld      d, 0
+    ld      hl, TitleShapedBuf
+    add     hl, de
+    ld      a, c
+    ld      [hl], a
+    pop     bc
+    pop     de
+    pop     hl
+    ret
+
+; GetTitleByte: A(in) = index -> A = HtmlTitleBuf[index]. Preserves BC,DE,HL.
+GetTitleByte:
+    push    hl
+    push    de
+    ld      e, a
+    ld      d, 0
+    ld      hl, HtmlTitleBuf
+    add     hl, de
+    ld      a, [hl]
+    pop     de
+    pop     hl
+    ret
+
+; SetTitleByte: A(in) = index, C = value. Writes buf[A] = C. Preserves all.
+SetTitleByte:
+    push    hl
+    push    de
+    push    bc
+    ld      e, a
+    ld      d, 0
+    ld      hl, HtmlTitleBuf
+    add     hl, de
+    ld      a, c
+    ld      [hl], a
+    pop     bc
+    pop     de
+    pop     hl
+    ret
+
+TsI:            db 0
+TsJ:            db 0
+TsN:            db 0
+TsTemp:         db 0
+TsCurFlags:     db 0
+TsConn:         db 0
+; Pass-1 scratch for ShapeTitleBuf: shaped glyphs land here so pass-2 can
+; copy them back while pass 1 still reads the ORIGINAL title bytes for
+; prev/next joining context. Size must match HtmlTitleBuf (TITLE_BUF_MAX).
+TitleShapedBuf: ds TITLE_BUF_MAX + 1
 
 ; <ul>: bullet list. Open indents by 16 px and switches bullet style.
 ; Close restores. No nesting state beyond a single level.
@@ -4057,11 +4390,13 @@ ApplyBlockAttrs:
     ld      [HtmlAlign], a
     ret
 
-; ResetBlockAttrs: clear alignment/dir at block-tag close so the next
-; block starts with defaults.
+; ResetBlockAttrs: on close, fall back to the document-level defaults set
+; by <html>/<body> (typically 0 = LTR + left-align, but dir="rtl" on the
+; root element propagates via HtmlDefaultDir/HtmlDefaultAlign).
 ResetBlockAttrs:
-    xor     a
+    ld      a, [HtmlDefaultAlign]
     ld      [HtmlAlign], a
+    ld      a, [HtmlDefaultDir]
     ld      [HtmlDir], a
     ret
 
@@ -4322,7 +4657,7 @@ TagTbl:
     db  "TITLE", 0
     dw  TagTitle
     db  "HTML", 0
-    dw  TagNoOp
+    dw  TagHtml
     db  "P", 0
     dw  TagP
     db  "BR", 0
@@ -5492,7 +5827,7 @@ DrawAboutPopup:
     ld      c, ABOUT_Y
     ld      d, ABOUT_W / 4
     ld      e, ABOUT_H
-    ld      a, COL_WHITE
+    ld      a, COL_LGRAY
     call    FillRect
 
     ld      b, ABOUT_X / 4
@@ -5502,9 +5837,9 @@ DrawAboutPopup:
     ld      a, COL_BLACK
     call    DrawRectBorder
 
-    ; Black-on-white body text (we're on the content area which is white).
+    ; Black-on-lgray body text so it blends with the popup fill.
     ld      a, COL_BLACK
-    ld      l, COL_WHITE
+    ld      l, COL_LGRAY
     call    SetTextColours
 
     ld      de, ABOUT_X + 8
@@ -5624,7 +5959,16 @@ UrlInit:        db 0                    ; address bar starts empty
 
 AboutTitleMsg:  db "About", 0
 AboutLine1:     db "MSX WBrowser", 0
-AboutLine2:     db "MSX2 Screen 6 HTML browser.", 0
+; AboutLine2: pre-shaped + BiDi-resolved "متصفح إنترنت لأجهزة MSX2" for an
+; RTL paragraph. Each Arabic byte is already the final MSX font glyph code
+; (logical letters passed through the joining-form shaper, lam+alef-hamza
+; fused to F4=>ED ligature, whole Arabic run reversed, then the LTR "MSX2"
+; re-reversed back to natural order per UAX#9 L2). This skips the runtime
+; shaping cost that the <title> and body text pay per render.
+AboutLine2:     db 0x4D, 0x53, 0x58, 0x32, 0x20
+                db 0xE4, 0xE8, 0xD2, 0xA9, 0xED, 0x20
+                db 0xA6, 0xD0, 0xE7, 0xA5, 0xD0, 0xE0, 0x20
+                db 0xAC, 0xC6, 0xB3, 0xA5, 0xCE, 0
 AboutLine3:     db "github.com/techana/mwbrowser", 0
 AboutLine4:     db "F1 shows this dialog.", 0
 AboutLine5:     db "Esc closes / quits.", 0
@@ -5784,6 +6128,8 @@ LineAttr:       ds LINE_BUF_MAX
 EmitCellAttr:   db 0                    ; attr byte EmitRaw applies to next cell
 HtmlAlign:      db 0                    ; 0=left, 1=right, 2=center
 HtmlDir:        db 0                    ; 0=LTR paragraph, 1=RTL paragraph
+HtmlDefaultAlign: db 0                  ; inherited default (set by <html>/<body>)
+HtmlDefaultDir:   db 0                  ; inherited default (set by <html>/<body>)
 HtmlNextAlign:  db 0xFF                 ; scratch: align= parsed on current tag (0xFF = unset)
 HtmlNextDir:    db 0xFF                 ; scratch: dir= parsed on current tag
 
