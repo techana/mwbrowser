@@ -1835,9 +1835,14 @@ PrintFileContent:
     ld      [LinkCount], a
     ld      [LineLen], a                ; drop any cells left from previous render
     ld      [ArLen], a
+    ld      a, 0xFF
+    ld      [LineLastSpace], a
+    xor     a
     ld      [EmitCellAttr], a
     ld      [HtmlAlign], a
     ld      [HtmlDir], a
+    ld      [HtmlDefaultAlign], a
+    ld      [HtmlDefaultDir], a
     ; .txt files: enable <pre>-style whitespace preservation so LF/CR
     ; produce real newlines and spaces/tabs aren't collapsed.
     ld      a, [PlainTextMode]
@@ -2077,18 +2082,9 @@ EmitSink:
     ld      a, b
     jp      EmitIsoByte                 ; canvas: shape + mirror per-word
 .toTitle:
-    ; Title: flat ISO->isolated glyph lookup (no shaping/mirroring).
+    ; Title: store the raw ISO byte verbatim. PrepTitleDraw picks joining
+    ; forms and reverses the buffer at render time.
     ld      a, b
-    cp      0x80
-    jp      c, TitleAppend
-    sub     0x80
-    ld      h, 0
-    ld      l, a
-    add     hl, hl
-    add     hl, hl                      ; *4
-    ld      de, IsoMap
-    add     hl, de
-    ld      a, [hl]
     jp      TitleAppend
 
 ; ----------------------------------------------------------------------------
@@ -2407,14 +2403,17 @@ EmitRaw:
     or      a
     jr      nz, .done                   ; suppressed: no buffer, no wrap, no advance
 
-    ; Wrap: if TextX > CONTENT_X_END - 6, newline (flushes buffer) then retry.
+    ; Wrap: if TextX > CONTENT_X_END - 6, break at the most-recent space on
+    ; the current line (SmartWrap), carrying the trailing word over to the
+    ; next line. Falls back to a hard mid-word wrap when no space is on the
+    ; line yet (a single word longer than the canvas width).
     ld      hl, [TextX]
     ld      de, CONTENT_X_END - 6
     and     a
     sbc     hl, de
     jr      c, .posOk
     push    bc
-    call    EmitNewline                 ; flushes line + advances TextY
+    call    SmartWrap
     pop     bc
 .posOk:
 
@@ -2454,6 +2453,14 @@ EmitRaw:
     ld      c, a
 .storeAttr:
     ld      [hl], c
+    ; Track last-space position for SmartWrap. B = glyph, the new cell's
+    ; index is the current LineLen (before it's bumped below).
+    ld      a, b
+    cp      0x20
+    jr      nz, .notSpace
+    ld      a, [LineLen]
+    ld      [LineLastSpace], a
+.notSpace:
     ld      a, [LineLen]
     inc     a
     ld      [LineLen], a
@@ -2847,9 +2854,9 @@ LineDrawCells:
     or      a
     ret     z
 
-    ; Width in byte-cols = len * 2.
+    ; Width in byte-cols = len * 2 (each cell is 8 pixels = 2 byte-cols).
     add     a, a
-    ld      c, a                        ; C = width (byte-cols)
+    ld      c, a
 
     ld      a, [HtmlAlign]
     cp      1
@@ -2894,7 +2901,7 @@ LineDrawCells:
     cp      b
     ret     z
 
-    ; byteCol = startCol + i*2
+    ; byteCol = startCol + i * 2  (each cell is 2 byte-cols wide)
     ld      a, [LineStartCol]
     ld      c, a
     ld      a, [LineDrawI]
@@ -2920,6 +2927,106 @@ LineDrawCells:
 LineStartCol:   db 0
 LineDrawI:      db 0
 
+; SmartWrap: called from EmitRaw when the next glyph wouldn't fit on the
+; current line. If LineLastSpace marks a space on the current line, stash
+; the trailing word (cells after that space) in TailGlyph/TailAttr, drop
+; the space itself from LineBuf, then EmitNewline to flush+advance, then
+; re-emit the stashed word onto the new line. If no space is on the line
+; (a single word longer than the canvas), fall back to a hard wrap and
+; just EmitNewline at the current position.
+SmartWrap:
+    ld      a, [LineLastSpace]
+    cp      0xFF
+    jp      z, EmitNewline              ; hard wrap: no space on this line
+
+    ; B = space index
+    ld      b, a
+    ; A = tail length = LineLen - B - 1
+    ld      a, [LineLen]
+    sub     b
+    dec     a
+    ld      [TailLen], a
+    jr      z, .flush                   ; nothing after the space: just wrap
+
+    ; Copy LineGlyph[B+1 .. LineLen-1] into TailGlyph.
+    push    bc
+    ld      c, a                        ; C = tail length
+    ld      a, b
+    inc     a                           ; source start index = B + 1
+    ld      e, a
+    ld      d, 0
+    ld      hl, LineGlyph
+    add     hl, de
+    ld      de, TailGlyph
+    ld      b, c
+.cg:
+    ld      a, [hl]
+    ld      [de], a
+    inc     hl
+    inc     de
+    djnz    .cg
+    pop     bc
+
+    ; Copy LineAttr[B+1 .. LineLen-1] into TailAttr.
+    push    bc
+    ld      a, [TailLen]
+    ld      c, a
+    ld      a, b
+    inc     a
+    ld      e, a
+    ld      d, 0
+    ld      hl, LineAttr
+    add     hl, de
+    ld      de, TailAttr
+    ld      b, c
+.ca:
+    ld      a, [hl]
+    ld      [de], a
+    inc     hl
+    inc     de
+    djnz    .ca
+    pop     bc
+
+.flush:
+    ; Truncate LineLen to drop the trailing space + the tail (we'll re-emit
+    ; the tail on the next line). B still holds the space index.
+    ld      a, b
+    ld      [LineLen], a
+    call    EmitNewline                 ; flush short line + advance + reset LineLastSpace
+
+    ; Re-emit stashed tail cells onto the new line via EmitRaw so wrap +
+    ; TextX advance behave normally. Stash EmitCellAttr around the loop in
+    ; case the caller was mid-way through setting a new cell's attr.
+    ld      a, [TailLen]
+    or      a
+    ret     z
+    ld      a, [EmitCellAttr]
+    ld      [SmartWrapSavedAttr], a
+    ld      a, [TailLen]
+    ld      b, a                        ; B = tail count
+    ld      c, 0                        ; C = tail index
+.re:
+    push    bc
+    ld      d, 0
+    ld      e, c
+    ld      hl, TailAttr
+    add     hl, de
+    ld      a, [hl]
+    ld      [EmitCellAttr], a
+    ld      hl, TailGlyph
+    add     hl, de
+    ld      a, [hl]
+    call    EmitRaw
+    pop     bc
+    inc     c
+    dec     b
+    jr      nz, .re
+    ld      a, [SmartWrapSavedAttr]
+    ld      [EmitCellAttr], a
+    ret
+
+SmartWrapSavedAttr: db 0
+
 ; EmitNewline: start a new rendered line. We always bump the line counter
 ; (for the scrollbar); we only advance TextY after the skip quota for
 ; scrolling is exhausted. TextY clamps at the bottom so further emissions
@@ -2932,6 +3039,10 @@ EmitNewline:
     ; EmitRaw wrap path.
     call    ArFlush
     call    LineFlush
+    push    af
+    ld      a, 0xFF
+    ld      [LineLastSpace], a
+    pop     af
     ; Count this rendered line in units of 8-pixel rows so H1/H2 (scale 2)
     ; contribute 2. This keeps scroll-by-page math in sync with actual VRAM
     ; pixels -- otherwise a page of scaled headings would scroll more than
@@ -3546,9 +3657,45 @@ TagHead:
     ld      [HtmlInHead], a
     ret
 
+; <body> and <html>: both carry a document-level dir/align that every
+; block inherits. ApplyDocAttrs snaps any align=/dir= on the tag into the
+; "default" slots; block-tag closes (ResetBlockAttrs) then fall back to
+; those defaults instead of hard-coded LTR+left.
+TagHtml:
 TagBody:
+    ld      a, [HtmlIsClose]
+    or      a
+    ret     nz
+    call    ApplyDocAttrs
+    ; <body>-specific: leave head mode.
     xor     a
     ld      [HtmlInHead], a
+    ret
+
+; ApplyDocAttrs: lift HtmlNextAlign / HtmlNextDir (if set) into both the
+; live HtmlAlign/HtmlDir AND the "default" slots so descendant blocks
+; inherit them after each ResetBlockAttrs. dir="rtl" without an explicit
+; align= implies align=right at the document level too.
+ApplyDocAttrs:
+    ld      a, [HtmlNextDir]
+    cp      0xFF
+    jr      z, .dadAlign
+    ld      [HtmlDefaultDir], a
+    ld      [HtmlDir], a
+    or      a
+    jr      z, .dadAlign
+    ld      a, [HtmlNextAlign]
+    cp      0xFF
+    jr      nz, .dadAlign
+    ld      a, 1
+    ld      [HtmlDefaultAlign], a
+    ld      [HtmlAlign], a
+.dadAlign:
+    ld      a, [HtmlNextAlign]
+    cp      0xFF
+    ret     z
+    ld      [HtmlDefaultAlign], a
+    ld      [HtmlAlign], a
     ret
 
 TagTitle:
@@ -4057,11 +4204,13 @@ ApplyBlockAttrs:
     ld      [HtmlAlign], a
     ret
 
-; ResetBlockAttrs: clear alignment/dir at block-tag close so the next
-; block starts with defaults.
+; ResetBlockAttrs: on close, fall back to the document-level defaults set
+; by <html>/<body> (typically 0 = LTR + left-align, but dir="rtl" on the
+; root element propagates via HtmlDefaultDir/HtmlDefaultAlign).
 ResetBlockAttrs:
-    xor     a
+    ld      a, [HtmlDefaultAlign]
     ld      [HtmlAlign], a
+    ld      a, [HtmlDefaultDir]
     ld      [HtmlDir], a
     ret
 
@@ -4322,7 +4471,7 @@ TagTbl:
     db  "TITLE", 0
     dw  TagTitle
     db  "HTML", 0
-    dw  TagNoOp
+    dw  TagHtml
     db  "P", 0
     dw  TagP
     db  "BR", 0
@@ -5492,7 +5641,7 @@ DrawAboutPopup:
     ld      c, ABOUT_Y
     ld      d, ABOUT_W / 4
     ld      e, ABOUT_H
-    ld      a, COL_WHITE
+    ld      a, COL_LGRAY
     call    FillRect
 
     ld      b, ABOUT_X / 4
@@ -5502,9 +5651,9 @@ DrawAboutPopup:
     ld      a, COL_BLACK
     call    DrawRectBorder
 
-    ; Black-on-white body text (we're on the content area which is white).
+    ; Black-on-lgray body text so it blends with the popup fill.
     ld      a, COL_BLACK
-    ld      l, COL_WHITE
+    ld      l, COL_LGRAY
     call    SetTextColours
 
     ld      de, ABOUT_X + 8
@@ -5522,7 +5671,9 @@ DrawAboutPopup:
     ld      hl, AboutLine1
     call    DrawString
 
-    ld      de, ABOUT_X + 8
+    ; Right-align the Arabic tagline: 23 glyphs * 8 px = 184 px wide,
+    ; so start X = right edge - 8 padding - 184 = ABOUT_X + ABOUT_W - 192.
+    ld      de, ABOUT_X + ABOUT_W - 192
     ld      c, ABOUT_Y + 36
     ld      hl, AboutLine2
     call    DrawString
@@ -5565,22 +5716,21 @@ DrawTitleLabel:
     call    SetTextColours
 
     ; Lead text: captured <title> (or "(no title)").
-    ld      de, 4
-    ld      c, 1
     ld      a, [HtmlTitleSeen]
     or      a
     jr      z, .useDefault
     ld      a, [HtmlTitleLen]
     or      a
     jr      z, .useDefault
-    ld      hl, HtmlTitleBuf
-    ld      a, [HtmlTitleLen]
+    call    PrepTitleDraw               ; HL -> buffer to draw, A = length
     jr      .drawLead
 .useDefault:
     ld      hl, TitleNone
     ld      a, 10                       ; strlen("(no title)")
 .drawLead:
     push    af                          ; save lead length
+    ld      de, 4                       ; pixel X (PrepTitleDraw clobbered DE/C)
+    ld      c, 1                        ; pixel Y
     call    DrawString
     pop     af
 
@@ -5609,6 +5759,239 @@ DrawTitleLabel:
     ld      hl, CharX
     jp      DrawString
 
+; PrepTitleDraw: produce the buffer that DrawString will render for the
+; titlebar. If any Arabic letter is present, we pick each letter's joining
+; form (Iso/End/Ini/Mid) from the logical neighbours in HtmlTitleBuf, then
+; write the shaped glyphs into TitleDrawBuf in REVERSE order so the MSX's
+; LTR GRPPRT path produces a right-to-left visual for an Arabic reader.
+; Pure-ASCII titles skip the scratch entirely.
+; Returns: HL = buffer to draw, A = length.
+PrepTitleDraw:
+    ld      a, [HtmlTitleLen]
+    ld      b, a                        ; B = N
+    ld      [TitleN], a
+    or      a
+    jr      z, .ptAscii                 ; empty: doesn't matter, return HtmlTitleBuf
+    ; Scan for any Arabic letter to decide between raw passthrough and
+    ; shape+reverse. Preserves B.
+    ld      hl, HtmlTitleBuf
+    ld      c, b
+.ptScan:
+    ld      a, [hl]
+    cp      0x80
+    jr      c, .ptScanNext
+    push    hl
+    push    bc
+    sub     0x80
+    ld      e, a
+    ld      d, 0
+    ld      hl, IsoJoin
+    add     hl, de
+    ld      a, [hl]
+    pop     bc
+    pop     hl
+    and     IS_ARABIC
+    jr      nz, .ptShape
+.ptScanNext:
+    inc     hl
+    dec     c
+    jr      nz, .ptScan
+
+.ptAscii:
+    ld      hl, HtmlTitleBuf
+    ld      a, b
+    ret
+
+.ptShape:
+    ; For each logical index i in 0..N-1, compute the shaped glyph and
+    ; store it at TitleDrawBuf[N-1-i]. ASCII bytes pass through; upper-ISO
+    ; non-Arabic bytes are mapped through IsoMap's Isolated form.
+    xor     a
+    ld      [TitleI], a
+.ptLoop:
+    ld      a, [TitleI]
+    ld      b, a
+    ld      a, [TitleN]
+    cp      b
+    jr      z, .ptTerm
+    call    TitleShapeOne               ; A = glyph to write at TitleI
+    ld      c, a                        ; save glyph
+    ; dest index = (N-1) - TitleI
+    ld      a, [TitleN]
+    dec     a
+    ld      b, a
+    ld      a, [TitleI]
+    neg
+    add     a, b                        ; A = N-1 - TitleI
+    ld      e, a
+    ld      d, 0
+    ld      hl, TitleDrawBuf
+    add     hl, de
+    ld      [hl], c
+    ld      a, [TitleI]
+    inc     a
+    ld      [TitleI], a
+    jr      .ptLoop
+
+.ptTerm:
+    ; NUL at TitleDrawBuf[N].
+    ld      a, [TitleN]
+    ld      e, a
+    ld      d, 0
+    ld      hl, TitleDrawBuf
+    add     hl, de
+    xor     a
+    ld      [hl], a
+    ld      hl, TitleDrawBuf
+    ld      a, [TitleN]
+    ret
+
+; TitleShapeOne: compute shaped glyph for HtmlTitleBuf[TitleI].
+; Returns A = glyph byte (ASCII passthrough, upper-ISO non-Arabic mapped
+; to Isolated form, Arabic mapped to the appropriate joining form using
+; logical prev/next neighbours inside the raw HtmlTitleBuf).
+TitleShapeOne:
+    ld      a, [TitleI]
+    ld      e, a
+    ld      d, 0
+    ld      hl, HtmlTitleBuf
+    add     hl, de
+    ld      a, [hl]
+    ld      [TitleCur], a
+    cp      0x80
+    ret     c                           ; ASCII: passthrough
+
+    ld      c, a                        ; C = raw byte
+    sub     0x80
+    ld      e, a
+    ld      d, 0
+    ld      hl, IsoJoin
+    add     hl, de
+    ld      a, [hl]
+    ld      [TitleCurFlags], a
+    and     IS_ARABIC
+    jr      nz, .tsArabic
+
+    ; Upper-ISO non-Arabic: Isolated form.
+    xor     a
+    jp      .tsLookup
+
+.tsArabic:
+    ; Build connect mask from prev/next neighbours.
+    xor     a
+    ld      [TitleConn], a
+
+    ; --- prev ---
+    ld      a, [TitleI]
+    or      a
+    jr      z, .tsNoPrev
+    ld      a, [TitleCurFlags]
+    and     JOIN_RIGHT
+    jr      z, .tsNoPrev
+    ld      a, [TitleI]
+    dec     a
+    ld      e, a
+    ld      d, 0
+    ld      hl, HtmlTitleBuf
+    add     hl, de
+    ld      a, [hl]
+    cp      0x80
+    jr      c, .tsNoPrev
+    sub     0x80
+    ld      e, a
+    ld      d, 0
+    ld      hl, IsoJoin
+    add     hl, de
+    ld      a, [hl]
+    ld      b, a
+    and     IS_ARABIC
+    jr      z, .tsNoPrev
+    ld      a, b
+    and     JOIN_LEFT
+    jr      z, .tsNoPrev
+    ld      a, [TitleConn]
+    or      0x10
+    ld      [TitleConn], a
+.tsNoPrev:
+
+    ; --- next ---
+    ld      a, [TitleI]
+    inc     a
+    ld      b, a
+    ld      a, [TitleN]
+    cp      b
+    jr      c, .tsNoNext
+    jr      z, .tsNoNext
+    ld      a, [TitleCurFlags]
+    and     JOIN_LEFT
+    jr      z, .tsNoNext
+    ld      a, [TitleI]
+    inc     a
+    ld      e, a
+    ld      d, 0
+    ld      hl, HtmlTitleBuf
+    add     hl, de
+    ld      a, [hl]
+    cp      0x80
+    jr      c, .tsNoNext
+    sub     0x80
+    ld      e, a
+    ld      d, 0
+    ld      hl, IsoJoin
+    add     hl, de
+    ld      a, [hl]
+    ld      b, a
+    and     IS_ARABIC
+    jr      z, .tsNoNext
+    ld      a, b
+    and     JOIN_RIGHT
+    jr      z, .tsNoNext
+    ld      a, [TitleConn]
+    or      0x20
+    ld      [TitleConn], a
+.tsNoNext:
+
+    ; Connect mask -> form (0=Iso, 1=End, 2=Ini, 3=Mid).
+    ld      a, [TitleConn]
+    cp      0x30
+    jr      z, .tsMid
+    cp      0x10
+    jr      z, .tsEnd
+    cp      0x20
+    jr      z, .tsIni
+    xor     a
+    jr      .tsLookup
+.tsEnd:
+    ld      a, 1
+    jr      .tsLookup
+.tsIni:
+    ld      a, 2
+    jr      .tsLookup
+.tsMid:
+    ld      a, 3
+.tsLookup:
+    ; glyph = IsoMap[(TitleCur - 0x80)*4 + form]
+    ld      e, a                        ; E = form
+    ld      a, [TitleCur]
+    sub     0x80
+    ld      h, 0
+    ld      l, a
+    add     hl, hl
+    add     hl, hl
+    ld      d, 0
+    add     hl, de
+    ld      de, IsoMap
+    add     hl, de
+    ld      a, [hl]
+    ret
+
+TitleI:         db 0
+TitleN:         db 0
+TitleCur:       db 0
+TitleCurFlags:  db 0
+TitleConn:      db 0
+TitleDrawBuf:   ds TITLE_BUF_MAX + 1
+
 ; ============================================================================
 ; Data
 ; ============================================================================
@@ -5624,7 +6007,16 @@ UrlInit:        db 0                    ; address bar starts empty
 
 AboutTitleMsg:  db "About", 0
 AboutLine1:     db "MSX WBrowser", 0
-AboutLine2:     db "MSX2 Screen 6 HTML browser.", 0
+; AboutLine2: pre-shaped + BiDi-resolved "متصفح إنترنت لأجهزة MSX2" for an
+; RTL paragraph. Each Arabic byte is already the final MSX font glyph code
+; (logical letters passed through the joining-form shaper, lam+alef-hamza
+; fused to F4=>ED ligature, whole Arabic run reversed, then the LTR "MSX2"
+; re-reversed back to natural order per UAX#9 L2). This skips the runtime
+; shaping cost that the <title> and body text pay per render.
+AboutLine2:     db 0x4D, 0x53, 0x58, 0x32, 0x20
+                db 0xE4, 0xE8, 0xD2, 0xA9, 0xED, 0x20
+                db 0xA6, 0xD0, 0xE7, 0xA5, 0xD0, 0xE0, 0x20
+                db 0xAC, 0xC6, 0xB3, 0xA5, 0xCE, 0
 AboutLine3:     db "github.com/techana/mwbrowser", 0
 AboutLine4:     db "F1 shows this dialog.", 0
 AboutLine5:     db "Esc closes / quits.", 0
@@ -5781,9 +6173,20 @@ CELL_NEUTRAL    equ 0x02                ; space/punct — direction from context
 LineLen:        db 0
 LineGlyph:      ds LINE_BUF_MAX
 LineAttr:       ds LINE_BUF_MAX
+; Index (in LineGlyph) of the most-recent space cell on the current line,
+; or 0xFF when the line has no space yet. Used by SmartWrap to break at
+; word boundaries instead of mid-word.
+LineLastSpace:  db 0xFF
+; Scratch used by SmartWrap to hold the trailing word that gets carried
+; over to the next line when we backtrack to the last space.
+TailGlyph:      ds LINE_BUF_MAX
+TailAttr:       ds LINE_BUF_MAX
+TailLen:        db 0
 EmitCellAttr:   db 0                    ; attr byte EmitRaw applies to next cell
 HtmlAlign:      db 0                    ; 0=left, 1=right, 2=center
 HtmlDir:        db 0                    ; 0=LTR paragraph, 1=RTL paragraph
+HtmlDefaultAlign: db 0                  ; inherited default (set by <html>/<body>)
+HtmlDefaultDir:   db 0                  ; inherited default (set by <html>/<body>)
 HtmlNextAlign:  db 0xFF                 ; scratch: align= parsed on current tag (0xFF = unset)
 HtmlNextDir:    db 0xFF                 ; scratch: dir= parsed on current tag
 
