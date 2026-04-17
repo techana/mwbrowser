@@ -1,0 +1,11 @@
+# Ignore everything by default; whitelist only what ships to the remote repo.
+*
+
+!.gitignore
+!README.md
+!README-ar.md
+!src/
+!src/mwbrowser.asm
+!src/iso8859_6.inc
+!dist/
+!dist/mwbrowser.com
