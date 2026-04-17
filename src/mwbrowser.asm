@@ -1835,6 +1835,9 @@ PrintFileContent:
     ld      [LinkCount], a
     ld      [LineLen], a                ; drop any cells left from previous render
     ld      [ArLen], a
+    ld      a, 0xFF
+    ld      [LineLastSpace], a
+    xor     a
     ld      [EmitCellAttr], a
     ld      [HtmlAlign], a
     ld      [HtmlDir], a
@@ -2079,18 +2082,9 @@ EmitSink:
     ld      a, b
     jp      EmitIsoByte                 ; canvas: shape + mirror per-word
 .toTitle:
-    ; Title: flat ISO->isolated glyph lookup (no shaping/mirroring).
+    ; Title: store the raw ISO byte verbatim. PrepTitleDraw picks joining
+    ; forms and reverses the buffer at render time.
     ld      a, b
-    cp      0x80
-    jp      c, TitleAppend
-    sub     0x80
-    ld      h, 0
-    ld      l, a
-    add     hl, hl
-    add     hl, hl                      ; *4
-    ld      de, IsoMap
-    add     hl, de
-    ld      a, [hl]
     jp      TitleAppend
 
 ; ----------------------------------------------------------------------------
@@ -2409,14 +2403,17 @@ EmitRaw:
     or      a
     jr      nz, .done                   ; suppressed: no buffer, no wrap, no advance
 
-    ; Wrap: if TextX > CONTENT_X_END - 6, newline (flushes buffer) then retry.
+    ; Wrap: if TextX > CONTENT_X_END - 6, break at the most-recent space on
+    ; the current line (SmartWrap), carrying the trailing word over to the
+    ; next line. Falls back to a hard mid-word wrap when no space is on the
+    ; line yet (a single word longer than the canvas width).
     ld      hl, [TextX]
     ld      de, CONTENT_X_END - 6
     and     a
     sbc     hl, de
     jr      c, .posOk
     push    bc
-    call    EmitNewline                 ; flushes line + advances TextY
+    call    SmartWrap
     pop     bc
 .posOk:
 
@@ -2456,6 +2453,14 @@ EmitRaw:
     ld      c, a
 .storeAttr:
     ld      [hl], c
+    ; Track last-space position for SmartWrap. B = glyph, the new cell's
+    ; index is the current LineLen (before it's bumped below).
+    ld      a, b
+    cp      0x20
+    jr      nz, .notSpace
+    ld      a, [LineLen]
+    ld      [LineLastSpace], a
+.notSpace:
     ld      a, [LineLen]
     inc     a
     ld      [LineLen], a
@@ -2922,6 +2927,106 @@ LineDrawCells:
 LineStartCol:   db 0
 LineDrawI:      db 0
 
+; SmartWrap: called from EmitRaw when the next glyph wouldn't fit on the
+; current line. If LineLastSpace marks a space on the current line, stash
+; the trailing word (cells after that space) in TailGlyph/TailAttr, drop
+; the space itself from LineBuf, then EmitNewline to flush+advance, then
+; re-emit the stashed word onto the new line. If no space is on the line
+; (a single word longer than the canvas), fall back to a hard wrap and
+; just EmitNewline at the current position.
+SmartWrap:
+    ld      a, [LineLastSpace]
+    cp      0xFF
+    jp      z, EmitNewline              ; hard wrap: no space on this line
+
+    ; B = space index
+    ld      b, a
+    ; A = tail length = LineLen - B - 1
+    ld      a, [LineLen]
+    sub     b
+    dec     a
+    ld      [TailLen], a
+    jr      z, .flush                   ; nothing after the space: just wrap
+
+    ; Copy LineGlyph[B+1 .. LineLen-1] into TailGlyph.
+    push    bc
+    ld      c, a                        ; C = tail length
+    ld      a, b
+    inc     a                           ; source start index = B + 1
+    ld      e, a
+    ld      d, 0
+    ld      hl, LineGlyph
+    add     hl, de
+    ld      de, TailGlyph
+    ld      b, c
+.cg:
+    ld      a, [hl]
+    ld      [de], a
+    inc     hl
+    inc     de
+    djnz    .cg
+    pop     bc
+
+    ; Copy LineAttr[B+1 .. LineLen-1] into TailAttr.
+    push    bc
+    ld      a, [TailLen]
+    ld      c, a
+    ld      a, b
+    inc     a
+    ld      e, a
+    ld      d, 0
+    ld      hl, LineAttr
+    add     hl, de
+    ld      de, TailAttr
+    ld      b, c
+.ca:
+    ld      a, [hl]
+    ld      [de], a
+    inc     hl
+    inc     de
+    djnz    .ca
+    pop     bc
+
+.flush:
+    ; Truncate LineLen to drop the trailing space + the tail (we'll re-emit
+    ; the tail on the next line). B still holds the space index.
+    ld      a, b
+    ld      [LineLen], a
+    call    EmitNewline                 ; flush short line + advance + reset LineLastSpace
+
+    ; Re-emit stashed tail cells onto the new line via EmitRaw so wrap +
+    ; TextX advance behave normally. Stash EmitCellAttr around the loop in
+    ; case the caller was mid-way through setting a new cell's attr.
+    ld      a, [TailLen]
+    or      a
+    ret     z
+    ld      a, [EmitCellAttr]
+    ld      [SmartWrapSavedAttr], a
+    ld      a, [TailLen]
+    ld      b, a                        ; B = tail count
+    ld      c, 0                        ; C = tail index
+.re:
+    push    bc
+    ld      d, 0
+    ld      e, c
+    ld      hl, TailAttr
+    add     hl, de
+    ld      a, [hl]
+    ld      [EmitCellAttr], a
+    ld      hl, TailGlyph
+    add     hl, de
+    ld      a, [hl]
+    call    EmitRaw
+    pop     bc
+    inc     c
+    dec     b
+    jr      nz, .re
+    ld      a, [SmartWrapSavedAttr]
+    ld      [EmitCellAttr], a
+    ret
+
+SmartWrapSavedAttr: db 0
+
 ; EmitNewline: start a new rendered line. We always bump the line counter
 ; (for the scrollbar); we only advance TextY after the skip quota for
 ; scrolling is exhausted. TextY clamps at the bottom so further emissions
@@ -2934,6 +3039,10 @@ EmitNewline:
     ; EmitRaw wrap path.
     call    ArFlush
     call    LineFlush
+    push    af
+    ld      a, 0xFF
+    ld      [LineLastSpace], a
+    pop     af
     ; Count this rendered line in units of 8-pixel rows so H1/H2 (scale 2)
     ; contribute 2. This keeps scroll-by-page math in sync with actual VRAM
     ; pixels -- otherwise a page of scaled headings would scroll more than
@@ -3599,11 +3708,6 @@ TagTitle:
 .close:
     xor     a
     ld      [HtmlInTitle], a
-    ; Shape any Arabic runs in the title buffer in place before it gets
-    ; drawn -- the title bar uses BIOS GRPPRT (raw glyph blit, no shaping)
-    ; so we substitute the correct joining forms now and reverse each run
-    ; so it reads right-to-left on screen.
-    call    ShapeTitleBuf
     ; NUL-terminate captured title and repaint the titlebar.
     ld      a, [HtmlTitleLen]
     ld      e, a
@@ -3618,296 +3722,6 @@ TagTitle:
 
 TagNoOp:
     ret
-
-; ShapeTitleBuf: rewrite HtmlTitleBuf so Arabic reads right-to-left via
-; DrawString (which feeds BIOS GRPPRT straight through, no shaping). We
-; swap each Arabic byte for its final joining-form glyph (initial / medial
-; / final / isolated chosen from in-word logical neighbours -- spaces
-; break joining) and then reverse the whole buffer in place. Bails out
-; when the title has no Arabic letter at all (pure ASCII, chrome strings).
-ShapeTitleBuf:
-    ld      a, [HtmlTitleLen]
-    or      a
-    ret     z
-    ; Quick scan: return immediately if no Arabic letter is present.
-    ld      b, a
-    ld      hl, HtmlTitleBuf
-.stQuick:
-    ld      a, [hl]
-    cp      0x80
-    jr      c, .stQuickNext
-    push    hl
-    push    bc
-    sub     0x80
-    ld      e, a
-    ld      d, 0
-    ld      hl, IsoJoin
-    add     hl, de
-    ld      a, [hl]
-    pop     bc
-    pop     hl
-    and     IS_ARABIC
-    jr      nz, .stShape
-.stQuickNext:
-    inc     hl
-    djnz    .stQuick
-    ret                                 ; no Arabic -> leave raw bytes
-
-.stShape:
-    ld      a, [HtmlTitleLen]
-    ld      [TsN], a
-    ; Pass 1: shape every byte, WRITING into TitleShapedBuf so that each
-    ; shape decision sees the ORIGINAL (unshaped) neighbour bytes in
-    ; HtmlTitleBuf. If we wrote back in place, shaped glyphs (font codes
-    ; with IsoJoin=0) would look non-Arabic to later shape calls and
-    ; break middle/end detection for the rest of the word.
-    xor     a
-    ld      [TsI], a
-.stShapeLoop:
-    ld      a, [TsI]
-    ld      b, a
-    ld      a, [TsN]
-    cp      b
-    jr      z, .stCopyBack
-    call    ShapeTitleByte
-    ld      a, [TsI]
-    inc     a
-    ld      [TsI], a
-    jr      .stShapeLoop
-
-.stCopyBack:
-    ; Pass 2: TitleShapedBuf -> HtmlTitleBuf.
-    ld      a, [TsN]
-    or      a
-    jr      z, .stReverse
-    ld      b, a
-    ld      hl, TitleShapedBuf
-    ld      de, HtmlTitleBuf
-.stCopy:
-    ld      a, [hl]
-    ld      [de], a
-    inc     hl
-    inc     de
-    djnz    .stCopy
-
-.stReverse:
-    xor     a
-    ld      [TsI], a
-    ld      a, [TsN]
-    dec     a
-    ld      [TsJ], a
-.stRevLoop:
-    ld      a, [TsI]
-    ld      b, a
-    ld      a, [TsJ]
-    cp      b
-    ret     c
-    ret     z
-    ld      a, [TsI]
-    call    GetTitleByte
-    ld      [TsTemp], a
-    ld      a, [TsJ]
-    call    GetTitleByte
-    ld      c, a
-    ld      a, [TsI]
-    call    SetTitleByte
-    ld      a, [TsTemp]
-    ld      c, a
-    ld      a, [TsJ]
-    call    SetTitleByte
-    ld      a, [TsI]
-    inc     a
-    ld      [TsI], a
-    ld      a, [TsJ]
-    dec     a
-    ld      [TsJ], a
-    jr      .stRevLoop
-
-; ShapeTitleByte: if HtmlTitleBuf[TsI] is an Arabic letter, pick its joining
-; form by peeking the raw (not-yet-shaped) neighbours in the same word (a
-; space at [TsI-1] or [TsI+1] or a run edge kills the joining) and write
-; the final glyph back. Non-Arabic bytes are left as-is.
-ShapeTitleByte:
-    ld      a, [TsI]
-    call    GetTitleByte
-    ; First: copy the raw byte through to TitleShapedBuf. ShapeTitleByte's
-    ; later path overwrites this for Arabic bytes; non-Arabic bytes and
-    ; spaces land here unchanged.
-    ld      c, a
-    ld      a, [TsI]
-    call    SetShapedByte
-    ld      a, c
-    cp      0x80
-    ret     c                           ; ASCII: leave raw
-    sub     0x80
-    ld      hl, IsoJoin
-    ld      e, a
-    ld      d, 0
-    add     hl, de
-    ld      a, [hl]
-    ld      [TsCurFlags], a
-    and     IS_ARABIC
-    ret     z                           ; upper-ISO non-Arabic: leave
-
-    xor     a
-    ld      [TsConn], a
-
-    ; --- Prev neighbour ---
-    ld      a, [TsI]
-    or      a
-    jr      z, .stbNoPrev
-    ld      a, [TsCurFlags]
-    and     JOIN_RIGHT
-    jr      z, .stbNoPrev
-    ld      a, [TsI]
-    dec     a
-    call    GetTitleByte
-    cp      0x80
-    jr      c, .stbNoPrev               ; ASCII or space
-    sub     0x80
-    ld      hl, IsoJoin
-    ld      e, a
-    ld      d, 0
-    add     hl, de
-    ld      a, [hl]
-    ld      b, a
-    and     IS_ARABIC
-    jr      z, .stbNoPrev
-    ld      a, b
-    and     JOIN_LEFT
-    jr      z, .stbNoPrev
-    ld      a, [TsConn]
-    or      0x10                        ; SHAPE_MASK_PREV
-    ld      [TsConn], a
-.stbNoPrev:
-
-    ; --- Next neighbour ---
-    ld      a, [TsI]
-    inc     a
-    ld      b, a
-    ld      a, [TsN]
-    cp      b
-    jr      c, .stbNoNext
-    jr      z, .stbNoNext
-    ld      a, [TsCurFlags]
-    and     JOIN_LEFT
-    jr      z, .stbNoNext
-    ld      a, [TsI]
-    inc     a
-    call    GetTitleByte
-    cp      0x80
-    jr      c, .stbNoNext
-    sub     0x80
-    ld      hl, IsoJoin
-    ld      e, a
-    ld      d, 0
-    add     hl, de
-    ld      a, [hl]
-    ld      b, a
-    and     IS_ARABIC
-    jr      z, .stbNoNext
-    ld      a, b
-    and     JOIN_RIGHT
-    jr      z, .stbNoNext
-    ld      a, [TsConn]
-    or      0x20                        ; SHAPE_MASK_NEXT
-    ld      [TsConn], a
-.stbNoNext:
-
-    ; --- Connect mask -> form ---
-    ld      a, [TsConn]
-    cp      0x30
-    jr      z, .stbFMid
-    cp      0x10
-    jr      z, .stbFEnd
-    cp      0x20
-    jr      z, .stbFIni
-    xor     a
-    jr      .stbHaveForm
-.stbFEnd:
-    ld      a, 1
-    jr      .stbHaveForm
-.stbFIni:
-    ld      a, 2
-    jr      .stbHaveForm
-.stbFMid:
-    ld      a, 3
-.stbHaveForm:
-    ; Glyph = IsoMap[(byte-0x80)*4 + form]
-    ld      e, a
-    ld      a, c
-    sub     0x80
-    ld      h, 0
-    ld      l, a
-    add     hl, hl
-    add     hl, hl
-    ld      a, e
-    ld      d, 0
-    ld      e, a
-    add     hl, de
-    ld      de, IsoMap
-    add     hl, de
-    ld      a, [hl]
-    ld      c, a
-    ld      a, [TsI]
-    call    SetShapedByte
-    ret
-
-; SetShapedByte: A(in) = index, C = value. Writes TitleShapedBuf[A] = C.
-SetShapedByte:
-    push    hl
-    push    de
-    push    bc
-    ld      e, a
-    ld      d, 0
-    ld      hl, TitleShapedBuf
-    add     hl, de
-    ld      a, c
-    ld      [hl], a
-    pop     bc
-    pop     de
-    pop     hl
-    ret
-
-; GetTitleByte: A(in) = index -> A = HtmlTitleBuf[index]. Preserves BC,DE,HL.
-GetTitleByte:
-    push    hl
-    push    de
-    ld      e, a
-    ld      d, 0
-    ld      hl, HtmlTitleBuf
-    add     hl, de
-    ld      a, [hl]
-    pop     de
-    pop     hl
-    ret
-
-; SetTitleByte: A(in) = index, C = value. Writes buf[A] = C. Preserves all.
-SetTitleByte:
-    push    hl
-    push    de
-    push    bc
-    ld      e, a
-    ld      d, 0
-    ld      hl, HtmlTitleBuf
-    add     hl, de
-    ld      a, c
-    ld      [hl], a
-    pop     bc
-    pop     de
-    pop     hl
-    ret
-
-TsI:            db 0
-TsJ:            db 0
-TsN:            db 0
-TsTemp:         db 0
-TsCurFlags:     db 0
-TsConn:         db 0
-; Pass-1 scratch for ShapeTitleBuf: shaped glyphs land here so pass-2 can
-; copy them back while pass 1 still reads the ORIGINAL title bytes for
-; prev/next joining context. Size must match HtmlTitleBuf (TITLE_BUF_MAX).
-TitleShapedBuf: ds TITLE_BUF_MAX + 1
 
 ; <ul>: bullet list. Open indents by 16 px and switches bullet style.
 ; Close restores. No nesting state beyond a single level.
@@ -5857,7 +5671,9 @@ DrawAboutPopup:
     ld      hl, AboutLine1
     call    DrawString
 
-    ld      de, ABOUT_X + 8
+    ; Right-align the Arabic tagline: 23 glyphs * 8 px = 184 px wide,
+    ; so start X = right edge - 8 padding - 184 = ABOUT_X + ABOUT_W - 192.
+    ld      de, ABOUT_X + ABOUT_W - 192
     ld      c, ABOUT_Y + 36
     ld      hl, AboutLine2
     call    DrawString
@@ -5900,22 +5716,21 @@ DrawTitleLabel:
     call    SetTextColours
 
     ; Lead text: captured <title> (or "(no title)").
-    ld      de, 4
-    ld      c, 1
     ld      a, [HtmlTitleSeen]
     or      a
     jr      z, .useDefault
     ld      a, [HtmlTitleLen]
     or      a
     jr      z, .useDefault
-    ld      hl, HtmlTitleBuf
-    ld      a, [HtmlTitleLen]
+    call    PrepTitleDraw               ; HL -> buffer to draw, A = length
     jr      .drawLead
 .useDefault:
     ld      hl, TitleNone
     ld      a, 10                       ; strlen("(no title)")
 .drawLead:
     push    af                          ; save lead length
+    ld      de, 4                       ; pixel X (PrepTitleDraw clobbered DE/C)
+    ld      c, 1                        ; pixel Y
     call    DrawString
     pop     af
 
@@ -5943,6 +5758,239 @@ DrawTitleLabel:
     ld      c, 1
     ld      hl, CharX
     jp      DrawString
+
+; PrepTitleDraw: produce the buffer that DrawString will render for the
+; titlebar. If any Arabic letter is present, we pick each letter's joining
+; form (Iso/End/Ini/Mid) from the logical neighbours in HtmlTitleBuf, then
+; write the shaped glyphs into TitleDrawBuf in REVERSE order so the MSX's
+; LTR GRPPRT path produces a right-to-left visual for an Arabic reader.
+; Pure-ASCII titles skip the scratch entirely.
+; Returns: HL = buffer to draw, A = length.
+PrepTitleDraw:
+    ld      a, [HtmlTitleLen]
+    ld      b, a                        ; B = N
+    ld      [TitleN], a
+    or      a
+    jr      z, .ptAscii                 ; empty: doesn't matter, return HtmlTitleBuf
+    ; Scan for any Arabic letter to decide between raw passthrough and
+    ; shape+reverse. Preserves B.
+    ld      hl, HtmlTitleBuf
+    ld      c, b
+.ptScan:
+    ld      a, [hl]
+    cp      0x80
+    jr      c, .ptScanNext
+    push    hl
+    push    bc
+    sub     0x80
+    ld      e, a
+    ld      d, 0
+    ld      hl, IsoJoin
+    add     hl, de
+    ld      a, [hl]
+    pop     bc
+    pop     hl
+    and     IS_ARABIC
+    jr      nz, .ptShape
+.ptScanNext:
+    inc     hl
+    dec     c
+    jr      nz, .ptScan
+
+.ptAscii:
+    ld      hl, HtmlTitleBuf
+    ld      a, b
+    ret
+
+.ptShape:
+    ; For each logical index i in 0..N-1, compute the shaped glyph and
+    ; store it at TitleDrawBuf[N-1-i]. ASCII bytes pass through; upper-ISO
+    ; non-Arabic bytes are mapped through IsoMap's Isolated form.
+    xor     a
+    ld      [TitleI], a
+.ptLoop:
+    ld      a, [TitleI]
+    ld      b, a
+    ld      a, [TitleN]
+    cp      b
+    jr      z, .ptTerm
+    call    TitleShapeOne               ; A = glyph to write at TitleI
+    ld      c, a                        ; save glyph
+    ; dest index = (N-1) - TitleI
+    ld      a, [TitleN]
+    dec     a
+    ld      b, a
+    ld      a, [TitleI]
+    neg
+    add     a, b                        ; A = N-1 - TitleI
+    ld      e, a
+    ld      d, 0
+    ld      hl, TitleDrawBuf
+    add     hl, de
+    ld      [hl], c
+    ld      a, [TitleI]
+    inc     a
+    ld      [TitleI], a
+    jr      .ptLoop
+
+.ptTerm:
+    ; NUL at TitleDrawBuf[N].
+    ld      a, [TitleN]
+    ld      e, a
+    ld      d, 0
+    ld      hl, TitleDrawBuf
+    add     hl, de
+    xor     a
+    ld      [hl], a
+    ld      hl, TitleDrawBuf
+    ld      a, [TitleN]
+    ret
+
+; TitleShapeOne: compute shaped glyph for HtmlTitleBuf[TitleI].
+; Returns A = glyph byte (ASCII passthrough, upper-ISO non-Arabic mapped
+; to Isolated form, Arabic mapped to the appropriate joining form using
+; logical prev/next neighbours inside the raw HtmlTitleBuf).
+TitleShapeOne:
+    ld      a, [TitleI]
+    ld      e, a
+    ld      d, 0
+    ld      hl, HtmlTitleBuf
+    add     hl, de
+    ld      a, [hl]
+    ld      [TitleCur], a
+    cp      0x80
+    ret     c                           ; ASCII: passthrough
+
+    ld      c, a                        ; C = raw byte
+    sub     0x80
+    ld      e, a
+    ld      d, 0
+    ld      hl, IsoJoin
+    add     hl, de
+    ld      a, [hl]
+    ld      [TitleCurFlags], a
+    and     IS_ARABIC
+    jr      nz, .tsArabic
+
+    ; Upper-ISO non-Arabic: Isolated form.
+    xor     a
+    jp      .tsLookup
+
+.tsArabic:
+    ; Build connect mask from prev/next neighbours.
+    xor     a
+    ld      [TitleConn], a
+
+    ; --- prev ---
+    ld      a, [TitleI]
+    or      a
+    jr      z, .tsNoPrev
+    ld      a, [TitleCurFlags]
+    and     JOIN_RIGHT
+    jr      z, .tsNoPrev
+    ld      a, [TitleI]
+    dec     a
+    ld      e, a
+    ld      d, 0
+    ld      hl, HtmlTitleBuf
+    add     hl, de
+    ld      a, [hl]
+    cp      0x80
+    jr      c, .tsNoPrev
+    sub     0x80
+    ld      e, a
+    ld      d, 0
+    ld      hl, IsoJoin
+    add     hl, de
+    ld      a, [hl]
+    ld      b, a
+    and     IS_ARABIC
+    jr      z, .tsNoPrev
+    ld      a, b
+    and     JOIN_LEFT
+    jr      z, .tsNoPrev
+    ld      a, [TitleConn]
+    or      0x10
+    ld      [TitleConn], a
+.tsNoPrev:
+
+    ; --- next ---
+    ld      a, [TitleI]
+    inc     a
+    ld      b, a
+    ld      a, [TitleN]
+    cp      b
+    jr      c, .tsNoNext
+    jr      z, .tsNoNext
+    ld      a, [TitleCurFlags]
+    and     JOIN_LEFT
+    jr      z, .tsNoNext
+    ld      a, [TitleI]
+    inc     a
+    ld      e, a
+    ld      d, 0
+    ld      hl, HtmlTitleBuf
+    add     hl, de
+    ld      a, [hl]
+    cp      0x80
+    jr      c, .tsNoNext
+    sub     0x80
+    ld      e, a
+    ld      d, 0
+    ld      hl, IsoJoin
+    add     hl, de
+    ld      a, [hl]
+    ld      b, a
+    and     IS_ARABIC
+    jr      z, .tsNoNext
+    ld      a, b
+    and     JOIN_RIGHT
+    jr      z, .tsNoNext
+    ld      a, [TitleConn]
+    or      0x20
+    ld      [TitleConn], a
+.tsNoNext:
+
+    ; Connect mask -> form (0=Iso, 1=End, 2=Ini, 3=Mid).
+    ld      a, [TitleConn]
+    cp      0x30
+    jr      z, .tsMid
+    cp      0x10
+    jr      z, .tsEnd
+    cp      0x20
+    jr      z, .tsIni
+    xor     a
+    jr      .tsLookup
+.tsEnd:
+    ld      a, 1
+    jr      .tsLookup
+.tsIni:
+    ld      a, 2
+    jr      .tsLookup
+.tsMid:
+    ld      a, 3
+.tsLookup:
+    ; glyph = IsoMap[(TitleCur - 0x80)*4 + form]
+    ld      e, a                        ; E = form
+    ld      a, [TitleCur]
+    sub     0x80
+    ld      h, 0
+    ld      l, a
+    add     hl, hl
+    add     hl, hl
+    ld      d, 0
+    add     hl, de
+    ld      de, IsoMap
+    add     hl, de
+    ld      a, [hl]
+    ret
+
+TitleI:         db 0
+TitleN:         db 0
+TitleCur:       db 0
+TitleCurFlags:  db 0
+TitleConn:      db 0
+TitleDrawBuf:   ds TITLE_BUF_MAX + 1
 
 ; ============================================================================
 ; Data
@@ -6125,6 +6173,15 @@ CELL_NEUTRAL    equ 0x02                ; space/punct — direction from context
 LineLen:        db 0
 LineGlyph:      ds LINE_BUF_MAX
 LineAttr:       ds LINE_BUF_MAX
+; Index (in LineGlyph) of the most-recent space cell on the current line,
+; or 0xFF when the line has no space yet. Used by SmartWrap to break at
+; word boundaries instead of mid-word.
+LineLastSpace:  db 0xFF
+; Scratch used by SmartWrap to hold the trailing word that gets carried
+; over to the next line when we backtrack to the last space.
+TailGlyph:      ds LINE_BUF_MAX
+TailAttr:       ds LINE_BUF_MAX
+TailLen:        db 0
 EmitCellAttr:   db 0                    ; attr byte EmitRaw applies to next cell
 HtmlAlign:      db 0                    ; 0=left, 1=right, 2=center
 HtmlDir:        db 0                    ; 0=LTR paragraph, 1=RTL paragraph
