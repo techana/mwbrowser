@@ -149,6 +149,7 @@ Main:
     call    SetPalette
     call    SetBorder
     call    ClearContent                ; VRAM all white (colour 0)
+    call    BindFnKeys                  ; make F1 inject 0xF1 on DIRIN
     call    InitState
 
     call    DrawTitlebar
@@ -430,9 +431,22 @@ Screen0Palette:
 ; State
 ; ============================================================================
 
+; BindFnKeys: override the MSX function-key string buffer so F1 injects
+; the single byte 0xF1 into the DIRIN stream (matching KEY_F1 in the
+; dispatch). Without this, F1's default expansion string (e.g., "color")
+; comes through instead and the About popup never opens.
+;   FNKSTR is at 0xF87F with 16 bytes per key (F1..F10).
+BindFnKeys:
+    ld      hl, 0xF87F                  ; F1's slot
+    ld      [hl], 0xF1
+    inc     hl
+    xor     a
+    ld      [hl], a                     ; NUL-terminate
+    ret
+
 ; Initialise Focus / Busy / Url. Called once from Main.
 InitState:
-    ld      a, FOC_REFRESH
+    ld      a, FOC_ADDRESS
     ld      [Focus], a
     xor     a
     ld      [Busy], a
@@ -1289,20 +1303,11 @@ PaintAddressBar:
     jr      z, .addrDgray               ; unfocused: dark-gray border
     ld      a, COL_BLACK                ; focused: black border
     call    DrawRectBorder
-    ; Full-bg corner bytes (WHITE pair 10 -> 0xAA) so rounding is symmetric.
-    ld      hl, 0xAAAA
-    jr      .addrRound
+    jr      .addrBorderDone
 .addrDgray:
     ld      a, COL_DGRAY
     call    DrawRectBorder
-    ld      hl, 0xAAAA
-.addrRound:
-    ld      b, ADDR_X0 / 4
-    ld      a, ADDR_X0 / 4 + (ADDR_X1 - ADDR_X0 + 1) / 4 - 1
-    ld      d, a
-    ld      c, BTN_Y0
-    ld      e, BTN_Y0 + BTN_H - 1
-    call    RoundCorners
+.addrBorderDone:
 
     ; URL text.
     ld      a, COL_BLACK
@@ -4195,64 +4200,6 @@ TagS:
     ld      [HtmlStyleFlags], a
     ret
 
-; DebugShowScrollState: print 'sNN/tNN tYY hYY' at upper-right of content
-; area where values are ScrollLine / TotalLines / ThumbTop / ThumbHeight.
-DebugShowScrollState:
-    ld      hl, DebugTmpBuf
-    ld      [hl], 's'
-    inc     hl
-    ld      a, [ScrollLine]
-    call    DbgFmtHex
-    ld      [hl], '/'
-    inc     hl
-    ld      [hl], 't'
-    inc     hl
-    ld      a, [TotalLines]
-    call    DbgFmtHex
-    ld      [hl], ' '
-    inc     hl
-    ld      [hl], 'T'
-    inc     hl
-    ld      a, [ThumbTop]
-    call    DbgFmtHex
-    ld      [hl], 'H'
-    inc     hl
-    ld      a, [ThumbHeight]
-    call    DbgFmtHex
-    ld      [hl], 0
-
-    ld      de, 4
-    ld      c, CONTENT_Y0 + 1
-    ld      a, COL_BLACK
-    push    de
-    ld      l, COL_WHITE
-    call    SetTextColours
-    pop     de
-    ld      hl, DebugTmpBuf
-    jp      DrawString
-
-; DbgFmtHex: A = value, HL = dest. Writes 2 hex chars; HL advances by 2.
-DbgFmtHex:
-    push    af
-    rrca
-    rrca
-    rrca
-    rrca
-    and     0x0F
-    call    .nyb
-    pop     af
-    and     0x0F
-    ; fall through
-.nyb:
-    cp      10
-    jr      c, .dig
-    add     a, 'A' - 10 - '0'
-.dig:
-    add     a, '0'
-    ld      [hl], a
-    inc     hl
-    ret
-
 ; <a>: anchor / link. Open sets underline + begins a LinkTable entry using
 ; the current pen position and the href captured by ScanHrefAttr. Close
 ; stores the end position; the entry is committed even if the rendered text
@@ -4809,8 +4756,6 @@ NavigateToCurrentUrl:
 
     call    HistoryPush                 ; records UrlBuf -> history[cursor]
     call    HistoryUpdateFlags
-    ld      a, 1
-    ld      [HasLoaded], a
 
     xor     a
     ld      [ScrollLine], a
@@ -5675,7 +5620,7 @@ CharGreater:    db ">", 0
 CharX:          db "X", 0
 CharLowerX:     db "x", 0
 CharHelp:       db "?", 0
-UrlInit:        db "a:\test.html", 0
+UrlInit:        db 0                    ; address bar starts empty
 
 AboutTitleMsg:  db "About", 0
 AboutLine1:     db "MSX WBrowser", 0
@@ -5738,7 +5683,6 @@ CursorBg:       ds 16                   ; 2 bytes * 8 rows VRAM backup
 CursorByteCol:  db 0                    ; scratch (byte col during erase/draw)
 CursorRowY:     db 0                    ; scratch (current y during loops)
 CursorBgPtr:    dw 0                    ; scratch (pointer into CursorBg)
-CursorMaskPtr:  dw 0                    ; scratch (pointer into CursorMask)
 EntrySP:        dw 0                    ; SP at Main entry (restored on Shutdown)
 
 ; File I/O and navigation state.
@@ -5748,7 +5692,6 @@ ScrollLine:     db 0                    ; first visible line (0 = top of file)
 TotalLines:     db 0                    ; LF count in loaded file (for thumb math)
 ThumbTop:       db THUMB_Y0             ; current thumb top y (set by ComputeThumb)
 ThumbHeight:    db THUMB_Y1 - THUMB_Y0 + 1
-HasLoaded:      db 0                    ; 1 once first successful load has happened
 AboutOpen:      db 0                    ; 1 while the About popup is on screen
 
 ; Text cursor for DrawCharFast-based rendering.
@@ -5789,7 +5732,6 @@ HtmlSavedBold:  db 0                    ; scratch: STYLE_BOLD state before <th>
 HtmlFg:         db 3                    ; current text fg palette index (default BLACK=3)
 HtmlFgStack:    ds 4                    ; <font> stack of previous fg values
 HtmlFgDepth:    db 0                    ; current <font> nesting depth
-HtmlColorName:  ds 12                   ; scratch for color name lookup
 CurrentFontLUT: dw FontLUT              ; pointer to active LUT (updated by <font>)
 HtmlCurHrefLen: db 0                    ; length of the current href being captured
 HtmlCurHref:    ds LINK_URL_MAX + 1     ; NUL-terminated href of the *open* <a>
@@ -5802,7 +5744,6 @@ LinkUrls:       ds (LINK_URL_MAX + 1) * LINK_MAX
 HtmlTitleBuf:   ds TITLE_BUF_MAX + 1    ; NUL-terminated
 HtmlTagName:    ds 8                    ; up to 7 chars + NUL
 HtmlEntityName: ds 6                    ; up to 5 chars + NUL
-DebugTmpBuf:    ds 10                   ; scratch for debug labels
 FastCgSlot:     db 0                    ; cached CGPNT[0] for ExtractFont
 
 ; Multi-step back/forward history. Ring buffer of HISTORY_MAX URL slots.
