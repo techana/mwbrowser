@@ -1,0 +1,19 @@
+<HTML>
+<HEAD><TITLE>Inline image test</TITLE></HEAD>
+<BODY>
+<H1>Inline image sample</H1>
+
+<P>This page embeds MSX-native images via a <B>data:msx;base64,</B>
+URI. The payload is a 2-byte header (width-in-bytes, height-in-rows)
+followed by raw Screen-6 2bpp pixel data -- no filters, no compression.</P>
+
+<P>A larger 64x46 image in its own paragraph:</P>
+
+<P><IMG SRC="data:msx;base64,EC6qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqv8AVQBVAFUAVQBVAFUAVf//////////////////////qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqr///////////////////////////////////////////WqVapVqlWqVapVqlWqVa/1qlWqVapVqlWqVapVqlWv9apVqlWqVapVqlWqVapVr/WqVapVqlWqVapVqlWqVa/1qlWqVapVqlWqVapVqlWv9apVqlWqVapVqlWqVapVr/WqVapVqlWqVapVqlWqVa/1qlWqVapVqlWqVapVqlWv9apVqlVqVapVqlVqVapVr/WqVapVVVWqVapVVVWqVa/1qlWpVRVVqlWpVRVVqlWv9apVpUAAVapVpUAAVapVr/WqVaUAwBWqVaUAwBWqVa/1qlWUD/wFqlWUD/wFqlWv9apVlD//BapVlD//BapVr/WqVZQ//wWqVZQ//wWqVa/1qlVQ///BalVQ///BalWv9apVlD//BapVlD//BapVr/WqVZQ//wWqVZQ//wWqVa/1qlWUD/wFqlWUD/wFqlWv9apVpQDAFapVpQDAFapVr/WqVaVAAFWqVaVAAFWqVa/1qlWpVRVVqlWpVRVVqlWv9apVqlVVVapVqlVVVapVr/WqVapValWqVapValWqVa/1qlWqVapVqlWqVapVqlWv9apVqlWqVapVqlWqVapVr/WqVapVqlWqVapVqlWqVa/1qlWqVapVqlWqVapVqlWv9apVqlWqVapVqlWqVapVr/WqVapVqlWqVapVqlWqVa/1qlWqVapVqlWqVapVqlWv9apVqlWqVapVqlWqVapVr/WqVapVqlWqVapVqlWqVa///////////////////////////////////////////6qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq" ALT="big sample"></P>
+
+<P>A smaller 16x16 image inline with text: before
+<IMG SRC="data:msx;base64,BBCqqqqqlWqpVpBqqQaTGqTGk8aTxpNxTcaTXDXGk1fVxpNVVcaTVVXGk8VTxpFxTUaRXDVGkFfVBpVVVVaqqqqq" ALT="small"> after.</P>
+
+<P>Back to regular text.</P>
+</BODY>
+</HTML>
