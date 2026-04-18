@@ -1712,6 +1712,40 @@ BuildFcbFromUrl:
     jr      nz, .pe
     ret
 
+; DetectArabicInBuf: walk the first FileLen bytes of FileBuf and return
+; A = 1 as soon as any byte's IsoJoin entry carries the IS_ARABIC flag;
+; A = 0 if the whole buffer is ASCII-only. Used by PrintFileContent to
+; auto-switch .txt files to RTL when they contain Arabic text.
+DetectArabicInBuf:
+    ld      hl, FileBuf
+    ld      bc, [FileLen]
+.daLoop:
+    ld      a, b
+    or      c
+    jr      z, .daNone
+    ld      a, [hl]
+    inc     hl
+    dec     bc
+    cp      0x80
+    jr      c, .daLoop                  ; ASCII
+    push    hl
+    push    bc
+    sub     0x80
+    ld      e, a
+    ld      d, 0
+    ld      hl, IsoJoin
+    add     hl, de
+    ld      a, [hl]
+    pop     bc
+    pop     hl
+    and     IS_ARABIC
+    jr      z, .daLoop
+    ld      a, 1
+    ret
+.daNone:
+    xor     a
+    ret
+
 ; DetectPlainText: set PlainTextMode = 1 when the FCB's extension is
 ; "TXT", else 0. Must be called AFTER BuildFcbFromUrl so the three
 ; extension bytes at Fcb+9..11 are populated (uppercased, space-padded).
@@ -1872,6 +1906,23 @@ PrintFileContent:
     ld      [HtmlDir], a
     ld      [HtmlDefaultAlign], a
     ld      [HtmlDefaultDir], a
+    ; .txt files containing Arabic bytes default to RTL so the page
+    ; renders like an Arabic <html dir="rtl">. Scan FileBuf for any
+    ; byte whose IsoJoin entry flags IS_ARABIC; if found, seed the
+    ; document-level dir + align before HTML parsing starts.
+    ld      a, [PlainTextMode]
+    or      a
+    jr      z, .noAutoRtl
+    call    DetectArabicInBuf
+    or      a
+    jr      z, .noAutoRtl
+    ld      a, 1
+    ld      [HtmlDir], a
+    ld      [HtmlDefaultDir], a
+    ld      [HtmlAlign], a
+    ld      [HtmlDefaultAlign], a
+.noAutoRtl:
+
     ; .txt files: enable <pre>-style whitespace preservation so LF/CR
     ; produce real newlines and spaces/tabs aren't collapsed.
     ld      a, [PlainTextMode]
