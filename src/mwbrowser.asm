@@ -2501,6 +2501,24 @@ EmitRaw:
     add     a, a                        ; A = HtmlFg << CELL_FG_SHIFT
     or      c
     ld      c, a
+
+    ; Fold HtmlStyleFlags (BOLD/ITALIC/UNDERLINE/STRIKE) into attr so
+    ; per-cell style survives the EmitRaw -> LineFlush delay.
+    ld      a, [HtmlStyleFlags]
+    push    af
+    and     STYLE_BOLD | STYLE_ITALIC   ; bits 0-1
+    add     a, a
+    add     a, a                        ; shift left 2 -> bits 2-3
+    or      c
+    ld      c, a
+    pop     af
+    and     STYLE_UNDERLINE | STYLE_STRIKE  ; bits 2-3
+    add     a, a
+    add     a, a
+    add     a, a
+    add     a, a                        ; shift left 4 -> bits 6-7
+    or      c
+    ld      c, a
 .storeAttr:
     ld      [hl], c
     ; Track last-space position for SmartWrap. B = glyph, the new cell's
@@ -2897,12 +2915,20 @@ ReverseRangeStatic:
 ; 492-px canvas edge (= byte-col 123) fits in an 8-bit register -- an
 ; earlier attempt at pixel math silently truncated CONTENT_X_END+1 (=0x1EC)
 ; to 0xEC, pinning "right" to the middle of the page.
-RIGHT_EDGE_COL equ (CONTENT_X_END + 1) / 4          ; 123
+; Leave one byte-column (4 px) between the rightmost glyph and the view
+; edge so RTL / right-aligned text doesn't touch the content-area frame,
+; mirroring the natural gap LTR text has on the left.
+RIGHT_EDGE_COL equ (CONTENT_X_END + 1) / 4 - 1      ; 122 (gap of 4 px)
 
 LineDrawCells:
     ld      a, [LineLen]
     or      a
     ret     z
+
+    ; Remember global HtmlStyleFlags so the per-cell unpacking below
+    ; doesn't permanently change it for the parser that runs after us.
+    ld      a, [HtmlStyleFlags]
+    ld      [SavedStyleFlags], a
 
     ; If LineStartColOverride != 0xFF, the caller (e.g. a <td> flush) has
     ; already pinned the start column; skip the HtmlAlign math so the
@@ -2960,9 +2986,10 @@ LineDrawCells:
     ld      a, [LineLen]
     cp      b
     jr      nz, .dDraw
-    ; Loop finished: restore the LUT to match the current global HtmlFg so
-    ; callers that don't go through LineDrawCells (toolbar/titlebar) pick
-    ; up the expected colour.
+    ; Loop finished: restore HtmlStyleFlags for the parser (EmitRaw etc.)
+    ; and repoint the LUT at whatever colour HtmlFg currently names.
+    ld      a, [SavedStyleFlags]
+    ld      [HtmlStyleFlags], a
     ld      a, [HtmlFg]
     jp      SetLutFromPalette
 .dDraw:
@@ -2979,16 +3006,35 @@ LineDrawCells:
     ld      c, a                        ; C = y
 
     ; Pick the per-cell colour LUT from the attr byte (bits 4-5) so inline
-    ; <font color> swaps take effect mid-line.
+    ; <font color> swaps take effect mid-line. At the same time, unpack
+    ; per-cell style bits into HtmlStyleFlags so DrawCharFast renders the
+    ; right mix of bold / italic / underline / strike for this glyph.
     push    bc
     ld      a, [LineDrawI]
     call    LGet_Attr
+    push    af
     and     CELL_FG_MASK
     rrca
     rrca
     rrca
     rrca                                ; A = palette index
     call    SetLutFromPalette
+    pop     af
+    ; attr bits 2-3  -> HtmlStyleFlags bits 0-1 (BOLD, ITALIC)
+    ; attr bits 6-7  -> HtmlStyleFlags bits 2-3 (UNDERLINE, STRIKE)
+    ld      b, a
+    and     0x0C
+    rrca
+    rrca                                ; bits 0-1
+    ld      c, a
+    ld      a, b
+    and     0xC0
+    rrca
+    rrca
+    rrca
+    rrca                                ; bits 2-3
+    or      c
+    ld      [HtmlStyleFlags], a
     pop     bc
 
     ld      a, [LineDrawI]
@@ -3005,6 +3051,7 @@ LineDrawCells:
 
 LineStartCol:   db 0
 LineDrawI:      db 0
+SavedStyleFlags: db 0
 
 ; SmartWrap: called from EmitRaw when the next glyph wouldn't fit on the
 ; current line. If LineLastSpace marks a space on the current line, stash
@@ -4097,6 +4144,7 @@ TagTableTag:
 
     call    DrawTableRuleHere
     ld      a, [TextY]
+    ld      [TableTopY], a              ; remember top for full-height borders
     add     a, TABLE_ROW_GAP
     ld      [TextY], a
     ld      [HtmlRowTopY], a
@@ -4105,14 +4153,73 @@ TagTableTag:
 .close:
     ; Flush the last cell of the last row before closing out the table.
     call    FlushPendingCell
-    ; Close the last row's bottom rule + blank line.
+    call    CountTableRow
+    ld      a, [HtmlLineSkip]
+    or      a
+    jr      nz, .ttSkipAdv
+    ; Close the last row's bottom rule.
     ld      a, [HtmlRowTopY]
     add     a, TEXT_LINE_H
     ld      [TextY], a
     call    DrawTableRuleHere
+    ; Paint the vertical borders as continuous lines on top of the
+    ; horizontal rules, so row-to-row transitions don't chop them.
+    call    DrawTableVerticals
+.ttSkipAdv:
     xor     a
     ld      [HtmlInTable], a
     jp      EmitBlankLine
+
+; DrawTableVerticals: draw the four full-height vertical borders that
+; frame the table (left edge, two inner column dividers, right edge).
+; Each line runs from TableTopY down to the just-drawn bottom rule.
+DrawTableVerticals:
+    ; BorderHeight = bottom - top + 1
+    ld      a, [TextY]
+    ld      b, a
+    ld      a, [TableTopY]
+    cpl
+    add     a, 1
+    add     a, b
+    inc     a
+    ld      [BorderHeight], a
+
+    ld      b, (TABLE_LEFT_PX - 4) / 4
+    call    .dtvBar
+    ld      b, (172 - 4) / 4
+    call    .dtvBar
+    ld      b, (332 - 4) / 4
+    call    .dtvBar
+    ld      b, TABLE_RIGHT_PX / 4
+    ; fall through for the right border
+
+.dtvBar:
+    ld      a, [TableTopY]
+    ld      c, a
+    ld      d, 1
+    ld      a, [BorderHeight]
+    ld      e, a
+    ld      a, COL_DGRAY
+    jp      FillRect
+
+; CountTableRow: bump HtmlLineCount and decrement HtmlLineSkip so a
+; <tr>-advance contributes to the scroll-line bookkeeping the same way
+; a tag-driven EmitNewline would. Preserves all other state.
+CountTableRow:
+    push    af
+    ld      a, [HtmlLineCount]
+    inc     a
+    jr      z, .ctSat                   ; saturate at 0xFF
+    ld      [HtmlLineCount], a
+.ctSat:
+    ld      a, [HtmlLineSkip]
+    or      a
+    jr      z, .ctDone
+    dec     a
+    ld      [HtmlLineSkip], a
+.ctDone:
+    pop     af
+    ret
 
 ; <tr>: close the previous row (if any) with a rule + gap, and open a new
 ; row by resetting state and caching the new RowTopY.
@@ -4129,7 +4236,16 @@ TagTr:
     ; moving the Y cursor down.
     call    FlushPendingCell
 
+    ; Account the just-closed row in the scroll line counter: HtmlLineSkip
+    ; decrements on scrolled pages so PageDown crosses the table the same
+    ; way as the rest of the document, and HtmlLineCount grows so the
+    ; thumb height reflects the true page length.
+    call    CountTableRow
+
     ; Close previous row: advance TextY past its text, draw rule, gap.
+    ld      a, [HtmlLineSkip]
+    or      a
+    jr      nz, .trNoAdvance
     ld      a, [HtmlRowTopY]
     add     a, TEXT_LINE_H
     ld      [TextY], a
@@ -4137,6 +4253,7 @@ TagTr:
     ld      a, [TextY]
     add     a, TABLE_ROW_GAP
     ld      [TextY], a
+.trNoAdvance:
 
 .newRow:
     xor     a
@@ -4167,14 +4284,24 @@ TagTd:
     ; remembered start X. Must happen before we overwrite CellStartX/TextX.
     call    FlushPendingCell
 
-    ; Compute cell start X from TableColStartX[HtmlTableCol]. Entries are
-    ; 16-bit because col 2 sits past 255 px. Overflow clamps to last slot.
+    ; Compute cell start X from TableColStartX[index]. Under RTL we
+    ; mirror the column so col 0 lands at the rightmost position. The
+    ; position table has three slots whose left-right order is flipped
+    ; for RTL -- columns past the third fall back to the extreme slot.
     ld      a, [HtmlTableCol]
     cp      3
     jr      c, .okCol
     ld      a, 2
 .okCol:
-    ld      e, a
+    ld      b, a
+    ld      a, [HtmlDir]
+    or      a
+    jr      z, .ltrCol
+    ld      a, 2
+    sub     b                           ; RTL: index = 2 - HtmlTableCol
+    ld      b, a
+.ltrCol:
+    ld      e, b
     ld      d, 0
     ld      hl, TableColStartX
     add     hl, de
@@ -4182,6 +4309,19 @@ TagTd:
     ld      e, [hl]
     inc     hl
     ld      d, [hl]                     ; DE = cell start X (2 bytes)
+    ; Cell end X comes from TableColEndX at the same physical index.
+    push    de
+    ld      e, b
+    ld      d, 0
+    ld      hl, TableColEndX
+    add     hl, de
+    add     hl, de
+    ld      a, [hl]
+    ld      [CellEndX], a
+    inc     hl
+    ld      a, [hl]
+    ld      [CellEndX + 1], a
+    pop     de
     ld      a, e
     ld      [TextX], a
     ld      [CellStartX], a
@@ -4189,16 +4329,8 @@ TagTd:
     ld      [TextX + 1], a
     ld      [CellStartX + 1], a
 
-    ; Draw the vertical divider for non-first columns. The divider sits
-    ; 4 px before the cell's content X.
-    ld      a, [HtmlTableCol]
-    or      a
-    jr      z, .noDivider
-    ld      hl, -4
-    add     hl, de                      ; HL = divider X = content X - 4
-    call    DrawCellDividerAt_HL
-
-.noDivider:
+    ; Column dividers are now painted as full-height lines by
+    ; DrawTableVerticals at </TABLE>, so no per-cell divider here.
     ld      a, [HtmlTableCol]
     inc     a
     ld      [HtmlTableCol], a
@@ -4248,8 +4380,25 @@ FlushPendingCell:
     ld      a, [LineLen]
     or      a
     ret     z
+    ; RTL tables: align cell text to the right of the cell. Start pixel
+    ; = CellEndX - LineLen*8 so the last glyph lands flush with the cell
+    ; divider on the right. LTR cells keep left-alignment at CellStartX.
+    ld      a, [HtmlDir]
+    or      a
+    jr      z, .fpcLeft
+    ld      hl, [CellEndX]
+    ld      a, [LineLen]
+    add     a, a
+    add     a, a
+    add     a, a                        ; A = LineLen * 8
+    ld      e, a
+    ld      d, 0
+    and     a
+    sbc     hl, de                      ; HL = cell_end - text_width
+    jr      .fpcByteCol
+.fpcLeft:
     ld      hl, [CellStartX]
-    ; byte col = pixel X / 4
+.fpcByteCol:
     srl     h
     rr      l
     srl     h
@@ -4261,14 +4410,25 @@ FlushPendingCell:
     ld      [LineStartColOverride], a
     ret
 
-; Content-start X per column (16-bit: col 2 sits past 255). The three-column
-; layout leaves 4 px of padding before the first cell and 4 px after the
-; last divider.
+; Content-start X per column (16-bit: col 2 sits past 255). For tables
+; with no width attribute (all we support right now) we leave a ~10 px
+; margin on both sides of the content area: left pad = 12 px, right edge
+; of the last cell = pixel 480 (11 px from the frame). Byte alignment
+; forces small rounding, so the actual numbers are 12 / 11.
+TABLE_LEFT_PX  equ 12
+TABLE_RIGHT_PX equ 480
 TableColStartX:
-    dw  4, 164, 324
+    dw  TABLE_LEFT_PX, 172, 332
+; Right edge (inclusive) for each column; used by RTL cell right-align
+; and by the full-height border draw below. The last column stretches
+; to TABLE_RIGHT_PX; the earlier columns stop 4 px before the next
+; column's content X so the vertical divider can land in the gap.
+TableColEndX:
+    dw  168, 328, TABLE_RIGHT_PX
 
-; DrawTableRuleHere: horizontal DGRAY rule at the current TextY across the
-; content width. Skipped while LineSkip is non-zero.
+; DrawTableRuleHere: horizontal DGRAY rule at the current TextY across
+; the table's width (from TABLE_LEFT_PX to TABLE_RIGHT_PX). Skipped
+; while LineSkip is non-zero.
 DrawTableRuleHere:
     ld      a, [HtmlLineSkip]
     or      a
@@ -4277,8 +4437,8 @@ DrawTableRuleHere:
     cp      CONTENT_Y1 - TEXT_LINE_H + 2
     ret     nc
     ld      c, a
-    ld      b, 0
-    ld      d, (CONTENT_X_END + 1) / 4
+    ld      b, TABLE_LEFT_PX / 4
+    ld      d, (TABLE_RIGHT_PX - TABLE_LEFT_PX + 4) / 4
     ld      a, COL_DGRAY
     jp      DrawHLine
 
@@ -6267,7 +6427,7 @@ AboutLine2:     db 0x4D, 0x53, 0x58, 0x32, 0x20
 AboutLine3:     db "github.com/techana/mwbrowser", 0
 AboutLine4:     db "F1 shows this dialog.", 0
 AboutLine5:     db "Esc closes / quits.", 0
-AboutFooter:    db "v0.3 demo build", 0
+AboutFooter:    db "v0.4 demo build", 0
 
 ; Screen-6 icon bitmaps (4 px/byte, 11=black, 01=bg/lgray).
 
@@ -6434,6 +6594,9 @@ LineStartColOverride: db 0xFF
 ; flushed at that X (rather than the wandering TextX) when the next <td>
 ; opens or the row ends.
 CellStartX:     dw 0
+CellEndX:       dw 0
+TableTopY:      db 0
+BorderHeight:   db 0
 ; Index (in LineGlyph) of the most-recent space cell on the current line,
 ; or 0xFF when the line has no space yet. Used by SmartWrap to break at
 ; word boundaries instead of mid-word.
