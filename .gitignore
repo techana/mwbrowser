@@ -9,3 +9,7 @@
 !src/iso8859_6.inc
 !dist/
 !dist/mwbro.com
+!samples/
+!samples/*.htm
+!samples/*.html
+!samples/*.txt

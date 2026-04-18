@@ -1,0 +1,6 @@
+Plain text file -- no HTML parsing.
+Latin: hello world.
+Arabic: Â—Õ»« »«‰Ÿ«‰Â
+Lam-alef fuse: „ «» ‰« ‘Í¡
+Lam-alef fuse 2: ‰√Ê Á–« ‰≈Œ »«—
+Digits: ±≤≥ ¨ ø
