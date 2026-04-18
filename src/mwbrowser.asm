@@ -3724,6 +3724,8 @@ ScanHrefAttr:
     xor     a
     ld      [HtmlCurHrefLen], a
     ld      [HtmlCurHref], a            ; default = empty string
+    ld      [HtmlCurSrcPtr], a
+    ld      [HtmlCurSrcPtr + 1], a      ; SRC pointer starts NULL
 .sh_scan:
     ld      a, [hl]
     cp      '>'
@@ -3732,19 +3734,77 @@ ScanHrefAttr:
     ; (for <font>) starting here. They share HtmlCurHref since no tag uses
     ; more than one of them.
     cp      'h'
-    jr      z, .sh_tryHref
+    jp      z, .sh_tryHref
     cp      'H'
-    jr      z, .sh_tryHref
+    jp      z, .sh_tryHref
     cp      'a'
-    jr      z, .sh_tryAlt
+    jp      z, .sh_tryAlt
     cp      'A'
-    jr      z, .sh_tryAlt
+    jp      z, .sh_tryAlt
     cp      'c'
-    jr      z, .sh_tryColor
+    jp      z, .sh_tryColor
     cp      'C'
-    jr      z, .sh_tryColor
+    jp      z, .sh_tryColor
+    cp      's'
+    jp      z, .sh_trySrc
+    cp      'S'
+    jp      z, .sh_trySrc
     inc     hl
-    jr      .sh_scan
+    jp      .sh_scan
+
+.sh_trySrc:
+    push    hl
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'R'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'C'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    cp      '='
+    jp      nz, .sh_noMatch
+    inc     hl
+    pop     bc
+    ; HL is at the char after '=' (either a quote or the value's first
+    ; char). For data URIs the value is long, so instead of copying into
+    ; the 32-byte HtmlCurHref, remember the pointer into FileBuf and let
+    ; TagImg read it directly.
+    ld      a, [hl]
+    cp      0x22                        ; double quote
+    jr      z, .sh_srcQuoted
+    cp      0x27                        ; apostrophe
+    jr      z, .sh_srcQuoted
+    ld      [HtmlCurSrcPtr], hl
+    jr      .sh_srcSkip
+.sh_srcQuoted:
+    inc     hl
+    ld      [HtmlCurSrcPtr], hl
+.sh_srcSkip:
+    ; Skip to closing quote / '>' so ScanHrefAttr's main loop can pick
+    ; up the next attribute. We don't care about the exact delimiter; the
+    ; TagImg decoder re-reads via HtmlCurSrcPtr and stops at the value
+    ; terminator (quote or close-angle).
+.sh_srcSkipLoop:
+    ld      a, [hl]
+    or      a
+    jr      z, .sh_srcSkipDone
+    cp      '>'
+    jr      z, .sh_srcSkipDone
+    cp      0x22
+    jr      z, .sh_srcSkipAfterQuote
+    cp      0x27
+    jr      z, .sh_srcSkipAfterQuote
+    inc     hl
+    jr      .sh_srcSkipLoop
+.sh_srcSkipAfterQuote:
+    inc     hl
+.sh_srcSkipDone:
+    jp      .sh_scan
 
 .sh_tryHref:
     push    hl
@@ -4141,14 +4201,31 @@ TagBlockquote:
 ; when no alt). Uses a shared ScanAltAttr populated during ParseTag in the
 ; same style as href. Self-closing; no matching close tag needed.
 TagImg:
-    ; Open a bracket, then print HtmlCurHref (we repurpose the href buffer
-    ; for the alt text capture below), then close bracket.
+    ; If the src attribute carries our "data:msx;base64,<payload>" magic,
+    ; decode and blit the image. Otherwise fall back to the legacy
+    ; "[alt-text]" placeholder.
+    ld      hl, [HtmlCurSrcPtr]
+    ld      a, h
+    or      l
+    jp      z, .altFallback
+    ld      de, DataMsxPrefix
+    ld      b, DataMsxPrefixLen
+.tiCmp:
+    ld      a, [de]
+    cp      [hl]
+    jr      nz, .altFallback
+    inc     de
+    inc     hl
+    djnz    .tiCmp
+    ; HL now points at first base64 char. Decode + render.
+    jp      RenderImageDataUri
+
+.altFallback:
     ld      a, '['
     call    EmitSink
     ld      a, [HtmlCurHref]
     or      a
     jr      nz, .copyAlt
-    ; Empty alt -> print "img"
     ld      hl, TagImgWord
     jr      .loop
 .copyAlt:
@@ -4166,7 +4243,250 @@ TagImg:
     ld      a, ']'
     jp      EmitSink
 
-TagImgWord: db "img", 0
+TagImgWord:      db "img", 0
+DataMsxPrefix:   db "data:msx;base64,"
+DataMsxPrefixLen equ $ - DataMsxPrefix
+
+; RenderImageDataUri: HL points at the first base64 char of a
+; "data:msx;base64,..." value inside FileBuf. Decode the base64 stream
+; into ImgBuf, then blit the image to VRAM at the current pen position.
+; Format: byte0 = width in bytes (pixels/4), byte1 = height in rows,
+; followed by width_bytes * height raw Screen-6 2bpp bytes.
+RenderImageDataUri:
+    ; Flush anything the current paragraph has accumulated so the image
+    ; doesn't overdraw pending text, then line-break so the image drops
+    ; onto a fresh baseline.
+    push    hl
+    call    ArFlush
+    call    LineFlush
+    pop     hl
+
+    ; Decode base64 stream into ImgBuf. B64Decode reads from HL until
+    ; it hits a non-base64 terminator (quote, '>', NUL).
+    ld      de, ImgBuf
+    call    B64Decode
+
+    ; If we're in the scroll-skip phase just advance the bookkeeping by
+    ; the image's row count (ceil(height/8)) and bail out; otherwise
+    ; actually paint the pixels.
+    ld      hl, ImgBuf
+    ld      a, [hl]
+    ld      [ImgWidthB], a
+    inc     hl
+    ld      a, [hl]
+    ld      [ImgHeightR], a
+
+    ld      a, [HtmlLineSkip]
+    or      a
+    jr      nz, .imgSkip
+
+    ; Rendering path: blit at HtmlIndent, TextY.
+    ld      a, [HtmlIndent]
+    ld      [TextX], a
+    xor     a
+    ld      [TextX + 1], a
+    call    BlitImageFromImgBuf
+
+    ; Advance TextY by image height (minus 8) so the final EmitNewline
+    ; of the enclosing tag/flow lands on the line after the image.
+    ld      a, [ImgHeightR]
+    ld      b, a
+    ld      a, [TextY]
+    add     a, b
+    cp      CONTENT_Y1 + 1
+    jr      c, .tyOk
+    ld      a, CONTENT_Y1 - 8
+.tyOk:
+    ld      [TextY], a
+    jr      .imgAdvanceCount
+
+.imgSkip:
+    ; No draw; just keep TextY pinned at its current value.
+
+.imgAdvanceCount:
+    ; Bump HtmlLineCount / HtmlLineSkip by ceil(height/8) rows.
+    ld      a, [ImgHeightR]
+    add     a, 7
+    srl     a
+    srl     a
+    srl     a
+    ld      b, a                        ; B = rows
+.imgBumpLoop:
+    ld      a, b
+    or      a
+    jr      z, .imgBumpDone
+    push    bc
+    call    CountTableRow               ; reuse the row-counter helper
+    pop     bc
+    dec     b
+    jr      .imgBumpLoop
+.imgBumpDone:
+    ret
+
+; B64Decode: source in HL, destination in DE. Decodes until '"', '>',
+; or NUL in the source. Preserves DE and HL at return for no particular
+; reason; callers don't care.
+B64Decode:
+.b64Loop:
+    call    B64ReadChar
+    cp      0xFF
+    ret     z
+    ld      [B64C0], a
+    call    B64ReadChar
+    cp      0xFF
+    ret     z
+    ld      [B64C1], a
+    ; out[0] = (C0 << 2) | (C1 >> 4)
+    ld      a, [B64C0]
+    add     a, a
+    add     a, a
+    ld      b, a
+    ld      a, [B64C1]
+    rrca
+    rrca
+    rrca
+    rrca
+    and     0x0F
+    or      b
+    ld      [de], a
+    inc     de
+
+    call    B64ReadChar
+    cp      0xFF
+    ret     z
+    ld      [B64C2], a
+    ; out[1] = ((C1 & 0x0F) << 4) | (C2 >> 2)
+    ld      a, [B64C1]
+    and     0x0F
+    add     a, a
+    add     a, a
+    add     a, a
+    add     a, a
+    ld      b, a
+    ld      a, [B64C2]
+    rrca
+    rrca
+    and     0x3F
+    or      b
+    ld      [de], a
+    inc     de
+
+    call    B64ReadChar
+    cp      0xFF
+    ret     z
+    ld      [B64C3], a
+    ; out[2] = ((C2 & 0x03) << 6) | C3
+    ld      a, [B64C2]
+    and     0x03
+    rrca
+    rrca
+    ld      b, a
+    ld      a, [B64C3]
+    or      b
+    ld      [de], a
+    inc     de
+    jr      .b64Loop
+
+; B64ReadChar: read one char from [HL], advance HL, translate to 0..63.
+; Returns 0xFF on any non-base64 terminator (including '=').
+B64ReadChar:
+    ld      a, [hl]
+    inc     hl
+    or      a
+    jr      z, .b64Bad
+    cp      0x22                        ; double quote
+    jr      z, .b64Bad
+    cp      '>'
+    jr      z, .b64Bad
+    cp      '='
+    jr      z, .b64Bad
+    cp      '+'
+    jr      nz, .b64NotPlus
+    ld      a, 62
+    ret
+.b64NotPlus:
+    cp      '/'
+    jr      nz, .b64NotSlash
+    ld      a, 63
+    ret
+.b64NotSlash:
+    cp      '0'
+    jr      c, .b64Bad
+    cp      '9' + 1
+    jr      nc, .b64NotDigit
+    sub     '0' - 52
+    ret
+.b64NotDigit:
+    cp      'A'
+    jr      c, .b64Bad
+    cp      'Z' + 1
+    jr      nc, .b64MaybeLower
+    sub     'A'
+    ret
+.b64MaybeLower:
+    cp      'a'
+    jr      c, .b64Bad
+    cp      'z' + 1
+    jr      nc, .b64Bad
+    sub     'a' - 26
+    ret
+.b64Bad:
+    ld      a, 0xFF
+    ret
+
+; BlitImageFromImgBuf: draw the decoded image (ImgBuf + 2) at
+; (TextX byte col, TextY). Reads ImgWidthB and ImgHeightR for size.
+BlitImageFromImgBuf:
+    ld      hl, ImgBuf
+    inc     hl
+    inc     hl                           ; HL = ImgBuf + 2 (pixel data start)
+    ld      a, [TextX]
+    srl     a
+    srl     a
+    ld      [ImgStartCol], a
+    ld      a, [TextY]
+    ld      [ImgCurY], a
+    xor     a
+    ld      [ImgCurRow], a
+.blRow:
+    ld      a, [ImgCurRow]
+    ld      b, a
+    ld      a, [ImgHeightR]
+    cp      b
+    ret     z
+    push    hl
+    ld      a, [ImgStartCol]
+    ld      b, a
+    ld      a, [ImgCurY]
+    ld      c, a
+    call    SetVramWritePos
+    pop     hl
+    ld      a, [ImgWidthB]
+    ld      b, a
+.blCol:
+    ld      a, [hl]
+    out     [VDP_DATA], a
+    inc     hl
+    djnz    .blCol
+    ld      a, [ImgCurY]
+    inc     a
+    ld      [ImgCurY], a
+    ld      a, [ImgCurRow]
+    inc     a
+    ld      [ImgCurRow], a
+    jr      .blRow
+
+; Scratch for the base64 decode + image blit pipeline.
+B64C0:        db 0
+B64C1:        db 0
+B64C2:        db 0
+B64C3:        db 0
+ImgWidthB:    db 0
+ImgHeightR:   db 0
+ImgStartCol:  db 0
+ImgCurY:      db 0
+ImgCurRow:    db 0
+HtmlCurSrcPtr: dw 0
 
 ; <font color="name">: push current fg, set new fg + CurrentFontLUT from
 ; the color name stored in HtmlCurHref (ScanHrefAttr captured it via the
@@ -6829,3 +7149,7 @@ HtmlNextDir:    db 0xFF                 ; scratch: dir= parsed on current tag
 ; MSX-DOS leaves above the program.
 FileBuf         equ $
 FontBuf         equ FileBuf + FILE_BUF_SIZE
+; 1 KB scratch for the data:msx;base64 image decoder. Sits above the
+; font cache in TPA.
+IMG_BUF_SIZE    equ 1024
+ImgBuf          equ FontBuf + 2048
