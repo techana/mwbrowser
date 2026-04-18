@@ -1318,6 +1318,31 @@ PaintAddressBar:
     ld      hl, UrlBuf
     call    DrawString
 
+    ; Text caret: a 4-px-wide black column just past the URL when the
+    ; address bar has focus, so it's obvious that typing will land here.
+    ld      a, [ButtonState]
+    and     BTN_FOCUSED
+    jr      z, .noCaret
+    ld      a, [UrlLen]
+    add     a, a
+    add     a, a
+    add     a, a                        ; A = UrlLen * 8 (px offset)
+    ld      e, a
+    ld      d, 0
+    ld      hl, ADDR_X0 + 4
+    add     hl, de                      ; HL = caret pixel X
+    srl     h
+    rr      l
+    srl     h
+    rr      l                           ; HL = byte col
+    ld      b, l                        ; B = byteCol
+    ld      c, BTN_Y0 + 3
+    ld      d, 1                        ; 1 byte wide = 4 px
+    ld      e, BTN_H - 6
+    ld      a, COL_BLACK
+    call    FillRect
+.noCaret:
+
     ; Clear-button glyph at right edge of the address bar (visual hint for
     ; Ctrl+L = MSX CLS). Dark-gray so it doesn't compete with the URL.
     ld      a, COL_DGRAY
@@ -2399,14 +2424,11 @@ EmitRaw:
     push    bc
 
     ld      b, a                        ; B = glyph
-    ld      a, [HtmlLineSkip]
-    or      a
-    jr      nz, .done                   ; suppressed: no buffer, no wrap, no advance
 
-    ; Wrap: if TextX > CONTENT_X_END - 6, break at the most-recent space on
-    ; the current line (SmartWrap), carrying the trailing word over to the
-    ; next line. Falls back to a hard mid-word wrap when no space is on the
-    ; line yet (a single word longer than the canvas width).
+    ; Wrap check runs in both render and skip-scroll phases so the line
+    ; count that backs HtmlLineSkip includes wrap breaks, not only
+    ; tag-driven EmitNewlines. Without this a scroll step skips past
+    ; wrap-produced rows and PageDown overshoots the next page.
     ld      hl, [TextX]
     ld      de, CONTENT_X_END - 6
     and     a
@@ -2417,6 +2439,19 @@ EmitRaw:
     pop     bc
 .posOk:
 
+    ; Skip phase: wrap has already been handled above; skip the buffer
+    ; append and the TextY bottom check, but keep TextX advancing so the
+    ; next wrap fires at the same X as it would during a full render.
+    ld      a, [HtmlLineSkip]
+    or      a
+    jr      z, .doAppend
+    ld      hl, [TextX]
+    ld      de, 8
+    add     hl, de
+    ld      [TextX], hl
+    jr      .done
+
+.doAppend:
     ; Bottom check: past canvas bottom -> advance cursor silently (no append).
     ld      a, [HtmlScaleY]
     add     a, a
@@ -2444,12 +2479,23 @@ EmitRaw:
     ; Space glyph (0x20) in an LTR cell -> mark as Neutral (takes direction
     ; of surrounding strong cells during BiDi neutral resolution).
     and     CELL_RTL
-    jr      nz, .storeAttr              ; RTL cell: trust caller
+    jr      nz, .attrDone               ; RTL cell: trust caller
     ld      a, b
     cp      0x20
-    jr      nz, .storeAttr
+    jr      nz, .attrDone
     ld      a, c
     or      CELL_NEUTRAL
+    ld      c, a
+.attrDone:
+    ; Fold current foreground palette index into bits 4-5 of the attr so
+    ; inline <font color> swaps survive into LineDrawCells.
+    ld      a, [HtmlFg]
+    and     0x03
+    add     a, a
+    add     a, a
+    add     a, a
+    add     a, a                        ; A = HtmlFg << CELL_FG_SHIFT
+    or      c
     ld      c, a
 .storeAttr:
     ld      [hl], c
@@ -2854,7 +2900,17 @@ LineDrawCells:
     or      a
     ret     z
 
+    ; If LineStartColOverride != 0xFF, the caller (e.g. a <td> flush) has
+    ; already pinned the start column; skip the HtmlAlign math so the
+    ; cell lands at its column edge rather than the paragraph's alignment.
+    ld      a, [LineStartColOverride]
+    cp      0xFF
+    jr      z, .ldoDefault
+    jp      .alHave
+
+.ldoDefault:
     ; Width in byte-cols = len * 2 (each cell is 8 pixels = 2 byte-cols).
+    ld      a, [LineLen]
     add     a, a
     ld      c, a
 
@@ -2899,7 +2955,13 @@ LineDrawCells:
     ld      b, a
     ld      a, [LineLen]
     cp      b
-    ret     z
+    jr      nz, .dDraw
+    ; Loop finished: restore the LUT to match the current global HtmlFg so
+    ; callers that don't go through LineDrawCells (toolbar/titlebar) pick
+    ; up the expected colour.
+    ld      a, [HtmlFg]
+    jp      SetLutFromPalette
+.dDraw:
 
     ; byteCol = startCol + i * 2  (each cell is 2 byte-cols wide)
     ld      a, [LineStartCol]
@@ -2911,6 +2973,19 @@ LineDrawCells:
 
     ld      a, [TextY]
     ld      c, a                        ; C = y
+
+    ; Pick the per-cell colour LUT from the attr byte (bits 4-5) so inline
+    ; <font color> swaps take effect mid-line.
+    push    bc
+    ld      a, [LineDrawI]
+    call    LGet_Attr
+    and     CELL_FG_MASK
+    rrca
+    rrca
+    rrca
+    rrca                                ; A = palette index
+    call    SetLutFromPalette
+    pop     bc
 
     ld      a, [LineDrawI]
     call    LGet_Glyph                  ; A = glyph
@@ -3843,6 +3918,11 @@ TagImgWord: db "img", 0
 ; the color name stored in HtmlCurHref (ScanHrefAttr captured it via the
 ; href/alt path). </font> pops. Only a small set of names maps to our 4
 ; palette entries; anything else falls through to the default (BLACK).
+; Before we swap the foreground, flush whatever is already pending in
+; LineBuf at its current line-start pixel X -- LineDrawCells reads one
+; global HtmlFg/CurrentFontLUT at flush time, so an inline colour change
+; would otherwise recolour cells that were emitted under the previous
+; font.
 TagFont:
     ld      a, [HtmlIsClose]
     or      a
@@ -3922,17 +4002,24 @@ TagFont:
 ; SetHtmlFg: A = palette index (0..3). Updates HtmlFg + CurrentFontLUT.
 SetHtmlFg:
     ld      [HtmlFg], a
+    jp      SetLutFromPalette
+
+; SetLutFromPalette: A = palette index (0..3). Writes CurrentFontLUT to
+; match. Does NOT touch HtmlFg, so callers that need a one-off LUT swap
+; (e.g. LineDrawCells picking a per-cell colour) can restore the global
+; fg afterwards by writing back [HtmlFg] through SetHtmlFg.
+SetLutFromPalette:
     ld      hl, FontLUT                 ; default = BLACK
     cp      COL_BLACK
-    jr      z, .sfDone
+    jr      z, .spDone
     ld      hl, FontLUT_LGray
     cp      COL_LGRAY
-    jr      z, .sfDone
+    jr      z, .spDone
     ld      hl, FontLUT_DGray
     cp      COL_DGRAY
-    jr      z, .sfDone
+    jr      z, .spDone
     ld      hl, FontLUT                 ; fallback (WHITE invisible anyway)
-.sfDone:
+.spDone:
     ld      [CurrentFontLUT], hl
     ret
 
@@ -4012,6 +4099,8 @@ TagTableTag:
     ret
 
 .close:
+    ; Flush the last cell of the last row before closing out the table.
+    call    FlushPendingCell
     ; Close the last row's bottom rule + blank line.
     ld      a, [HtmlRowTopY]
     add     a, TEXT_LINE_H
@@ -4031,6 +4120,10 @@ TagTr:
     ld      a, [HtmlTableFirst]
     or      a
     jr      nz, .newRow
+
+    ; Flush the last cell of the previous row at its saved start X before
+    ; moving the Y cursor down.
+    call    FlushPendingCell
 
     ; Close previous row: advance TextY past its text, draw rule, gap.
     ld      a, [HtmlRowTopY]
@@ -4066,6 +4159,10 @@ TagTd:
     or      a
     ret     nz
 
+    ; Flush any text still in LineBuf from the PREVIOUS cell at its
+    ; remembered start X. Must happen before we overwrite CellStartX/TextX.
+    call    FlushPendingCell
+
     ; Compute cell start X from TableColStartX[HtmlTableCol]. Entries are
     ; 16-bit because col 2 sits past 255 px. Overflow clamps to last slot.
     ld      a, [HtmlTableCol]
@@ -4083,8 +4180,10 @@ TagTd:
     ld      d, [hl]                     ; DE = cell start X (2 bytes)
     ld      a, e
     ld      [TextX], a
+    ld      [CellStartX], a
     ld      a, d
     ld      [TextX + 1], a
+    ld      [CellStartX + 1], a
 
     ; Draw the vertical divider for non-first columns. The divider sits
     ; 4 px before the cell's content X.
@@ -4099,6 +4198,63 @@ TagTd:
     ld      a, [HtmlTableCol]
     inc     a
     ld      [HtmlTableCol], a
+    ret
+
+; FlushInline: draw whatever is in LineBuf at the pixel X where the line
+; actually started (= TextX - LineLen * 8) without advancing TextY. Used
+; right before an inline style swap (e.g. <font color>) so cells emitted
+; under the previous style get rendered under that style, not the new
+; one -- LineDrawCells reads one global style for the whole flush.
+FlushInline:
+    call    ArFlush
+    ld      a, [LineLen]
+    or      a
+    ret     z
+    push    hl
+    push    de
+    push    bc
+    ld      hl, [TextX]
+    ld      a, [LineLen]
+    add     a, a
+    add     a, a
+    add     a, a                        ; A = LineLen * 8 pixels emitted
+    ld      e, a
+    ld      d, 0
+    and     a
+    sbc     hl, de                      ; HL = start pixel X
+    srl     h
+    rr      l
+    srl     h
+    rr      l                           ; HL = start byte col
+    ld      a, l
+    ld      [LineStartColOverride], a
+    call    LineFlush
+    ld      a, 0xFF
+    ld      [LineStartColOverride], a
+    pop     bc
+    pop     de
+    pop     hl
+    ret
+
+; FlushPendingCell: drain anything currently in LineBuf onto VRAM at the
+; previous cell's saved start X (CellStartX), then clear the buffer.
+; No-op if the buffer is empty or no cell was opened yet.
+FlushPendingCell:
+    call    ArFlush                     ; let any pending Arabic word settle
+    ld      a, [LineLen]
+    or      a
+    ret     z
+    ld      hl, [CellStartX]
+    ; byte col = pixel X / 4
+    srl     h
+    rr      l
+    srl     h
+    rr      l
+    ld      a, l
+    ld      [LineStartColOverride], a
+    call    LineFlush
+    ld      a, 0xFF
+    ld      [LineStartColOverride], a
     ret
 
 ; Content-start X per column (16-bit: col 2 sits past 255). The three-column
@@ -5116,40 +5272,52 @@ ScrollUp:
     ld      [ScrollLine], a
     jp      RefreshAfterScroll
 
-; PageUp: subtract TEXT_MAX_LINES from ScrollLine (clamping to 0), refresh.
+; PageUp: subtract PAGE_SCROLL_STEP from ScrollLine (clamping to 0), refresh.
 PageUp:
     ld      a, [ScrollLine]
-    sub     TEXT_MAX_LINES
+    sub     PAGE_SCROLL_STEP
     jr      nc, .store
     xor     a
 .store:
     ld      [ScrollLine], a
     jp      RefreshAfterScroll
 
-; PageDown: add TEXT_MAX_LINES to ScrollLine, clamped to (TotalLines - 1).
+; PageDown: advance ScrollLine by TEXT_MAX_LINES - 2 (so two lines of
+; overlap carry over) and clamp the target so the viewport stays full
+; -- the final page pins to max(0, TotalLines - TEXT_MAX_LINES) instead
+; of TotalLines-1, which would leave the content area mostly blank.
+PAGE_SCROLL_STEP equ TEXT_MAX_LINES - 1
+
 PageDown:
     ld      a, [TotalLines]
     or      a
     ret     z
-    ld      d, a                        ; D = TotalLines
+    cp      TEXT_MAX_LINES + 1
+    ret     c                           ; all content fits: nothing to scroll
+    sub     TEXT_MAX_LINES              ; A = last reachable top-line
+    ld      d, a                        ; D = max ScrollLine
     ld      a, [ScrollLine]
-    add     a, TEXT_MAX_LINES
+    add     a, PAGE_SCROLL_STEP
     cp      d
     jr      c, .pdStore
-    ld      a, d
-    dec     a                           ; clamp to TotalLines - 1
+    ld      a, d                        ; clamp to max so viewport stays full
 .pdStore:
     ld      [ScrollLine], a
     jp      RefreshAfterScroll
 
-; ScrollDown: if there's more content below, bump ScrollLine and refresh.
+; ScrollDown: if there's more content below the viewport, bump ScrollLine
+; and refresh. Clamps at max(0, TotalLines - TEXT_MAX_LINES) so the
+; viewport never bottoms out with a mostly-blank canvas.
 ScrollDown:
     ld      a, [TotalLines]
+    cp      TEXT_MAX_LINES + 1
+    ret     c                           ; everything fits
+    sub     TEXT_MAX_LINES              ; A = max ScrollLine
     ld      d, a
     ld      a, [ScrollLine]
-    inc     a
     cp      d
-    ret     nc                          ; ScrollLine + 1 >= TotalLines
+    ret     nc                          ; already at max
+    inc     a
     ld      [ScrollLine], a
     jp      RefreshAfterScroll
 
@@ -6170,9 +6338,23 @@ PlainTextMode:  db 0                    ; 1 when current file is .txt (no HTML)
 LINE_BUF_MAX    equ 64                  ; ~492px / 8px per cell
 CELL_RTL        equ 0x01                ; Arabic letter (already shaped)
 CELL_NEUTRAL    equ 0x02                ; space/punct — direction from context
+; Colour index (0..3 = palette entry) packed into bits 4-5 of the cell's
+; attr, captured at emit time so inline <font color> changes don't need a
+; mid-line flush. LineDrawCells picks the matching LUT per cell.
+CELL_FG_SHIFT   equ 4
+CELL_FG_MASK    equ 0x30
 LineLen:        db 0
 LineGlyph:      ds LINE_BUF_MAX
 LineAttr:       ds LINE_BUF_MAX
+; 0xFF = "compute start column from HtmlAlign/HtmlIndent". Anything else
+; pins LineDrawCells to that byte column for the next flush, used by
+; table cells that need to land at a specific column X regardless of the
+; paragraph-alignment state. Reset by the caller after each flush.
+LineStartColOverride: db 0xFF
+; Saved start pixel X of the currently-open <td>/<th>, so its text can be
+; flushed at that X (rather than the wandering TextX) when the next <td>
+; opens or the row ends.
+CellStartX:     dw 0
 ; Index (in LineGlyph) of the most-recent space cell on the current line,
 ; or 0xFF when the line has no space yet. Used by SmartWrap to break at
 ; word boundaries instead of mid-word.
