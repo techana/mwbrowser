@@ -129,8 +129,8 @@ CONTENT_W_BYTES equ (CONTENT_X_END + 1) / 4                     ; 124 bytes
 ; ---- About popup geometry (must be byte-aligned: X and W multiples of 4) ----
 ABOUT_X        equ 128
 ABOUT_Y        equ 50
-ABOUT_W        equ 256
-ABOUT_H        equ 120
+ABOUT_W        equ 240
+ABOUT_H        equ 108
 
 ; ---- button state bits ----
 BTN_DISABLED   equ 0x01
@@ -1422,6 +1422,10 @@ FontLUT_LGray:                          ; fg = LGRAY (pair 01)
 FontLUT_DGray:                          ; fg = DGRAY (pair 00)
     db  0xAA, 0xA8, 0xA2, 0xA0, 0x8A, 0x88, 0x82, 0x80
     db  0x2A, 0x28, 0x22, 0x20, 0x0A, 0x08, 0x02, 0x00
+
+FontLUT_BlackOnLgray:                   ; fg = BLACK (pair 11), bg = LGRAY (pair 01)
+    db  0x55, 0x57, 0x5D, 0x5F, 0x75, 0x77, 0x7D, 0x7F
+    db  0xD5, 0xD7, 0xDD, 0xDF, 0xF5, 0xF7, 0xFD, 0xFF
 
 ; ExtractFont: copy the 2 KB font into FontBuf using the live CGPNT pointer.
 ; CGPNT[0]   = slot specifier holding the font
@@ -5829,42 +5833,117 @@ DrawAboutPopup:
     ld      hl, AboutTitleMsg
     call    DrawString
 
-    ld      de, ABOUT_X + ABOUT_W - 12  ; X glyph in the popup's top-right
+    ld      de, ABOUT_X + ABOUT_W - 13  ; X glyph in the popup's top-right (1 px left of the border)
     ld      c, ABOUT_Y + 4
     ld      hl, CharX
     call    DrawString
 
-    ld      de, ABOUT_X + 8
-    ld      c, ABOUT_Y + 24
+    ; Centre "MSX WBrowser" (12 glyphs * 8 px = 96 px) and render it
+    ; bold via DrawCharFast. FontLUT_BlackOnLgray matches the popup's
+    ; LGRAY background; HtmlStyleFlags=STYLE_BOLD makes DrawCharFast
+    ; OR each glyph row with itself shifted right one pixel.
+    ld      hl, FontLUT_BlackOnLgray
+    ld      [CurrentFontLUT], hl
+    ld      a, STYLE_BOLD
+    ld      [HtmlStyleFlags], a
+    ld      b, (ABOUT_X + (ABOUT_W - 96) / 2) / 4    ; byte col = pixel/4
+    ld      c, ABOUT_Y + 12
     ld      hl, AboutLine1
-    call    DrawString
+.apmLoop:
+    ld      a, [hl]
+    or      a
+    jr      z, .apmDone
+    push    hl
+    push    bc
+    call    DrawCharFast
+    pop     bc
+    pop     hl
+    inc     hl
+    inc     b
+    inc     b                                       ; 2 byte cols per 8-px char
+    jr      .apmLoop
+.apmDone:
+    xor     a
+    ld      [HtmlStyleFlags], a
+    ld      hl, FontLUT
+    ld      [CurrentFontLUT], hl
 
-    ; Right-align the Arabic tagline: 23 glyphs * 8 px = 184 px wide,
-    ; so start X = right edge - 8 padding - 184 = ABOUT_X + ABOUT_W - 192.
-    ld      de, ABOUT_X + ABOUT_W - 192
-    ld      c, ABOUT_Y + 36
+    ; Centre the Arabic tagline: 23 glyphs * 8 px = 184 px wide.
+    ld      de, ABOUT_X + (ABOUT_W - 184) / 2
+    ld      c, ABOUT_Y + 24
     ld      hl, AboutLine2
     call    DrawString
 
     ld      de, ABOUT_X + 8
-    ld      c, ABOUT_Y + 48
+    ld      c, ABOUT_Y + 36
     ld      hl, AboutLine3
     call    DrawString
 
     ld      de, ABOUT_X + 8
-    ld      c, ABOUT_Y + 72
+    ld      c, ABOUT_Y + 60
     ld      hl, AboutLine4
     call    DrawString
 
     ld      de, ABOUT_X + 8
-    ld      c, ABOUT_Y + 84
+    ld      c, ABOUT_Y + 72
     ld      hl, AboutLine5
     call    DrawString
 
     ld      de, ABOUT_X + 8
     ld      c, ABOUT_Y + ABOUT_H - 12
     ld      hl, AboutFooter
-    jp      DrawString
+    call    DrawString
+
+    ; 53x15 logo sits to the right of the "MSX WBrowser" line.
+    jp      DrawLogoBitmap
+
+; DrawLogoBitmap: blit LogoBitmap (LOGO_W_BYTES x LOGO_H) into VRAM to
+; the right of the "MSX WBrowser" label, vertically centred around that
+; text row.
+; Bottom-right corner, pulled 2 px in from the popup's frame. Byte-align
+; forces the right-side gap to be a few pixels wider than 2 px (the 3 trailing
+; LGRAY padding pixels make up the difference so nothing visibly sits past
+; the aligned edge).
+; Logo tile is 14 bytes wide (56 px). With the 3-pixel LGRAY padding on
+; the LEFT of each row, the visible 53-px artwork sits at byte_col*4 + 3,
+; which gives a 1-px nudge left vs the right-padded encoding at the same
+; byte column.
+LOGO_DEST_BYTE equ (ABOUT_X + ABOUT_W - 64) / 4   ; byte col 76 -> visible art at pixel 307..359
+LOGO_DEST_Y    equ ABOUT_Y + ABOUT_H - 20         ; 4 px above the bottom border (2 up from -18)
+
+DrawLogoBitmap:
+    ld      hl, LogoBitmap
+    ld      a, LOGO_DEST_Y
+    ld      [LogoCurY], a
+    ld      a, LOGO_H
+    ld      [LogoRowsLeft], a
+.dlbRow:
+    push    hl
+    ld      a, LOGO_DEST_BYTE
+    ld      b, a
+    ld      a, [LogoCurY]
+    ld      c, a
+    call    SetVramWritePos
+    pop     hl
+    ld      b, LOGO_W_BYTES
+.dlbCol:
+    ld      a, [hl]
+    out     [VDP_DATA], a
+    inc     hl
+    djnz    .dlbCol
+    ld      a, [LogoCurY]
+    inc     a
+    ld      [LogoCurY], a
+    ld      a, [LogoRowsLeft]
+    dec     a
+    ld      [LogoRowsLeft], a
+    jr      nz, .dlbRow
+    ret
+
+LogoCurY:       db 0
+LogoRowsLeft:   db 0
+
+    include "logo.inc"
 
 ; ============================================================================
 ; Labels (title only; buttons now use icons/chars, not text labels)
