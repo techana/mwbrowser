@@ -2502,21 +2502,31 @@ EmitRaw:
     or      c
     ld      c, a
 
-    ; Fold HtmlStyleFlags (BOLD/ITALIC/UNDERLINE/STRIKE) into attr so
-    ; per-cell style survives the EmitRaw -> LineFlush delay.
+    ; Fold HtmlStyleFlags (BOLD/ITALIC/UNDERLINE/FOCUSED) into attr so
+    ; per-cell style survives the EmitRaw -> LineFlush delay. STRIKE is
+    ; dropped here -- its slot carries STYLE_FOCUSED instead so a
+    ; Tab-focused link's dotted underline is per-cell as well.
     ld      a, [HtmlStyleFlags]
     push    af
     and     STYLE_BOLD | STYLE_ITALIC   ; bits 0-1
     add     a, a
-    add     a, a                        ; shift left 2 -> bits 2-3
+    add     a, a                        ; shift left 2 -> attr bits 2-3
     or      c
     ld      c, a
     pop     af
-    and     STYLE_UNDERLINE | STYLE_STRIKE  ; bits 2-3
+    push    af
+    and     STYLE_UNDERLINE             ; bit 2 (0x04)
     add     a, a
     add     a, a
     add     a, a
-    add     a, a                        ; shift left 4 -> bits 6-7
+    add     a, a                        ; shift left 4 -> attr bit 6 (0x40)
+    or      c
+    ld      c, a
+    pop     af
+    and     STYLE_FOCUSED               ; bit 4 (0x10)
+    add     a, a
+    add     a, a
+    add     a, a                        ; shift left 3 -> attr bit 7 (0x80)
     or      c
     ld      c, a
 .storeAttr:
@@ -3020,19 +3030,27 @@ LineDrawCells:
     rrca                                ; A = palette index
     call    SetLutFromPalette
     pop     af
-    ; attr bits 2-3  -> HtmlStyleFlags bits 0-1 (BOLD, ITALIC)
-    ; attr bits 6-7  -> HtmlStyleFlags bits 2-3 (UNDERLINE, STRIKE)
+    ; attr bits 2-3 -> HtmlStyleFlags bits 0-1 (BOLD, ITALIC)
+    ; attr bit 6     -> HtmlStyleFlags bit 2 (UNDERLINE)
+    ; attr bit 7     -> HtmlStyleFlags bit 4 (FOCUSED, dotted underline)
     ld      b, a
     and     0x0C
     rrca
     rrca                                ; bits 0-1
     ld      c, a
     ld      a, b
-    and     0xC0
+    and     0x40
     rrca
     rrca
     rrca
-    rrca                                ; bits 2-3
+    rrca                                ; bit 6 -> bit 2
+    or      c
+    ld      c, a
+    ld      a, b
+    and     0x80
+    rrca
+    rrca
+    rrca                                ; bit 7 -> bit 4
     or      c
     ld      [HtmlStyleFlags], a
     pop     bc
