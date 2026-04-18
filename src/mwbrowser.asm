@@ -2988,6 +2988,14 @@ LineDrawCells:
 .alHave:
     ld      [LineStartCol], a
 
+    ; For RTL paragraphs the BiDi reorder drew cells in reverse visual
+    ; order, but any link rects captured at parse time still hold the
+    ; logical X where TextX was pointing. Mirror them now so mouse
+    ; clicks land on the correct pixel range on screen.
+    ld      a, [HtmlDir]
+    or      a
+    call    nz, FixRtlLinkRectsOnLine
+
     xor     a
     ld      [LineDrawI], a
 .dLoop:
@@ -3070,6 +3078,132 @@ LineDrawCells:
 LineStartCol:   db 0
 LineDrawI:      db 0
 SavedStyleFlags: db 0
+LineRightPx:    dw 0                ; pixel past the right edge of current line
+FxLinkI:        db 0                ; link iteration index for FixRtlLinkRectsOnLine
+FxOrigStart:    dw 0
+FxOrigEnd:      dw 0
+
+; FixRtlLinkRectsOnLine: for every link whose start AND end Y coincide
+; with the current TextY (single-line link), mirror LinkStartX/EndX
+; across the line so mouse clicks land on the visually-reversed BiDi
+; cells rather than the logical-order positions captured at parse time.
+;   new_start = line_right_edge_px - (orig_end_px - HtmlIndent)
+;   new_end   = line_right_edge_px - (orig_start_px - HtmlIndent)
+; where line_right_edge_px = (LineStartCol + LineLen*2) * 4.
+FixRtlLinkRectsOnLine:
+    ld      a, [LinkCount]
+    or      a
+    ret     z
+    ; Compute LineRightPx = (LineStartCol + LineLen * 2) * 4 (16-bit).
+    ld      a, [LineStartCol]
+    ld      b, a
+    ld      a, [LineLen]
+    add     a, a
+    add     a, b
+    ld      l, a
+    ld      h, 0
+    add     hl, hl
+    add     hl, hl
+    ld      [LineRightPx], hl
+
+    xor     a
+    ld      [FxLinkI], a
+.fxNext:
+    ld      a, [FxLinkI]
+    ld      b, a
+    ld      a, [LinkCount]
+    cp      b
+    ret     z
+
+    ; Check LinkStartY[i] == TextY.
+    ld      a, [FxLinkI]
+    ld      e, a
+    ld      d, 0
+    ld      hl, LinkStartY
+    add     hl, de
+    ld      a, [TextY]
+    cp      [hl]
+    jr      nz, .fxSkip
+    ; Check LinkEndY[i] == TextY (only handle single-line links for now).
+    ld      hl, LinkEndY
+    add     hl, de
+    ld      a, [TextY]
+    cp      [hl]
+    jr      nz, .fxSkip
+
+    ; Stash originals before we overwrite, then compute both new values.
+    ;   FxOrigStart = orig LinkStartX
+    ;   FxOrigEnd   = orig LinkEndX
+    ld      a, [FxLinkI]
+    add     a, a                    ; *2 for word offset
+    ld      e, a
+    ld      d, 0
+    ld      hl, LinkStartX
+    add     hl, de
+    ld      a, [hl]
+    ld      [FxOrigStart], a
+    inc     hl
+    ld      a, [hl]
+    ld      [FxOrigStart + 1], a
+    ld      hl, LinkEndX
+    add     hl, de
+    ld      a, [hl]
+    ld      [FxOrigEnd], a
+    inc     hl
+    ld      a, [hl]
+    ld      [FxOrigEnd + 1], a
+
+    ; new_start = LineRightPx - (FxOrigEnd - HtmlIndent)
+    ld      hl, [FxOrigEnd]
+    ld      a, [HtmlIndent]
+    ld      e, a
+    ld      d, 0
+    and     a
+    sbc     hl, de                  ; HL = orig_end - indent
+    ex      de, hl                  ; DE = orig_end - indent
+    ld      hl, [LineRightPx]
+    and     a
+    sbc     hl, de                  ; HL = new_start
+    ld      a, [FxLinkI]
+    add     a, a
+    ld      e, a
+    ld      d, 0
+    push    hl
+    ld      hl, LinkStartX
+    add     hl, de
+    pop     de
+    ld      [hl], e
+    inc     hl
+    ld      [hl], d
+
+    ; new_end = LineRightPx - (FxOrigStart - HtmlIndent)
+    ld      hl, [FxOrigStart]
+    ld      a, [HtmlIndent]
+    ld      e, a
+    ld      d, 0
+    and     a
+    sbc     hl, de
+    ex      de, hl
+    ld      hl, [LineRightPx]
+    and     a
+    sbc     hl, de                  ; HL = new_end
+    ld      a, [FxLinkI]
+    add     a, a
+    ld      e, a
+    ld      d, 0
+    push    hl
+    ld      hl, LinkEndX
+    add     hl, de
+    pop     de
+    ld      [hl], e
+    inc     hl
+    ld      [hl], d
+
+.fxSkip:
+    ld      a, [FxLinkI]
+    inc     a
+    ld      [FxLinkI], a
+    jp      .fxNext
 
 ; SmartWrap: called from EmitRaw when the next glyph wouldn't fit on the
 ; current line. If LineLastSpace marks a space on the current line, stash
