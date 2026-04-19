@@ -4627,6 +4627,34 @@ SC6_WIDTH_B     equ 128                 ; full Screen-6 row in bytes
 SC6_VISIBLE_B   equ (CONTENT_X_END + 1) / 4  ; content area width in bytes
 SC6_MAX_ROWS    equ 240                 ; upper bound; EOF stops earlier
 
+; ImgApplyStartCol: A = image width in bytes. Writes ImgStartCol so the
+; image respects HtmlAlign: center (=2) splits the slack evenly when the
+; image fits the content area, left/right fall back to HtmlIndent. Used
+; by the data-URI, PCX, and BMP renderers; SC6 always draws at the
+; current indent since a Screen-6 dump is already full width.
+ImgApplyStartCol:
+    ld      b, a                        ; B = image width in bytes
+    ld      a, [HtmlAlign]
+    cp      2
+    jr      nz, .iasLeft
+    ld      a, SC6_VISIBLE_B
+    sub     b
+    jr      c, .iasLeft                 ; image wider than viewport
+    srl     a                           ; half the slack (in bytes)
+    ld      b, a
+    ld      a, [HtmlIndent]
+    srl     a
+    srl     a
+    add     a, b
+    ld      [ImgStartCol], a
+    ret
+.iasLeft:
+    ld      a, [HtmlIndent]
+    srl     a
+    srl     a
+    ld      [ImgStartCol], a
+    ret
+
 ; RenderPcxFile: stream a ZSoft PCX file (2 bpp, 1 plane only) into the
 ; viewport. Falls back to [alt] for any other variant (monochrome, 4/8
 ; bpp, multi-plane) so the program can't crash on something it can't
@@ -4688,10 +4716,8 @@ RenderPcxFile:
     ld      [PcxRepCount], a
 
     ; Layout math -- same as SC6 except widthB is from the header.
-    ld      a, [HtmlIndent]
-    srl     a
-    srl     a
-    ld      [ImgStartCol], a
+    ld      a, [PcxBpl]
+    call    ImgApplyStartCol
     ld      a, [HtmlIndent]
     ld      [TextX], a
     xor     a
@@ -4825,13 +4851,18 @@ RenderBmpFile:
     cp      'M'
     jp      nz, .bmpFail
 
-    ; bpp must be 24.
-    ld      a, [ImgBuf + 28]
-    cp      24
-    jp      nz, .bmpFail
+    ; bpp must be 4 (16-colour palette) or 24 (RGB). High byte of the
+    ; bpp word is always 0 for either case.
     ld      a, [ImgBuf + 29]
     or      a
     jp      nz, .bmpFail
+    ld      a, [ImgBuf + 28]
+    cp      4
+    jr      z, .bmpBppOk
+    cp      24
+    jp      nz, .bmpFail
+.bmpBppOk:
+    ld      [BmpBpp], a
 
     ; compression = 0 (BI_RGB).
     ld      a, [ImgBuf + 30]
@@ -4897,17 +4928,29 @@ RenderBmpFile:
     jp      .bmpFail
 .bmpOffOk:
 
-    ; Skip ahead to the pixel array: we've already consumed 128 bytes
-    ; of header, so drain (offset - 128) more bytes from the stream.
+    ; For 4 bpp we need the 16-entry palette that sits between the DIB
+    ; header (ends at byte 54) and the pixel array (byte 118 by default).
+    ; Extract it now -- ImgBuf still has the first 128 bytes of the file.
+    ld      a, [BmpBpp]
+    cp      4
+    jr      nz, .bmpNoPal
+    call    BmpBuild4bppPal
+    xor     a
+    ld      [BmpNibLeft], a
+.bmpNoPal:
+
+    ; Skip ahead to the pixel array. We've already loaded the first 128
+    ; bytes of the file into ImgBuf, so:
+    ;   offset < 128  -> rewind the read pointer into the buffer
+    ;   offset == 128 -> start fresh on the next refill
+    ;   offset  > 128 -> drain (offset - 128) bytes to catch up
+    ld      hl, [ImgBuf + 10]
     ld      de, 128
     or      a
     sbc     hl, de                      ; HL = offset - 128
-    jr      c, .bmpPastPixels           ; offset < 128 -> already at data
-    ld      a, h
-    or      l
-    jr      z, .bmpAtPixels
-    ; Mark the DMA buffer empty so ImgStreamByte drives forward from
-    ; the file's current position.
+    jr      c, .bmpInBuf
+    jr      z, .bmpFlushBuf
+    ; HL > 0: drain that many bytes from disk.
     xor     a
     ld      [ImgReadLen], a
 .bmpSkipByte:
@@ -4920,8 +4963,24 @@ RenderBmpFile:
     or      l
     jr      nz, .bmpSkipByte
     jr      .bmpAtPixels
-.bmpPastPixels:
+
+.bmpFlushBuf:
     xor     a
+    ld      [ImgReadLen], a
+    jr      .bmpAtPixels
+
+.bmpInBuf:
+    ; offset < 128: the pixel array's leading bytes are still in ImgBuf.
+    ; Park the stream pointer at ImgBuf[offset] with the right residual
+    ; length so no pixel bytes are lost before the next disk read.
+    ld      a, [ImgBuf + 10]
+    ld      c, a
+    ld      b, 0
+    ld      hl, ImgBuf
+    add     hl, bc
+    ld      [ImgReadPtr], hl
+    ld      a, 128
+    sub     c
     ld      [ImgReadLen], a
 
 .bmpAtPixels:
@@ -4930,11 +4989,32 @@ RenderBmpFile:
     call    ArFlush
     call    LineFlush
 
-    ; rowPadBytes = (4 - (width*3) % 4) & 3. Compute once.
+    ; pixel-bytes-per-row = ceil(width * bpp / 8). 16-bit because
+    ; 24 bpp at the 492-px cap is 1476 bytes/row.
+    ld      a, [BmpBpp]
+    cp      4
+    jr      z, .bmpRowSize4
+    ; 24 bpp: width * 3.
     ld      a, [BmpWidth]
-    ld      b, a
-    add     a, a
-    add     a, b                        ; A = width * 3
+    ld      l, a
+    ld      h, 0
+    ld      d, h
+    ld      e, l                         ; DE = width
+    add     hl, de
+    add     hl, de                       ; HL = width * 3
+    jr      .bmpRowSizeStore
+.bmpRowSize4:
+    ; 4 bpp: ceil(width / 2) = (width + 1) / 2.
+    ld      a, [BmpWidth]
+    inc     a
+    srl     a
+    ld      l, a
+    ld      h, 0
+.bmpRowSizeStore:
+    ld      [BmpPixBytes], hl
+    ; rowPadBytes = (4 - (pixBytes & 3)) & 3. Only the low 2 bits of
+    ; pixBytes matter, so read L.
+    ld      a, l
     and     3
     ld      b, a
     xor     a
@@ -4985,10 +5065,12 @@ RenderBmpFile:
     ld      [BmpRowsLeft], a
 .bmpYDone:
 
-    ld      a, [HtmlIndent]
+    ; image width in bytes = ceil(BmpWidth / 4).
+    ld      a, [BmpWidth]
+    add     a, 3
     srl     a
     srl     a
-    ld      [ImgStartCol], a
+    call    ImgApplyStartCol
 
     ; Drain any off-screen-bottom rows without drawing.
 .bmpPreSkip:
@@ -5028,17 +5110,8 @@ RenderBmpFile:
     ld      [BmpPackIdx], a
     ld      [BmpPackByte], a
 .bmpRowPx:
-    ; Read one pixel (B, G, R). Use G for luminance -- cheap and close
-    ; enough for photo-like content.
-    call    ImgStreamByte
-    jp      c, .bmpDone                 ; truncated mid-row
-    call    ImgStreamByte
+    call    BmpReadPxSlot               ; A = 0..3 slot, CF=1 on EOF
     jp      c, .bmpDone
-    ld      b, a                        ; B = green byte
-    call    ImgStreamByte
-    jp      c, .bmpDone
-    ld      a, b
-    call    BmpLumaToPalette            ; A = palette idx 0..3
 
     ; Pack into output byte.
     ld      b, a
@@ -5143,25 +5216,107 @@ RenderBmpFile:
     scf
     ret
 
-; BmpConsumeRow: drain one BMP row (width*3 + pad bytes) from the image
-; stream without writing to VRAM. CF=1 if the stream EOFs mid-row.
+; BmpConsumeRow: drain one BMP row (BmpPixBytes + BmpPad bytes) from
+; the image stream without writing to VRAM. 16-bit counter because a
+; 24 bpp row at full width is over 1 KB. CF=1 if the stream EOFs.
 BmpConsumeRow:
-    ld      a, [BmpWidth]
-    ld      b, a
-    add     a, a
-    add     a, b
-    ld      b, a
+    ld      hl, [BmpPixBytes]
     ld      a, [BmpPad]
-    add     a, b
-    ld      b, a
-    or      a
-    ret     z                           ; zero-byte row -> nothing to do
+    ld      e, a
+    ld      d, 0
+    add     hl, de                      ; HL = bytes to drain
+    ld      a, h
+    or      l
+    ret     z
 .bmcLoop:
-    push    bc
+    push    hl
     call    ImgStreamByte
-    pop     bc
+    pop     hl
     ret     c
-    djnz    .bmcLoop
+    dec     hl
+    ld      a, h
+    or      l
+    jr      nz, .bmcLoop
+    or      a                           ; CF=0
+    ret
+
+; BmpReadPxSlot: return A = 0..3 palette slot for the next BMP pixel.
+; Dispatches on BmpBpp. CF=1 on stream EOF.
+BmpReadPxSlot:
+    ld      a, [BmpBpp]
+    cp      4
+    jr      z, .bprs4
+    ; 24 bpp: B, G, R. Luminance approximated by G.
+    call    ImgStreamByte
+    ret     c
+    call    ImgStreamByte
+    ret     c
+    ld      b, a
+    call    ImgStreamByte
+    ret     c
+    ld      a, b
+    jp      BmpLumaToPalette
+.bprs4:
+    ld      a, [BmpNibLeft]
+    or      a
+    jr      nz, .bprs4Low
+    call    ImgStreamByte
+    ret     c
+    ld      [BmpNibBuf], a
+    ld      b, a
+    ld      a, 1
+    ld      [BmpNibLeft], a
+    ld      a, b
+    rrca
+    rrca
+    rrca
+    rrca
+    and     0x0F
+    jr      .bprs4Lookup
+.bprs4Low:
+    xor     a
+    ld      [BmpNibLeft], a
+    ld      a, [BmpNibBuf]
+    and     0x0F
+.bprs4Lookup:
+    ld      e, a
+    ld      d, 0
+    ld      hl, BmpPal16
+    add     hl, de
+    ld      a, [hl]
+    or      a                           ; CF=0
+    ret
+
+; BmpBuild4bppPal: map each of the 16 BGRA entries sitting at
+; ImgBuf[54..117] (from the initial DMA read) onto one of our four
+; palette slots via luminance (Green channel). Writes the 16-entry
+; table at BmpPal16.
+BmpBuild4bppPal:
+    ld      b, 0
+.bp4Loop:
+    push    bc
+    ; HL = ImgBuf + 54 + B*4 + 1 (Green of entry B).
+    ld      a, b
+    add     a, a
+    add     a, a
+    add     a, 54 + 1
+    ld      l, a
+    ld      h, 0
+    ld      de, ImgBuf
+    add     hl, de
+    ld      a, [hl]
+    call    BmpLumaToPalette
+    pop     bc
+    ld      l, b
+    ld      h, 0
+    ld      de, BmpPal16
+    add     hl, de
+    ld      [hl], a
+    inc     b
+    ld      a, b
+    cp      16
+    jr      nz, .bp4Loop
+    ret
     or      a
     ret
 
@@ -5333,10 +5488,8 @@ RenderImageDataUri:
     xor     a
     ld      [TextX + 1], a
 
-    ld      a, [HtmlIndent]
-    srl     a
-    srl     a
-    ld      [ImgStartCol], a
+    ld      a, [ImgWidthB]
+    call    ImgApplyStartCol
     ld      a, [TextY]
     ld      [ImgCurY], a
     xor     a
@@ -5634,13 +5787,18 @@ PcxRepVal:    db 0                     ; byte being repeated
 PcxBpl:       db 0                     ; BytesPerLine from PCX header
 BmpWidth:     db 0
 BmpHeight:    db 0
+BmpBpp:       db 0                     ; 4 or 24
 BmpPad:       db 0                     ; trailing pad bytes per BMP row
+BmpPixBytes:  dw 0                     ; pixel bytes per row (pre-pad)
 BmpRowsLeft:  db 0
 BmpCurY:      db 0
 BmpSkipBot:   db 0                     ; bottom rows past CONTENT_Y1
 BmpPxLeft:    db 0                     ; pixels remaining in current row
 BmpPackIdx:   db 0                     ; 0..3, position within packed byte
 BmpPackByte:  db 0
+BmpNibBuf:    db 0                     ; 4-bpp half-byte pixel buffer
+BmpNibLeft:   db 0                     ; 1 if the low nibble of BmpNibBuf is still pending
+BmpPal16:     ds 16                    ; slot 0..3 per BMP-4bpp palette entry
 IMG_NAME_MAX equ 32
 ImgNameBuf:   ds IMG_NAME_MAX + 1     ; scratch for <img src="..."> filenames
 ExtImgRemap:  ds 256                  ; palette fixup LUT built once at startup
@@ -6219,6 +6377,25 @@ ResetBlockAttrs:
 TagBr:
     jp      EmitNewline
 
+; <center>: block-level centering. Equivalent to wrapping the content in
+; a paragraph with align="center", but without the implicit margins -- we
+; only insert the usual half-line gap above/below so a <center> around
+; an image doesn't push extra whitespace in.
+TagCenter:
+    ld      a, [HtmlIsClose]
+    or      a
+    jr      nz, .close
+    call    EnsureLineStart
+    call    EmitHalfLineGap
+    ld      a, 2                        ; HtmlAlign: 0=left, 1=right, 2=center
+    ld      [HtmlAlign], a
+    ret
+.close:
+    call    EmitNewline
+    call    EmitHalfLineGap
+    call    ResetBlockAttrs
+    ret
+
 TagHr:
     call    EmitBlankLine
     ; Only draw the rule when the current pen is actually inside the visible
@@ -6478,6 +6655,8 @@ TagTbl:
     dw  TagP
     db  "BR", 0
     dw  TagBr
+    db  "CENTER", 0
+    dw  TagCenter
     db  "HR", 0
     dw  TagHr
     db  "H1", 0
