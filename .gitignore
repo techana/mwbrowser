@@ -21,3 +21,4 @@
 !samples/*.BMP
 !tools/
 !tools/*.py
+!tools/*.sh
