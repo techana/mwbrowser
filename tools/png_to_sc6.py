@@ -59,11 +59,22 @@ def nearest_palette(rgb):
     return best_idx
 
 
-def pack_sc6(im):
+def pack_sc6(im, center=False):
     """Pack the RGB image row-major into 2 bpp bytes. Width that isn't a
     multiple of 4 gets right-padded with white so no source pixels are
-    lost, and each row is right-padded up to 128 bytes to match the
-    "always-full-row" SC6 layout the browser's loader expects."""
+    lost, and each row is padded out to 128 bytes to match the
+    'always-full-row' SC6 layout the browser's loader expects.
+
+    center=False (default): pad on the right only. The image sits at
+    x=0 of the Screen-6 row; wrap the <img> in <center> and you'll see
+    it hug the left edge because the padded bytes extend to the right
+    scrollbar and the browser's SC6 loader can't shift a 128-byte row
+    inside the 123-byte content area.
+
+    center=True: split the padding evenly between left and right. Once
+    rendered, the image content itself sits at the middle of the
+    content area -- the simplest way to match an HTML <center> wrap
+    without a width-aware SC6 header."""
     im = im.convert("RGB")
     w, h = im.size
     pixels = im.load()
@@ -72,9 +83,16 @@ def pack_sc6(im):
     w4 = (w + 3) & ~3
     bytes_per_img_row = w4 // 4
 
+    pad_total = max(0, SC6_ROW_BYTES - bytes_per_img_row)
+    if center:
+        pad_left  = pad_total // 2
+        pad_right = pad_total - pad_left
+    else:
+        pad_left, pad_right = 0, pad_total
+
     raw = bytearray()
     for y in range(h):
-        row = bytearray()
+        row = bytearray([PAD_BYTE] * pad_left)
         for bx in range(bytes_per_img_row):
             b = 0
             for k in range(4):
@@ -85,8 +103,7 @@ def pack_sc6(im):
                     idx = 3
                 b |= (idx & 3) << ((3 - k) * 2)
             row.append(b)
-        if len(row) < SC6_ROW_BYTES:
-            row.extend([PAD_BYTE] * (SC6_ROW_BYTES - len(row)))
+        row.extend([PAD_BYTE] * pad_right)
         raw.extend(row)
     return raw
 
@@ -114,10 +131,15 @@ def main():
     ap.add_argument("source", help="Path to input PNG or BMP")
     ap.add_argument("-o", "--out", default=None,
                     help="Output .sc6 path (default: <source>.sc6)")
+    ap.add_argument("-c", "--center", action="store_true",
+                    help="Center the image inside the 128-byte SC6 row"
+                         " (splits the white padding between both sides"
+                         " so an <img> wrapped in <center> lands in the"
+                         " middle of the viewport).")
     args = ap.parse_args()
 
     im = Image.open(args.source)
-    raw = pack_sc6(im)
+    raw = pack_sc6(im, center=args.center)
 
     out_path = args.out or default_output(args.source)
     with open(out_path, "wb") as f:
