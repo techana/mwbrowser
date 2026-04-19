@@ -3437,6 +3437,23 @@ EmitBlankLine:
 .skipBreak:
     jp      EmitNewline
 
+; EmitHalfLineGap: advance TextY by half a text line (4 px) to add a small
+; visual gap below block-close tags (</p>, </hx>), mirroring how browsers
+; give each paragraph bottom margin. No-op while HtmlLineSkip drains so
+; the gap doesn't double-decrement scroll math on scrolled pages. Clamps
+; so we never push TextY past the content area.
+HALF_LINE_H equ 4
+EmitHalfLineGap:
+    ld      a, [HtmlLineSkip]
+    or      a
+    ret     nz
+    ld      a, [TextY]
+    add     a, HALF_LINE_H
+    cp      CONTENT_Y1 + 1
+    ret     nc
+    ld      [TextY], a
+    ret
+
 ; ----------------------------------------------------------------------------
 ; TitleAppend: append a char to HtmlTitleBuf, capped at TITLE_BUF_MAX.
 ;   A = char
@@ -4309,7 +4326,7 @@ RenderImageDataUri:
     or      a
     jr      nz, .consumeRow
     ld      a, [ImgCurY]
-    cp      CONTENT_Y1
+    cp      CONTENT_Y1 + 1
     jr      nc, .consumeRow
 
     ld      a, [ImgStartCol]
@@ -4354,15 +4371,19 @@ RenderImageDataUri:
     jp      .rowLoop
 
 .rowDone:
-    ; After rendering the visible slice, land TextY right after the
-    ; drawn portion so the next EmitNewline doesn't overlap the image.
+    ; After rendering, land TextY right after the drawn portion so the
+    ; next EmitNewline sits below the image. If we ran against the
+    ; content bottom (image taller than the remaining space), park
+    ; TextY past CONTENT_Y1 so subsequent block content doesn't overdraw
+    ; the image's last rows -- the user sees the image filling the
+    ; viewport edge and the remainder continues on page 2.
     ld      a, [HtmlLineSkip]
     or      a
     jr      nz, .noTextYAdv
     ld      a, [ImgCurY]
-    cp      CONTENT_Y1
+    cp      CONTENT_Y1 + 1
     jr      c, .tyOk
-    ld      a, CONTENT_Y1 - 8
+    ld      a, CONTENT_Y1 + 1           ; clipped: suppress further drawing
 .tyOk:
     ld      [TextY], a
 .noTextYAdv:
@@ -5208,11 +5229,12 @@ TagP:
     call    ApplyBlockAttrs
     ret
 .pClose:
-    ; </p>: terminate the line but don't add a blank row below. The next
-    ; block tag will produce its own leading blank via EmitBlankLine, so
-    ; a double-spaced layout would inflate the rendered line count and
-    ; throw off scroll-by-page.
+    ; </p>: terminate the line and add a half-line gap (modern browsers
+    ; render a paragraph bottom margin). The next block tag still does
+    ; its own EmitBlankLine, producing ~1.5 blank rows total -- close to
+    ; typical HTML paragraph spacing without inflating scroll math too much.
     call    EmitNewline
+    call    EmitHalfLineGap
     call    ResetBlockAttrs
     ret
 
@@ -5296,12 +5318,13 @@ TagH2:
     ret
 .close:
     call    EmitNewline
+    ld      a, 1
+    ld      [HtmlScaleY], a             ; reset scale before the half-line gap
+    call    EmitHalfLineGap
     call    ResetBlockAttrs
     ld      a, [HtmlStyleFlags]
     and     0xFE
     ld      [HtmlStyleFlags], a
-    ld      a, 1
-    ld      [HtmlScaleY], a
     ret
 
 ; H3..H6 stay at normal glyph height but keep the bold flag + blank line.
@@ -5320,6 +5343,7 @@ TagH6:
     ret
 .close:
     call    EmitNewline
+    call    EmitHalfLineGap
     call    ResetBlockAttrs
     ld      a, [HtmlStyleFlags]
     and     0xFE
@@ -6178,6 +6202,8 @@ PageDown:
     sub     TEXT_MAX_LINES              ; A = last reachable top-line
     ld      d, a                        ; D = max ScrollLine
     ld      a, [ScrollLine]
+    cp      d
+    ret     nc                          ; already at (or past) last page: no-op
     add     a, PAGE_SCROLL_STEP
     cp      d
     jr      c, .pdStore
