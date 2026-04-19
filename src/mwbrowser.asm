@@ -1616,6 +1616,14 @@ EmitStyledByte:
 ;   "A:\TEST.HTM", "a:test.htm", "test.htm", "TEST.HTML" (ext truncated to 3).
 ; Letters uppercased; other chars pass through. Always returns.
 BuildFcbFromUrl:
+    ld      hl, UrlBuf
+    ; fall through to BuildFcbFromHL
+
+; BuildFcbFromHL: same as BuildFcbFromUrl but HL on entry points at the
+; NUL-terminated filename/path to parse. Used by the external <img>
+; loaders (src="foo.sc6" etc.) without stomping on UrlBuf.
+BuildFcbFromHL:
+    push    hl
     ld      hl, Fcb
     ld      b, 12
     xor     a
@@ -1623,8 +1631,8 @@ BuildFcbFromUrl:
     ld      [hl], a
     inc     hl
     djnz    .zf
+    pop     hl
 
-    ld      hl, UrlBuf
     ld      a, [hl]
     or      a
     ret     z                           ; empty URL
@@ -4242,28 +4250,61 @@ TagBlockquote:
     ld      [HtmlIndent], a
     jp      EmitBlankLine
 
-; <img>: stub -- prints "[alt]" using the captured alt attribute (or "[img]"
-; when no alt). Uses a shared ScanAltAttr populated during ParseTag in the
-; same style as href. Self-closing; no matching close tag needed.
+; <img>: render the image if src points at a supported format; otherwise
+; emit "[alt]" as a fallback. Supported formats:
+;   data:msx;base64,...     -- inline 2 bpp Screen-6 payload (img_encode.py)
+;   *.sc6                   -- native Screen-6 BSAVE file on disk
+; Self-closing; no matching close tag needed.
 TagImg:
-    ; If the src attribute carries our "data:msx;base64,<payload>" magic,
-    ; decode and blit the image. Otherwise fall back to the legacy
-    ; "[alt-text]" placeholder.
     ld      hl, [HtmlCurSrcPtr]
     ld      a, h
     or      l
     jp      z, .altFallback
+
+    ; Try the inline data URI first.
+    push    hl
     ld      de, DataMsxPrefix
     ld      b, DataMsxPrefixLen
 .tiCmp:
     ld      a, [de]
     cp      [hl]
-    jr      nz, .altFallback
+    jr      nz, .notDataUri
     inc     de
     inc     hl
     djnz    .tiCmp
-    ; HL now points at first base64 char. Decode + render.
+    pop     bc                          ; discard saved HL
     jp      RenderImageDataUri
+
+.notDataUri:
+    pop     hl                          ; HL back to first src char
+
+    ; Copy the src filename (chars until closing quote / NUL) into the
+    ; scratch buffer so the rest of the pipeline has a stable,
+    ; NUL-terminated name it can FCB-parse. Caps the length to keep
+    ; callers safe on deliberately malformed pages.
+    ld      de, ImgNameBuf
+    ld      b, IMG_NAME_MAX
+.tiCopy:
+    ld      a, [hl]
+    cp      0x22                        ; closing "
+    jr      z, .tiCopyDone
+    or      a
+    jr      z, .tiCopyDone
+    ld      [de], a
+    inc     hl
+    inc     de
+    djnz    .tiCopy
+.tiCopyDone:
+    xor     a
+    ld      [de], a                     ; NUL terminate
+
+    ; Dispatch by (lowercased) extension. MatchImgExt returns Z when the
+    ; buffer ends in the extension pointed to by HL.
+    ld      hl, ExtSc6
+    call    MatchImgExt
+    jp      z, RenderSc6File
+
+    ; No supported format -- fall through to the text placeholder.
 
 .altFallback:
     ld      a, '['
@@ -4290,6 +4331,280 @@ TagImg:
 
 TagImgWord:      db "img", 0
 DataMsxPrefix:   db "data:msx;base64,"
+ExtSc6:          db ".sc6", 0
+
+; MatchImgExt: case-insensitive compare of the tail of ImgNameBuf against
+; the NUL-terminated extension string at HL. Returns Z set on match.
+; Preserves HL; clobbers A/B/C/DE/flags.
+MatchImgExt:
+    push    hl
+    ; B = len(extension).
+    ld      b, 0
+.meExtLen:
+    ld      a, [hl]
+    or      a
+    jr      z, .meExtDone
+    inc     hl
+    inc     b
+    jr      .meExtLen
+.meExtDone:
+    ; C = len(ImgNameBuf).
+    ld      de, ImgNameBuf
+    ld      c, 0
+.meNameLen:
+    ld      a, [de]
+    or      a
+    jr      z, .meNameDone
+    inc     de
+    inc     c
+    jr      .meNameLen
+.meNameDone:
+    ; name shorter than ext -> can't match.
+    ld      a, c
+    cp      b
+    jr      c, .meNo
+    ; DE points at NUL. Back up B bytes so it aligns with the ext tail.
+    ld      a, e
+    sub     b
+    ld      e, a
+    ld      a, d
+    sbc     a, 0
+    ld      d, a
+    pop     hl
+    push    hl
+    ; Byte-by-byte, lowercasing both sides.
+.meCmp:
+    ld      a, [hl]
+    or      a
+    jr      z, .meMatch
+    or      0x20
+    ld      c, a
+    ld      a, [de]
+    or      0x20
+    cp      c
+    jr      nz, .meNo
+    inc     hl
+    inc     de
+    jr      .meCmp
+.meMatch:
+    pop     hl
+    xor     a                           ; Z=1
+    ret
+.meNo:
+    pop     hl
+    or      1                           ; Z=0
+    ret
+
+; Buffered byte-at-a-time reader over the currently open Fcb. Uses the
+; first 128 bytes of ImgBuf as the DOS DMA target.
+; State: ImgReadPtr (next byte), ImgReadLen (bytes remaining in buffer).
+; ImgStreamOpen must have done the DOS_OPEN; ImgStreamClose must close.
+
+ImgStreamRefill:
+    ld      c, DOS_SETDMA
+    ld      de, ImgBuf
+    call    BDOS_ENTRY
+    ld      c, DOS_READ
+    ld      de, Fcb
+    call    BDOS_ENTRY
+    or      a
+    jr      nz, .isrEof
+    ld      a, 128
+    ld      [ImgReadLen], a
+    ld      hl, ImgBuf
+    ld      [ImgReadPtr], hl
+    or      a                           ; Z=1 success (return carry clear)
+    ret
+.isrEof:
+    xor     a
+    ld      [ImgReadLen], a
+    scf
+    ret
+
+; ImgStreamByte: returns A = next byte, CF=1 on EOF.
+ImgStreamByte:
+    ld      a, [ImgReadLen]
+    or      a
+    jr      z, .isbRefill
+    dec     a
+    ld      [ImgReadLen], a
+    ld      hl, [ImgReadPtr]
+    ld      a, [hl]
+    inc     hl
+    ld      [ImgReadPtr], hl
+    or      a
+    ret
+.isbRefill:
+    call    ImgStreamRefill
+    ret     c
+    jr      ImgStreamByte
+
+; ImgStreamClose: close the file that ImgStreamOpen opened.
+ImgStreamClose:
+    ld      c, DOS_CLOSE
+    ld      de, Fcb
+    jp      BDOS_ENTRY
+
+; ImgStreamOpenName: HL = NUL-terminated filename (in ImgNameBuf). Builds
+; the FCB and opens. Returns CF=0 on success and leaves ImgReadLen=0 so
+; the first ImgStreamByte call triggers an initial refill.
+ImgStreamOpenName:
+    call    BuildFcbFromHL
+    ; Clear FCB state used by sequential reads.
+    ld      hl, Fcb + 12
+    ld      b, 24
+    xor     a
+.isoZ:
+    ld      [hl], a
+    inc     hl
+    djnz    .isoZ
+    ld      c, DOS_OPEN
+    ld      de, Fcb
+    call    BDOS_ENTRY
+    or      a
+    jr      nz, .isoFail
+    xor     a
+    ld      [ImgReadLen], a
+    or      a
+    ret
+.isoFail:
+    scf
+    ret
+
+; RenderSc6File: open ImgNameBuf (must end in .sc6), skip the 7-byte
+; MSX BLOAD header, then stream the remaining bytes as Screen-6 pixels
+; (128 bytes per row, 2 bpp, row-major). Clips both width and height to
+; the content area so a full 512x212 dump can't overrun the scrollbar
+; or wrap the VDP write pointer onto the titlebar.
+;
+; Memory budget: only a 128-byte DMA buffer inside ImgBuf is needed;
+; no full-image buffering, same streaming pattern the data-URI path
+; uses.
+;
+; Error handling: any DOS failure (file not found, short read before
+; the header is consumed, empty file) silently returns so the caller
+; can fall through to the "[alt]" text placeholder.
+RenderSc6File:
+    push    hl
+    call    ArFlush
+    call    LineFlush
+    pop     hl
+
+    ld      hl, ImgNameBuf
+    call    ImgStreamOpenName
+    ret     c                           ; file open failed
+
+    ; Skip the 7-byte BSAVE header (magic 0xFE + start/end/exec addrs).
+    ld      b, 7
+.rsfSkip:
+    push    bc
+    call    ImgStreamByte
+    pop     bc
+    jp      c, .rsfDone                 ; truncated before header -> bail
+    djnz    .rsfSkip
+
+    ; Derive layout. SC6 dumps are always 128 bytes per VRAM row at
+    ; Screen 6's 2 bpp 512 px width. Height follows from however much
+    ; pixel data is left (we don't trust the end-address field).
+    ld      a, SC6_WIDTH_B
+    ld      [ImgWidthB], a
+    ld      a, SC6_MAX_ROWS
+    ld      [ImgHeightR], a             ; generous upper bound; EOF stops us
+
+    ld      a, [HtmlIndent]
+    srl     a
+    srl     a
+    ld      [ImgStartCol], a
+    ld      a, [HtmlIndent]
+    ld      [TextX], a
+    xor     a
+    ld      [TextX + 1], a
+    ld      a, [TextY]
+    ld      [ImgCurY], a
+    xor     a
+    ld      [ImgCurRow], a
+
+.rsfRowLoop:
+    ld      a, [ImgCurRow]
+    cp      SC6_MAX_ROWS
+    jr      nc, .rsfDone
+    ld      a, [HtmlLineSkip]
+    or      a
+    jr      nz, .rsfConsume
+    ld      a, [ImgCurY]
+    cp      CONTENT_Y1 + 1
+    jr      nc, .rsfConsume
+
+    ; Render row: position VDP, draw up to CONTENT_W_BYTES pixels,
+    ; then drain the remainder of the 128-byte row without drawing.
+    ld      a, [ImgStartCol]
+    ld      b, a
+    ld      a, [ImgCurY]
+    ld      c, a
+    call    SetVramWritePos
+    ld      b, SC6_VISIBLE_B
+.rsfDraw:
+    push    bc
+    call    ImgStreamByte
+    pop     bc
+    jp      c, .rsfDone
+    out     [VDP_DATA], a
+    djnz    .rsfDraw
+
+    ld      b, SC6_WIDTH_B - SC6_VISIBLE_B
+.rsfDrainVis:
+    push    bc
+    call    ImgStreamByte
+    pop     bc
+    jp      c, .rsfDone
+    djnz    .rsfDrainVis
+
+    ld      a, [ImgCurY]
+    inc     a
+    ld      [ImgCurY], a
+    jr      .rsfRowPost
+
+.rsfConsume:
+    ld      b, SC6_WIDTH_B
+.rsfDrainAll:
+    push    bc
+    call    ImgStreamByte
+    pop     bc
+    jp      c, .rsfDone
+    djnz    .rsfDrainAll
+
+.rsfRowPost:
+    ld      a, [ImgCurRow]
+    inc     a
+    ld      [ImgCurRow], a
+    and     0x07
+    jp      nz, .rsfRowLoop
+    push    bc
+    call    CountTableRow
+    pop     bc
+    jp      .rsfRowLoop
+
+.rsfDone:
+    call    ImgStreamClose
+
+    ; Park TextY below the drawn portion so surrounding text doesn't
+    ; overdraw the image. If we hit the viewport bottom, push TextY
+    ; past the content area to suppress further drawing on this page.
+    ld      a, [HtmlLineSkip]
+    or      a
+    jr      nz, .rsfNoTy
+    ld      a, [ImgCurY]
+    cp      CONTENT_Y1 + 1
+    jr      c, .rsfTyOk
+    ld      a, CONTENT_Y1 + 1
+.rsfTyOk:
+    ld      [TextY], a
+.rsfNoTy:
+    ret
+
+SC6_WIDTH_B     equ 128                 ; full Screen-6 row in bytes
+SC6_VISIBLE_B   equ (CONTENT_X_END + 1) / 4  ; content area width in bytes
+SC6_MAX_ROWS    equ 240                 ; upper bound; EOF stops earlier
 
 ; Built-in page served when a requested URL can't be opened. Kept in ROM
 ; as raw HTML and copied into FileBuf + rendered via the normal path so
@@ -4736,6 +5051,10 @@ ImgStartCol:  db 0
 ImgCurY:      db 0
 ImgCurRow:    db 0
 HtmlCurSrcPtr: dw 0
+ImgReadPtr:   dw 0                     ; next byte in ImgBuf for ImgStreamByte
+ImgReadLen:   db 0                     ; bytes still unread in the DMA buffer
+IMG_NAME_MAX equ 32
+ImgNameBuf:   ds IMG_NAME_MAX + 1     ; scratch for <img src="..."> filenames
 
 ; <font color="name">: push current fg, set new fg + CurrentFontLUT from
 ; the color name stored in HtmlCurHref (ScanHrefAttr captured it via the

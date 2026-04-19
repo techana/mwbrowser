@@ -14,6 +14,3 @@
 !samples/*.html
 !samples/*.txt
 !tools/
-!tools/img_encode/
-!tools/img_encode/*.py
-!tools/img_encode/*.html
