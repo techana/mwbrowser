@@ -4275,7 +4275,12 @@ RenderImageDataUri:
     call    B64DecodeByte
     ld      [ImgHeightR], a
 
-    ; Start column + starting Y.
+    ; Image is always block-level, draw from the paragraph indent.
+    ld      a, [HtmlIndent]
+    ld      [TextX], a
+    xor     a
+    ld      [TextX + 1], a
+
     ld      a, [HtmlIndent]
     srl     a
     srl     a
@@ -4285,116 +4290,89 @@ RenderImageDataUri:
     xor     a
     ld      [ImgCurRow], a
 
-    ; If we're in the scroll-skip phase we still have to consume the
-    ; base64 stream so the parser's next HL is correct, but we skip
-    ; the VRAM positioning + OUT so the page boundary isn't disturbed.
-    ld      a, [HtmlLineSkip]
-    or      a
-    jr      nz, .rowLoopSkipPaint
-
-    ; --- render path: blit rows straight to VRAM ---------------------
 .rowLoop:
     ld      a, [ImgCurRow]
     ld      b, a
     ld      a, [ImgHeightR]
     cp      b
-    jr      z, .rowDone
+    jp      z, .rowDone
 
-    ; Once ImgCurY passes the content area bottom, stop writing VRAM and
-    ; only consume the base64 stream so the source pointer tracks
-    ; correctly; otherwise VDP would auto-increment past the end of the
-    ; Screen-6 bitmap and wrap back over the titlebar.
+    ; Decide whether this row is visible. Three reasons to consume
+    ; without drawing:
+    ;   (a) the scroll-skip phase is still draining (HtmlLineSkip != 0),
+    ;       so the image is sliced from the top exactly like any other
+    ;       content that belongs to the skipped rows.
+    ;   (b) ImgCurY has already passed the bottom of the content area,
+    ;       so drawing would wrap through VDP's linear write-address
+    ;       and reappear on the titlebar / toolbar.
+    ld      a, [HtmlLineSkip]
+    or      a
+    jr      nz, .consumeRow
     ld      a, [ImgCurY]
-    cp      CONTENT_Y1 + 1
-    jr      nc, .rowConsume
+    cp      CONTENT_Y1
+    jr      nc, .consumeRow
 
     ld      a, [ImgStartCol]
     ld      b, a
     ld      a, [ImgCurY]
     ld      c, a
     call    SetVramWritePos
-
     ld      a, [ImgWidthB]
     ld      b, a
-.colLoop:
+.colRender:
     push    bc
     call    B64DecodeByte
     pop     bc
     out     [VDP_DATA], a
-    djnz    .colLoop
-    jr      .rowAdvance
-
-.rowConsume:
-    ld      a, [ImgWidthB]
-    ld      b, a
-.consumeLoop:
-    push    bc
-    call    B64DecodeByte
-    pop     bc
-    djnz    .consumeLoop
-
-.rowAdvance:
+    djnz    .colRender
     ld      a, [ImgCurY]
     inc     a
     ld      [ImgCurY], a
-    ld      a, [ImgCurRow]
-    inc     a
-    ld      [ImgCurRow], a
-    jr      .rowLoop
+    jr      .rowPost
 
-    ; --- skip path: consume payload without VRAM writes --------------
-.rowLoopSkipPaint:
-    ld      a, [ImgCurRow]
-    ld      b, a
-    ld      a, [ImgHeightR]
-    cp      b
-    jr      z, .rowDone
+.consumeRow:
     ld      a, [ImgWidthB]
     ld      b, a
-.colSkip:
+.colConsume:
     push    bc
     call    B64DecodeByte
     pop     bc
-    djnz    .colSkip
+    djnz    .colConsume
+
+.rowPost:
     ld      a, [ImgCurRow]
     inc     a
     ld      [ImgCurRow], a
-    jr      .rowLoopSkipPaint
+    ; Every eight image rows count as one paragraph row for
+    ; HtmlLineCount / HtmlLineSkip bookkeeping, matching the row-unit
+    ; used elsewhere in the renderer.
+    and     0x07
+    jp      nz, .rowLoop
+    push    bc
+    call    CountTableRow
+    pop     bc
+    jp      .rowLoop
 
 .rowDone:
-    ; Rendering path: advance TextY by image height (minus 8) so the
-    ; final EmitNewline of the enclosing tag lands below the image.
+    ; After rendering the visible slice, land TextY right after the
+    ; drawn portion so the next EmitNewline doesn't overlap the image.
     ld      a, [HtmlLineSkip]
     or      a
-    jr      nz, .advCount
-    ld      a, [ImgHeightR]
-    ld      b, a
-    ld      a, [TextY]
-    add     a, b
-    cp      CONTENT_Y1 + 1
+    jr      nz, .noTextYAdv
+    ld      a, [ImgCurY]
+    cp      CONTENT_Y1
     jr      c, .tyOk
     ld      a, CONTENT_Y1 - 8
 .tyOk:
     ld      [TextY], a
-.advCount:
-    ; Bump HtmlLineCount / HtmlLineSkip by ceil(height/8) rows.
+.noTextYAdv:
+    ; Trailing partial row unit: emit one extra CountTableRow if the
+    ; height wasn't a multiple of 8 so the paragraph bookkeeping doesn't
+    ; fall half a row behind.
     ld      a, [ImgHeightR]
-    add     a, 7
-    srl     a
-    srl     a
-    srl     a
-    ld      b, a
-.bumpLoop:
-    ld      a, b
-    or      a
-    jr      z, .bumpDone
-    push    bc
-    call    CountTableRow
-    pop     bc
-    dec     b
-    jr      .bumpLoop
-.bumpDone:
-    ret
+    and     0x07
+    ret     z
+    jp      CountTableRow
 
 ; B64DecodeByte: pull one decoded byte from the base64 stream whose
 ; source pointer lives in BSrcPtr (so callers aren't forced to keep
