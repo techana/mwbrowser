@@ -4290,6 +4290,16 @@ TagImg:
 
 TagImgWord:      db "img", 0
 DataMsxPrefix:   db "data:msx;base64,"
+
+; Built-in page served when a requested URL can't be opened. Kept in ROM
+; as raw HTML and copied into FileBuf + rendered via the normal path so
+; the titlebar, scrollbar, and back-history all behave exactly like on a
+; loaded document.
+NotFoundHtml:
+    db  "<title>404 Not Found</title>"
+    db  "<h1>404 Not Found</h1>"
+    db  "<p>The requested file could not be opened.</p>"
+NotFoundHtmlLen equ $ - NotFoundHtml
 DataMsxPrefixLen equ $ - DataMsxPrefix
 
 ; RenderImageDataUri: HL points at the first base64 char of a
@@ -5328,7 +5338,43 @@ TagHr:
 ; comes back at </H1>/</H2>. Close: terminate the line only -- the next
 ; block tag will supply its own leading blank via EmitBlankLine, matching
 ; the </p> behavior so rendered line counts stay tight for scroll math.
+; Each heading level picks a distinct style so all six are visually
+; distinguishable despite Screen 6 only offering two vertical scales
+; (1x and 2x) for glyphs. Table:
+;   H1 = 2x + bold + underline    (top-level, underlined emphasis)
+;   H2 = 2x + bold                (standard big heading)
+;   H3 = 1x + bold + underline    (sub-heading, stands out vs <b>)
+;   H4 = 1x + bold                (sub-section)
+;   H5 = 1x + italic + underline  (thinner tone)
+;   H6 = 1x + italic              (subtle label)
+; Shared close: end the line, reset scale to 1, add the trailing
+; half-line gap, and clear only the style bits we turned on for this
+; tag so nested styling survives.
+
 TagH1:
+    ld      a, [HtmlIsClose]
+    or      a
+    jr      nz, .close
+    call    EnsureLineStart
+    call    EmitHalfLineGap
+    call    ApplyBlockAttrs
+    ld      a, [HtmlStyleFlags]
+    or      STYLE_BOLD | STYLE_UNDERLINE
+    ld      [HtmlStyleFlags], a
+    ld      a, 2
+    ld      [HtmlScaleY], a
+    ret
+.close:
+    call    EmitNewline
+    ld      a, 1
+    ld      [HtmlScaleY], a
+    call    EmitHalfLineGap
+    call    ResetBlockAttrs
+    ld      a, [HtmlStyleFlags]
+    and     ~(STYLE_BOLD | STYLE_UNDERLINE) & 0xFF
+    ld      [HtmlStyleFlags], a
+    ret
+
 TagH2:
     ld      a, [HtmlIsClose]
     or      a
@@ -5345,19 +5391,35 @@ TagH2:
 .close:
     call    EmitNewline
     ld      a, 1
-    ld      [HtmlScaleY], a             ; reset scale before the half-line gap
+    ld      [HtmlScaleY], a
     call    EmitHalfLineGap
     call    ResetBlockAttrs
     ld      a, [HtmlStyleFlags]
-    and     0xFE
+    and     ~STYLE_BOLD & 0xFF
     ld      [HtmlStyleFlags], a
     ret
 
-; H3..H6 stay at normal glyph height but keep the bold flag + blank line.
 TagH3:
+    ld      a, [HtmlIsClose]
+    or      a
+    jr      nz, .close
+    call    EnsureLineStart
+    call    EmitHalfLineGap
+    call    ApplyBlockAttrs
+    ld      a, [HtmlStyleFlags]
+    or      STYLE_BOLD | STYLE_UNDERLINE
+    ld      [HtmlStyleFlags], a
+    ret
+.close:
+    call    EmitNewline
+    call    EmitHalfLineGap
+    call    ResetBlockAttrs
+    ld      a, [HtmlStyleFlags]
+    and     ~(STYLE_BOLD | STYLE_UNDERLINE) & 0xFF
+    ld      [HtmlStyleFlags], a
+    ret
+
 TagH4:
-TagH5:
-TagH6:
     ld      a, [HtmlIsClose]
     or      a
     jr      nz, .close
@@ -5373,7 +5435,47 @@ TagH6:
     call    EmitHalfLineGap
     call    ResetBlockAttrs
     ld      a, [HtmlStyleFlags]
-    and     0xFE
+    and     ~STYLE_BOLD & 0xFF
+    ld      [HtmlStyleFlags], a
+    ret
+
+TagH5:
+    ld      a, [HtmlIsClose]
+    or      a
+    jr      nz, .close
+    call    EnsureLineStart
+    call    EmitHalfLineGap
+    call    ApplyBlockAttrs
+    ld      a, [HtmlStyleFlags]
+    or      STYLE_ITALIC | STYLE_UNDERLINE
+    ld      [HtmlStyleFlags], a
+    ret
+.close:
+    call    EmitNewline
+    call    EmitHalfLineGap
+    call    ResetBlockAttrs
+    ld      a, [HtmlStyleFlags]
+    and     ~(STYLE_ITALIC | STYLE_UNDERLINE) & 0xFF
+    ld      [HtmlStyleFlags], a
+    ret
+
+TagH6:
+    ld      a, [HtmlIsClose]
+    or      a
+    jr      nz, .close
+    call    EnsureLineStart
+    call    EmitHalfLineGap
+    call    ApplyBlockAttrs
+    ld      a, [HtmlStyleFlags]
+    or      STYLE_ITALIC
+    ld      [HtmlStyleFlags], a
+    ret
+.close:
+    call    EmitNewline
+    call    EmitHalfLineGap
+    call    ResetBlockAttrs
+    ld      a, [HtmlStyleFlags]
+    and     ~STYLE_ITALIC & 0xFF
     ld      [HtmlStyleFlags], a
     ret
 
@@ -6007,9 +6109,32 @@ NavigateToCurrentUrl:
     jp      PaintToolbar
 
 .err:
+    ; Load failed (file not found, disk error, etc.). Fall back to a
+    ; built-in 404 document so the viewport carries a real page instead
+    ; of a blank canvas. Push the attempted URL to history so Back
+    ; returns to whatever page the user came from.
+    ld      hl, NotFoundHtml
+    ld      de, FileBuf
+    ld      bc, NotFoundHtmlLen
+    ldir
+    ld      hl, NotFoundHtmlLen
+    ld      [FileLen], hl
+    xor     a
+    ld      [PlainTextMode], a
+
+    call    HistoryPush
+    call    HistoryUpdateFlags
+
+    xor     a
+    ld      [ScrollLine], a
+    call    ClearContentArea
+    call    PrintFileContent
+    ld      a, [HtmlLineCount]
+    ld      [TotalLines], a
+    call    ComputeThumb
+    call    DrawScrollbar
     xor     a
     ld      [Busy], a
-    call    ClearContentArea
     jp      PaintToolbar
 
 ; GoBack / GoForward walk the history cursor. They do not push a new
