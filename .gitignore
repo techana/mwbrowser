@@ -14,3 +14,4 @@
 !samples/*.html
 !samples/*.txt
 !tools/
+!tools/*.py
