@@ -4303,6 +4303,12 @@ TagImg:
     ld      hl, ExtSc6
     call    MatchImgExt
     jp      z, RenderSc6File
+    ld      hl, ExtPcx
+    call    MatchImgExt
+    jp      z, RenderPcxFile
+    ld      hl, ExtBmp
+    call    MatchImgExt
+    jp      z, RenderBmpFile
 
     ; No supported format -- fall through to the text placeholder.
 
@@ -4332,6 +4338,8 @@ TagImg:
 TagImgWord:      db "img", 0
 DataMsxPrefix:   db "data:msx;base64,"
 ExtSc6:          db ".sc6", 0
+ExtPcx:          db ".pcx", 0
+ExtBmp:          db ".bmp", 0
 
 ; MatchImgExt: case-insensitive compare of the tail of ImgNameBuf against
 ; the NUL-terminated extension string at HL. Returns Z set on match.
@@ -4605,6 +4613,581 @@ RenderSc6File:
 SC6_WIDTH_B     equ 128                 ; full Screen-6 row in bytes
 SC6_VISIBLE_B   equ (CONTENT_X_END + 1) / 4  ; content area width in bytes
 SC6_MAX_ROWS    equ 240                 ; upper bound; EOF stops earlier
+
+; RenderPcxFile: stream a ZSoft PCX file (2 bpp, 1 plane only) into the
+; viewport. Falls back to [alt] for any other variant (monochrome, 4/8
+; bpp, multi-plane) so the program can't crash on something it can't
+; honestly decode. Safety measures:
+;   - header magic (0x0A), encoding (1 = RLE), bpp (2), planes (1)
+;     all must match; otherwise we close the file and bail
+;   - BytesPerLine is capped at SC6_WIDTH_B so a forged header can't
+;     drive the per-row loops off into unrelated VRAM
+;   - RLE control bytes that would run off EOF stop the render early
+;     instead of looping forever
+RenderPcxFile:
+    push    hl
+    call    ArFlush
+    call    LineFlush
+    pop     hl
+
+    ld      hl, ImgNameBuf
+    call    ImgStreamOpenName
+    ret     c
+
+    ; Read the first 128 bytes = PCX header.
+    call    ImgStreamRefill
+    jp      c, .pcxFail
+
+    ; Validate header: manufacturer 0x0A, encoding 1, bpp 2, planes 1.
+    ld      a, [ImgBuf + 0]
+    cp      0x0A
+    jp      nz, .pcxFail
+    ld      a, [ImgBuf + 2]
+    cp      1
+    jp      nz, .pcxFail
+    ld      a, [ImgBuf + 3]
+    cp      2
+    jp      nz, .pcxFail
+    ld      a, [ImgBuf + 65]
+    cp      1
+    jp      nz, .pcxFail
+
+    ; Clamp BytesPerLine to the Screen-6 row size -- anything larger is
+    ; either a bogus header or a format we don't handle, so we render
+    ; only what fits and drain the rest per row.
+    ld      hl, [ImgBuf + 66]
+    ld      a, h
+    or      a
+    jp      nz, .pcxFail                ; > 255 = not supported
+    ld      a, l
+    or      a
+    jp      z, .pcxFail                 ; zero-width = bogus
+    cp      SC6_WIDTH_B + 1
+    jp      nc, .pcxFail
+    ld      [PcxBpl], a
+
+    ; Mark the header buffer consumed -- the next ImgStreamByte call
+    ; will refill from byte 128 (first RLE byte).
+    xor     a
+    ld      [ImgReadLen], a
+    ld      [PcxRepCount], a
+
+    ; Layout math -- same as SC6 except widthB is from the header.
+    ld      a, [HtmlIndent]
+    srl     a
+    srl     a
+    ld      [ImgStartCol], a
+    ld      a, [HtmlIndent]
+    ld      [TextX], a
+    xor     a
+    ld      [TextX + 1], a
+    ld      a, [TextY]
+    ld      [ImgCurY], a
+    xor     a
+    ld      [ImgCurRow], a
+
+.pcxRowLoop:
+    ld      a, [ImgCurRow]
+    cp      SC6_MAX_ROWS
+    jp      nc, .pcxDone
+    ld      a, [HtmlLineSkip]
+    or      a
+    jr      nz, .pcxConsume
+    ld      a, [ImgCurY]
+    cp      CONTENT_Y1 + 1
+    jr      nc, .pcxConsume
+
+    ld      a, [ImgStartCol]
+    ld      b, a
+    ld      a, [ImgCurY]
+    ld      c, a
+    call    SetVramWritePos
+
+    ; Emit min(BytesPerLine, SC6_VISIBLE_B) decoded bytes, then drain
+    ; the tail of this row so the next row starts on a fresh RLE state.
+    ld      a, [PcxBpl]
+    ld      b, a                        ; B = total bytes this row
+    ld      a, SC6_VISIBLE_B
+    cp      b
+    jr      nc, .pcxDrawSmall
+    ld      b, SC6_VISIBLE_B            ; clipped width
+.pcxDrawSmall:
+    ld      a, [PcxBpl]
+    sub     b
+    ld      c, a                        ; C = bytes to drain after draw
+.pcxDraw:
+    push    bc
+    call    PcxGetDecodedByte
+    pop     bc
+    jp      c, .pcxDone
+    out     [VDP_DATA], a
+    djnz    .pcxDraw
+    ld      a, c
+    or      a
+    jr      z, .pcxRowAdv
+    ld      b, c
+.pcxDrainVis:
+    push    bc
+    call    PcxGetDecodedByte
+    pop     bc
+    jp      c, .pcxDone
+    djnz    .pcxDrainVis
+.pcxRowAdv:
+    ld      a, [ImgCurY]
+    inc     a
+    ld      [ImgCurY], a
+    jr      .pcxRowPost
+
+.pcxConsume:
+    ld      a, [PcxBpl]
+    ld      b, a
+.pcxDrainAll:
+    push    bc
+    call    PcxGetDecodedByte
+    pop     bc
+    jp      c, .pcxDone
+    djnz    .pcxDrainAll
+
+.pcxRowPost:
+    ld      a, [ImgCurRow]
+    inc     a
+    ld      [ImgCurRow], a
+    and     0x07
+    jp      nz, .pcxRowLoop
+    push    bc
+    call    CountTableRow
+    pop     bc
+    jp      .pcxRowLoop
+
+.pcxFail:
+    call    ImgStreamClose
+    ret
+
+.pcxDone:
+    call    ImgStreamClose
+    ld      a, [HtmlLineSkip]
+    or      a
+    jr      nz, .pcxNoTy
+    ld      a, [ImgCurY]
+    cp      CONTENT_Y1 + 1
+    jr      c, .pcxTyOk
+    ld      a, CONTENT_Y1 + 1
+.pcxTyOk:
+    ld      [TextY], a
+.pcxNoTy:
+    ret
+
+; RenderBmpFile: stream a 24 bpp BMP (no compression, bottom-up) into
+; the viewport. Other bit depths or compressions fall back to [alt].
+; BMP rows go bottom-to-top on disk but we still stream sequentially:
+; each BMP row is written to VDP at (TextY + height - 1 - rowIdx).
+; Safety:
+;   - magic 'BM', bpp = 24, compression = 0, width <= 512 must all hold
+;   - the pixel-array offset (byte 10..13 in the BMP header) is capped
+;     at 1024 so a bogus offset can't pull megabytes through the stream
+;   - a luma-per-pixel threshold collapses the 24-bit colour down to
+;     the four Screen-6 palette slots (black / dgray / lgray / white)
+RenderBmpFile:
+    push    hl
+    call    ArFlush
+    call    LineFlush
+    pop     hl
+
+    ld      hl, ImgNameBuf
+    call    ImgStreamOpenName
+    ret     c
+
+    ; Read the first 128 bytes so we can peek at the BMP headers.
+    call    ImgStreamRefill
+    jp      c, .bmpFail
+
+    ; Magic = "BM".
+    ld      a, [ImgBuf + 0]
+    cp      'B'
+    jp      nz, .bmpFail
+    ld      a, [ImgBuf + 1]
+    cp      'M'
+    jp      nz, .bmpFail
+
+    ; bpp must be 24.
+    ld      a, [ImgBuf + 28]
+    cp      24
+    jp      nz, .bmpFail
+    ld      a, [ImgBuf + 29]
+    or      a
+    jp      nz, .bmpFail
+
+    ; compression = 0 (BI_RGB).
+    ld      a, [ImgBuf + 30]
+    or      a
+    jp      nz, .bmpFail
+    ld      a, [ImgBuf + 31]
+    or      a
+    jp      nz, .bmpFail
+    ld      a, [ImgBuf + 32]
+    or      a
+    jp      nz, .bmpFail
+    ld      a, [ImgBuf + 33]
+    or      a
+    jp      nz, .bmpFail
+
+    ; width -- only low byte of low word is usable since we cap at 512.
+    ld      a, [ImgBuf + 21]
+    or      a
+    jp      nz, .bmpFail                ; width > 65535 = bogus
+    ld      a, [ImgBuf + 20]
+    cp      2 + 1                       ; width < 513 -> low byte <= 2
+    jr      c, .bmpWidthOk
+    jp      nz, .bmpFail
+.bmpWidthOk:
+    ld      hl, [ImgBuf + 18]
+    ld      a, h
+    or      a
+    jp      nz, .bmpFail                ; width > 255 dropped (safety)
+    ld      a, l
+    or      a
+    jp      z, .bmpFail
+    cp      SC6_VISIBLE_B * 4 + 1
+    jp      nc, .bmpFail
+    ld      [BmpWidth], a
+
+    ; height -- must be positive and <= CONTENT_Y1 - CONTENT_Y0 + 1.
+    ld      a, [ImgBuf + 25]
+    or      a
+    jp      nz, .bmpFail                ; top-down or too tall
+    ld      a, [ImgBuf + 24]
+    or      a
+    jp      nz, .bmpFail                ; height > 255 not supported
+    ld      hl, [ImgBuf + 22]
+    ld      a, h
+    or      a
+    jp      nz, .bmpFail
+    ld      a, l
+    or      a
+    jp      z, .bmpFail
+    ld      [BmpHeight], a
+
+    ; Pixel-array offset (byte 10..13). Cap at 1024.
+    ld      a, [ImgBuf + 12]
+    or      a
+    jp      nz, .bmpFail
+    ld      a, [ImgBuf + 13]
+    or      a
+    jp      nz, .bmpFail
+    ld      hl, [ImgBuf + 10]
+    ld      a, h
+    cp      4 + 1                       ; high byte <= 4 -> offset <= 1279
+    jr      c, .bmpOffOk
+    jp      .bmpFail
+.bmpOffOk:
+
+    ; Skip ahead to the pixel array: we've already consumed 128 bytes
+    ; of header, so drain (offset - 128) more bytes from the stream.
+    ld      de, 128
+    or      a
+    sbc     hl, de                      ; HL = offset - 128
+    jr      c, .bmpPastPixels           ; offset < 128 -> already at data
+    ld      a, h
+    or      l
+    jr      z, .bmpAtPixels
+    ; Mark the DMA buffer empty so ImgStreamByte drives forward from
+    ; the file's current position.
+    xor     a
+    ld      [ImgReadLen], a
+.bmpSkipByte:
+    push    hl
+    call    ImgStreamByte
+    pop     hl
+    jp      c, .bmpFail
+    dec     hl
+    ld      a, h
+    or      l
+    jr      nz, .bmpSkipByte
+    jr      .bmpAtPixels
+.bmpPastPixels:
+    xor     a
+    ld      [ImgReadLen], a
+
+.bmpAtPixels:
+    ; rowPadBytes = (4 - (width*3) % 4) & 3. Compute once.
+    ld      a, [BmpWidth]
+    ld      b, a
+    add     a, a
+    add     a, b                        ; A = width * 3
+    and     3
+    ld      b, a
+    xor     a
+    sub     b
+    and     3
+    ld      [BmpPad], a
+
+    ; BMP rows are bottom-up. Work out how many rows at the bottom of
+    ; the image fall past CONTENT_Y1 (and therefore should be consumed
+    ; without drawing before we start rendering) and what on-screen Y
+    ; the first visible row lands on.  16-bit arithmetic because
+    ; TextY + height - 1 can exceed 255.
+    ld      a, [TextY]
+    ld      e, a
+    ld      d, 0
+    ld      a, [BmpHeight]
+    ld      l, a
+    ld      h, 0
+    add     hl, de
+    dec     hl                          ; HL = TextY + height - 1
+    ld      de, CONTENT_Y1
+    or      a
+    sbc     hl, de                      ; HL = bottomY - CONTENT_Y1
+    jr      c, .bmpBottomFits
+    jr      z, .bmpBottomFits
+    ; HL = skip-from-bottom count. Cap at BmpHeight for safety.
+    ld      a, h
+    or      a
+    jp      nz, .bmpFail                ; pathological offset
+    ld      a, l
+    ld      [BmpSkipBot], a
+    ld      b, a
+    ld      a, [BmpHeight]
+    sub     b
+    jp      c, .bmpFail                 ; all rows off-screen
+    ld      [BmpRowsLeft], a
+    ld      a, CONTENT_Y1
+    ld      [BmpCurY], a
+    jr      .bmpYDone
+.bmpBottomFits:
+    ; bottomY <= CONTENT_Y1. Restore HL = bottomY.
+    add     hl, de
+    ld      a, l
+    ld      [BmpCurY], a
+    xor     a
+    ld      [BmpSkipBot], a
+    ld      a, [BmpHeight]
+    ld      [BmpRowsLeft], a
+.bmpYDone:
+
+    ld      a, [HtmlIndent]
+    srl     a
+    srl     a
+    ld      [ImgStartCol], a
+
+    ; Drain any off-screen-bottom rows without drawing.
+.bmpPreSkip:
+    ld      a, [BmpSkipBot]
+    or      a
+    jr      z, .bmpRowLoop
+    dec     a
+    ld      [BmpSkipBot], a
+    call    BmpConsumeRow
+    jp      c, .bmpDone
+    jr      .bmpPreSkip
+
+.bmpRowLoop:
+    ld      a, [BmpRowsLeft]
+    or      a
+    jp      z, .bmpDone
+
+    ld      a, [HtmlLineSkip]
+    or      a
+    jp      nz, .bmpSkipRow
+    ld      a, [BmpCurY]
+    cp      CONTENT_Y0
+    jp      c, .bmpSkipRow
+    cp      CONTENT_Y1 + 1
+    jp      nc, .bmpSkipRow
+
+    ; Visible row: render.
+    ld      a, [ImgStartCol]
+    ld      b, a
+    ld      a, [BmpCurY]
+    ld      c, a
+    call    SetVramWritePos
+
+    ld      a, [BmpWidth]
+    ld      [BmpPxLeft], a
+    xor     a
+    ld      [BmpPackIdx], a
+    ld      [BmpPackByte], a
+.bmpRowPx:
+    ; Read one pixel (B, G, R). Use G for luminance -- cheap and close
+    ; enough for photo-like content.
+    call    ImgStreamByte
+    jp      c, .bmpDone                 ; truncated mid-row
+    call    ImgStreamByte
+    jp      c, .bmpDone
+    ld      b, a                        ; B = green byte
+    call    ImgStreamByte
+    jp      c, .bmpDone
+    ld      a, b
+    call    BmpLumaToPalette            ; A = palette idx 0..3
+
+    ; Pack into output byte.
+    ld      b, a
+    ld      a, [BmpPackIdx]
+    ld      c, a
+    ld      a, 3
+    sub     c
+    add     a, a
+    ld      c, a                        ; C = (3 - idx) * 2
+    ld      a, b
+    jr      .bmpShiftCheck
+.bmpShiftLoop:
+    add     a, a
+.bmpShiftCheck:
+    dec     c
+    jp      p, .bmpShiftLoop
+    ld      b, a                        ; B = pixel bits shifted into place
+    ld      a, [BmpPackByte]
+    or      b
+    ld      [BmpPackByte], a
+
+    ld      a, [BmpPackIdx]
+    inc     a
+    cp      4
+    jr      nz, .bmpPxPack
+    ld      a, [BmpPackByte]
+    out     [VDP_DATA], a
+    xor     a
+    ld      [BmpPackByte], a
+.bmpPxPack:
+    and     3
+    ld      [BmpPackIdx], a
+
+    ld      a, [BmpPxLeft]
+    dec     a
+    ld      [BmpPxLeft], a
+    jp      nz, .bmpRowPx
+
+    ; Flush a partial trailing byte (when width isn't a multiple of 4).
+    ld      a, [BmpPackIdx]
+    or      a
+    jr      z, .bmpRowPadSkip
+    ld      a, [BmpPackByte]
+    out     [VDP_DATA], a
+.bmpRowPadSkip:
+    ld      a, [BmpPad]
+    or      a
+    jr      z, .bmpRowAdv
+    ld      b, a
+.bmpRowPad:
+    push    bc
+    call    ImgStreamByte
+    pop     bc
+    jp      c, .bmpDone
+    djnz    .bmpRowPad
+    jr      .bmpRowAdv
+
+.bmpSkipRow:
+    call    BmpConsumeRow
+    jp      c, .bmpDone
+
+.bmpRowAdv:
+    ld      a, [BmpCurY]
+    dec     a
+    ld      [BmpCurY], a
+    ld      a, [BmpRowsLeft]
+    dec     a
+    ld      [BmpRowsLeft], a
+
+    ; Advance HtmlLineCount / HtmlLineSkip bookkeeping every 8 rows.
+    ld      a, [BmpRowsLeft]
+    and     0x07
+    jp      nz, .bmpRowLoop
+    push    bc
+    call    CountTableRow
+    pop     bc
+    jp      .bmpRowLoop
+
+.bmpFail:
+    call    ImgStreamClose
+    ret
+
+.bmpDone:
+    call    ImgStreamClose
+    ; Park TextY below the drawn image (height advance was done upfront
+    ; into BmpCurY, but TextY still points at the top -- move it down).
+    ld      a, [HtmlLineSkip]
+    or      a
+    jr      nz, .bmpNoTy
+    ld      a, [TextY]
+    ld      b, a
+    ld      a, [BmpHeight]
+    add     a, b
+    cp      CONTENT_Y1 + 1
+    jr      c, .bmpTyOk
+    ld      a, CONTENT_Y1 + 1
+.bmpTyOk:
+    ld      [TextY], a
+.bmpNoTy:
+    ret
+
+; BmpConsumeRow: drain one BMP row (width*3 + pad bytes) from the image
+; stream without writing to VRAM. CF=1 if the stream EOFs mid-row.
+BmpConsumeRow:
+    ld      a, [BmpWidth]
+    ld      b, a
+    add     a, a
+    add     a, b
+    ld      b, a
+    ld      a, [BmpPad]
+    add     a, b
+    ld      b, a
+    or      a
+    ret     z                           ; zero-byte row -> nothing to do
+.bmcLoop:
+    push    bc
+    call    ImgStreamByte
+    pop     bc
+    ret     c
+    djnz    .bmcLoop
+    or      a
+    ret
+
+; BmpLumaToPalette: A = 0..255 brightness -> A = Screen-6 palette slot
+; matching the nearest of the four configured palette entries (dgray 73,
+; lgray 182, white 255, black 0). Cheap 3-way threshold.
+BmpLumaToPalette:
+    cp      37
+    jr      c, .bltBlack
+    cp      127
+    jr      c, .bltDgray
+    cp      218
+    jr      c, .bltLgray
+    ld      a, 2                        ; white
+    ret
+.bltBlack:
+    ld      a, 3
+    ret
+.bltDgray:
+    xor     a                           ; dgray palette index 0
+    ret
+.bltLgray:
+    ld      a, 1
+    ret
+
+; PcxGetDecodedByte: returns A = next decoded PCX byte (after RLE
+; expansion). CF=1 if the stream EOFs in the middle of a run marker.
+PcxGetDecodedByte:
+    ld      a, [PcxRepCount]
+    or      a
+    jr      nz, .pgbReplay
+    call    ImgStreamByte
+    ret     c
+    cp      0xC0
+    jr      c, .pgbLiteral
+    and     0x3F
+    ld      [PcxRepCount], a
+    call    ImgStreamByte
+    ret     c
+    ld      [PcxRepVal], a
+.pgbReplay:
+    ld      a, [PcxRepCount]
+    dec     a
+    ld      [PcxRepCount], a
+    ld      a, [PcxRepVal]
+    or      a                           ; CF=0
+    ret
+.pgbLiteral:
+    or      a                           ; CF=0 (A already has the byte)
+    ret
 
 ; Built-in page served when a requested URL can't be opened. Kept in ROM
 ; as raw HTML and copied into FileBuf + rendered via the normal path so
@@ -5053,6 +5636,18 @@ ImgCurRow:    db 0
 HtmlCurSrcPtr: dw 0
 ImgReadPtr:   dw 0                     ; next byte in ImgBuf for ImgStreamByte
 ImgReadLen:   db 0                     ; bytes still unread in the DMA buffer
+PcxRepCount:  db 0                     ; repeat counter for PCX RLE decoder
+PcxRepVal:    db 0                     ; byte being repeated
+PcxBpl:       db 0                     ; BytesPerLine from PCX header
+BmpWidth:     db 0
+BmpHeight:    db 0
+BmpPad:       db 0                     ; trailing pad bytes per BMP row
+BmpRowsLeft:  db 0
+BmpCurY:      db 0
+BmpSkipBot:   db 0                     ; bottom rows past CONTENT_Y1
+BmpPxLeft:    db 0                     ; pixels remaining in current row
+BmpPackIdx:   db 0                     ; 0..3, position within packed byte
+BmpPackByte:  db 0
 IMG_NAME_MAX equ 32
 ImgNameBuf:   ds IMG_NAME_MAX + 1     ; scratch for <img src="..."> filenames
 
