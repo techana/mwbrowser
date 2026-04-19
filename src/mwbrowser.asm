@@ -3439,14 +3439,28 @@ EmitBlankLine:
 
 ; EmitHalfLineGap: advance TextY by half a text line (4 px) to add a small
 ; visual gap below block-close tags (</p>, </hx>), mirroring how browsers
-; give each paragraph bottom margin. No-op while HtmlLineSkip drains so
-; the gap doesn't double-decrement scroll math on scrolled pages. Clamps
-; so we never push TextY past the content area.
+; give each paragraph bottom margin. The gap counts as a full row in the
+; HtmlLineCount / HtmlLineSkip bookkeeping so PageDown's last-page math
+; stays in sync with the real vertical pixel budget (otherwise the final
+; line in documents with many paragraphs lands below the reachable
+; ScrollLine max and never scrolls into view).
 HALF_LINE_H equ 4
 EmitHalfLineGap:
+    ; Bookkeeping: treat this gap as one 8-px row for scroll math. When
+    ; a scrolled pass is still skipping, burn a skip count instead of
+    ; advancing TextY (pin-to-top behaviour matches EmitNewline).
+    ld      a, [HtmlLineCount]
+    inc     a
+    jr      z, .hgSat                   ; saturate at 0xFF
+    ld      [HtmlLineCount], a
+.hgSat:
     ld      a, [HtmlLineSkip]
     or      a
-    ret     nz
+    jr      z, .hgAdvance
+    dec     a
+    ld      [HtmlLineSkip], a
+    ret
+.hgAdvance:
     ld      a, [TextY]
     add     a, HALF_LINE_H
     cp      CONTENT_Y1 + 1
