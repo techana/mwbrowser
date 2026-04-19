@@ -13,5 +13,11 @@
 !samples/*.htm
 !samples/*.html
 !samples/*.txt
+!samples/*.sc6
+!samples/*.SC6
+!samples/*.pcx
+!samples/*.PCX
+!samples/*.bmp
+!samples/*.BMP
 !tools/
 !tools/*.py
