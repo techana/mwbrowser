@@ -4303,15 +4303,25 @@ TagImg:
     ; buffer ends in the extension pointed to by HL.
     ld      hl, ExtSc6
     call    MatchImgExt
-    jp      z, RenderSc6File
+    jr      nz, .tryPcx
+    call    RenderSc6File
+    ret     c                           ; image rendered -> done
+    jr      .altFallback
+.tryPcx:
     ld      hl, ExtPcx
     call    MatchImgExt
-    jp      z, RenderPcxFile
+    jr      nz, .tryBmp
+    call    RenderPcxFile
+    ret     c
+    jr      .altFallback
+.tryBmp:
     ld      hl, ExtBmp
     call    MatchImgExt
-    jp      z, RenderBmpFile
+    jr      nz, .altFallback
+    call    RenderBmpFile
+    ret     c
 
-    ; No supported format -- fall through to the text placeholder.
+    ; No supported format or file couldn't be opened -> placeholder.
 
 .altFallback:
     ld      a, '['
@@ -4494,14 +4504,13 @@ ImgStreamOpenName:
 ; the header is consumed, empty file) silently returns so the caller
 ; can fall through to the "[alt]" text placeholder.
 RenderSc6File:
-    push    hl
-    call    ArFlush
-    call    LineFlush
-    pop     hl
-
     ld      hl, ImgNameBuf
     call    ImgStreamOpenName
-    ret     c                           ; file open failed
+    jp      c, .rsfOpenFail             ; file not found -> let caller fallback
+
+    ; File is open -- now it's safe to end the current text line.
+    call    ArFlush
+    call    LineFlush
 
     ; Skip the 7-byte BSAVE header (magic 0xFE + start/end/exec addrs).
     ld      b, 7
@@ -4610,6 +4619,11 @@ RenderSc6File:
 .rsfTyOk:
     ld      [TextY], a
 .rsfNoTy:
+    scf                                 ; CF=1 -> image was handled
+    ret
+
+.rsfOpenFail:
+    or      a                           ; CF=0 -> fall through to altFallback
     ret
 
 SC6_WIDTH_B     equ 128                 ; full Screen-6 row in bytes
@@ -4627,16 +4641,13 @@ SC6_MAX_ROWS    equ 240                 ; upper bound; EOF stops earlier
 ;   - RLE control bytes that would run off EOF stop the render early
 ;     instead of looping forever
 RenderPcxFile:
-    push    hl
-    call    ArFlush
-    call    LineFlush
-    pop     hl
-
     ld      hl, ImgNameBuf
     call    ImgStreamOpenName
-    ret     c
+    jp      c, .pcxOpenFail
 
-    ; Read the first 128 bytes = PCX header.
+    ; Read the first 128 bytes = PCX header before committing to the
+    ; render -- if validation fails we can still close and let the
+    ; caller fall back to the text placeholder.
     call    ImgStreamRefill
     jp      c, .pcxFail
 
@@ -4667,6 +4678,11 @@ RenderPcxFile:
     cp      SC6_WIDTH_B + 1
     jp      nc, .pcxFail
     ld      [PcxBpl], a
+
+    ; Header validated. Flush the current text line now -- once we
+    ; start OUTing pixels the layout is committed.
+    call    ArFlush
+    call    LineFlush
 
     ; Mark the header buffer consumed -- the next ImgStreamByte call
     ; will refill from byte 128 (first RLE byte).
@@ -4763,7 +4779,10 @@ RenderPcxFile:
     jp      .pcxRowLoop
 
 .pcxFail:
+    ; Format rejected before we flushed: let the caller emit [alt].
     call    ImgStreamClose
+.pcxOpenFail:
+    or      a                           ; CF=0
     ret
 
 .pcxDone:
@@ -4778,6 +4797,7 @@ RenderPcxFile:
 .pcxTyOk:
     ld      [TextY], a
 .pcxNoTy:
+    scf
     ret
 
 ; RenderBmpFile: stream a 24 bpp BMP (no compression, bottom-up) into
@@ -4791,16 +4811,12 @@ RenderPcxFile:
 ;   - a luma-per-pixel threshold collapses the 24-bit colour down to
 ;     the four Screen-6 palette slots (black / dgray / lgray / white)
 RenderBmpFile:
-    push    hl
-    call    ArFlush
-    call    LineFlush
-    pop     hl
-
     ld      hl, ImgNameBuf
     call    ImgStreamOpenName
-    ret     c
+    jp      c, .bmpOpenFail
 
-    ; Read the first 128 bytes so we can peek at the BMP headers.
+    ; Read the first 128 bytes so we can peek at the BMP headers
+    ; before committing to any layout changes.
     call    ImgStreamRefill
     jp      c, .bmpFail
 
@@ -4912,6 +4928,11 @@ RenderBmpFile:
     ld      [ImgReadLen], a
 
 .bmpAtPixels:
+    ; Headers are valid and we're positioned at the pixel array -- now
+    ; it's safe to end the current text line.
+    call    ArFlush
+    call    LineFlush
+
     ; rowPadBytes = (4 - (width*3) % 4) & 3. Compute once.
     ld      a, [BmpWidth]
     ld      b, a
@@ -5101,6 +5122,8 @@ RenderBmpFile:
 
 .bmpFail:
     call    ImgStreamClose
+.bmpOpenFail:
+    or      a                           ; CF=0 -> altFallback
     ret
 
 .bmpDone:
@@ -5120,6 +5143,7 @@ RenderBmpFile:
 .bmpTyOk:
     ld      [TextY], a
 .bmpNoTy:
+    scf
     ret
 
 ; BmpConsumeRow: drain one BMP row (width*3 + pad bytes) from the image

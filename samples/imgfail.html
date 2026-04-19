@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html>
+<head><title>Image Fallbacks</title></head>
+<body>
+<h2>Image Fallback Test</h2>
+
+<p>1) Unsupported format (.xyz):</p>
+<p>Before <img src="foo.xyz"> after.</p>
+
+<p>2) Supported format but file is missing:</p>
+<p>Before <img src="NOPE.SC6"> after.</p>
+
+<p>3a) Unsupported format with alt:</p>
+<p>Before <img src="foo.xyz" alt="missing"> after.</p>
+
+<p>3b) Supported format, missing file, with alt:</p>
+<p>Before <img src="NOPE.SC6" alt="gone"> after.</p>
+
+</body>
+</html>
