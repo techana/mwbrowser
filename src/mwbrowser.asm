@@ -1796,14 +1796,21 @@ UpperCaseA:
 ; LoadFile: open via Fcb, read up to FILE_BUF_SIZE bytes into FileBuf, close.
 ;   On success A=0, FileLen = bytes actually read (capped at buffer size).
 ;   On failure A!=0 (file not found etc.).
-LoadFile:
-    ld      hl, Fcb + 12                ; zero FCB internal state
+; ResetFcbTail: zero Fcb bytes 12..35 (the record-number / random-read
+; fields BDOS keeps internal). Called before every DOS_OPEN so a
+; previous file's state never leaks into the new session.
+ResetFcbTail:
+    ld      hl, Fcb + 12
     ld      b, 24
     xor     a
-.z:
+.rftLoop:
     ld      [hl], a
     inc     hl
-    djnz    .z
+    djnz    .rftLoop
+    ret
+
+LoadFile:
+    call    ResetFcbTail
 
     ld      c, DOS_OPEN
     ld      de, Fcb
@@ -4163,9 +4170,6 @@ TagTitle:
     ld      [HtmlTitleSeen], a
     jp      DrawTitleLabel
 
-TagNoOp:
-    ret
-
 ; <ul>: bullet list. Open indents by 16 px and switches bullet style.
 ; Close restores. No nesting state beyond a single level.
 TagUl:
@@ -4469,14 +4473,7 @@ ImgStreamClose:
 ; the first ImgStreamByte call triggers an initial refill.
 ImgStreamOpenName:
     call    BuildFcbFromHL
-    ; Clear FCB state used by sequential reads.
-    ld      hl, Fcb + 12
-    ld      b, 24
-    xor     a
-.isoZ:
-    ld      [hl], a
-    inc     hl
-    djnz    .isoZ
+    call    ResetFcbTail                ; record / position / random-read slots
     ld      c, DOS_OPEN
     ld      de, Fcb
     call    BDOS_ENTRY
@@ -5566,69 +5563,6 @@ B64DecodeByte:
     pop     hl
     ret
 
-; B64Decode (legacy): kept for the non-streaming caller. Unused now but
-; left in case a future path still wants the old behaviour.
-B64Decode:
-.b64Loop:
-    call    B64ReadChar
-    cp      0xFF
-    ret     z
-    ld      [B64C0], a
-    call    B64ReadChar
-    cp      0xFF
-    ret     z
-    ld      [B64C1], a
-    ; out[0] = (C0 << 2) | (C1 >> 4)
-    ld      a, [B64C0]
-    add     a, a
-    add     a, a
-    ld      b, a
-    ld      a, [B64C1]
-    rrca
-    rrca
-    rrca
-    rrca
-    and     0x0F
-    or      b
-    ld      [de], a
-    inc     de
-
-    call    B64ReadChar
-    cp      0xFF
-    ret     z
-    ld      [B64C2], a
-    ; out[1] = ((C1 & 0x0F) << 4) | (C2 >> 2)
-    ld      a, [B64C1]
-    and     0x0F
-    add     a, a
-    add     a, a
-    add     a, a
-    add     a, a
-    ld      b, a
-    ld      a, [B64C2]
-    rrca
-    rrca
-    and     0x3F
-    or      b
-    ld      [de], a
-    inc     de
-
-    call    B64ReadChar
-    cp      0xFF
-    ret     z
-    ld      [B64C3], a
-    ; out[2] = ((C2 & 0x03) << 6) | C3
-    ld      a, [B64C2]
-    and     0x03
-    rrca
-    rrca
-    ld      b, a
-    ld      a, [B64C3]
-    or      b
-    ld      [de], a
-    inc     de
-    jr      .b64Loop
-
 ; B64ReadChar: read one char from [HL], advance HL, translate to 0..63.
 ; Returns 0xFF on any non-base64 terminator (including '=').
 B64ReadChar:
@@ -5676,53 +5610,6 @@ B64ReadChar:
     ld      a, 0xFF
     ret
 
-; BlitImageFromImgBuf: draw the decoded image (ImgBuf + 2) at
-; (TextX byte col, TextY). Reads ImgWidthB and ImgHeightR for size.
-BlitImageFromImgBuf:
-    ld      hl, ImgBuf
-    inc     hl
-    inc     hl                           ; HL = ImgBuf + 2 (pixel data start)
-    ld      a, [TextX]
-    srl     a
-    srl     a
-    ld      [ImgStartCol], a
-    ld      a, [TextY]
-    ld      [ImgCurY], a
-    xor     a
-    ld      [ImgCurRow], a
-.blRow:
-    ld      a, [ImgCurRow]
-    ld      b, a
-    ld      a, [ImgHeightR]
-    cp      b
-    ret     z
-    push    hl
-    ld      a, [ImgStartCol]
-    ld      b, a
-    ld      a, [ImgCurY]
-    ld      c, a
-    call    SetVramWritePos
-    pop     hl
-    ld      a, [ImgWidthB]
-    ld      b, a
-.blCol:
-    ld      a, [hl]
-    out     [VDP_DATA], a
-    inc     hl
-    djnz    .blCol
-    ld      a, [ImgCurY]
-    inc     a
-    ld      [ImgCurY], a
-    ld      a, [ImgCurRow]
-    inc     a
-    ld      [ImgCurRow], a
-    jr      .blRow
-
-; Scratch for the base64 decode + image blit pipeline.
-B64C0:        db 0
-B64C1:        db 0
-B64C2:        db 0
-B64C3:        db 0
 ; Streaming-decoder state. A triplet holds the three bytes produced
 ; from the last four base64 chars; BTripletIdx cycles 0..2 as callers
 ; consume those bytes, hitting 3 when a fresh quartet must be read.
@@ -6372,191 +6259,95 @@ TagHr:
 ; half-line gap, and clear only the style bits we turned on for this
 ; tag so nested styling survives.
 
+; Each heading loads (scale, style-mask) into (B, C) and falls into the
+; shared Hx dispatcher. The dispatcher handles open (set style bits +
+; scale), close (reset scale to 1, clear the same bits), and the
+; half-line gap above and below the block.
 TagH1:
-    ld      a, [HtmlIsClose]
-    or      a
-    jr      nz, .close
-    call    EnsureLineStart
-    call    EmitHalfLineGap
-    call    ApplyBlockAttrs
-    ld      a, [HtmlStyleFlags]
-    or      STYLE_BOLD | STYLE_UNDERLINE
-    ld      [HtmlStyleFlags], a
-    ld      a, 2
-    ld      [HtmlScaleY], a
-    ret
-.close:
-    call    EmitNewline
-    ld      a, 1
-    ld      [HtmlScaleY], a
-    call    EmitHalfLineGap
-    call    ResetBlockAttrs
-    ld      a, [HtmlStyleFlags]
-    and     ~(STYLE_BOLD | STYLE_UNDERLINE) & 0xFF
-    ld      [HtmlStyleFlags], a
-    ret
-
+    ld      b, 2
+    ld      c, STYLE_BOLD | STYLE_UNDERLINE
+    jr      HxDispatch
 TagH2:
+    ld      b, 2
+    ld      c, STYLE_BOLD
+    jr      HxDispatch
+TagH3:
+    ld      b, 1
+    ld      c, STYLE_BOLD | STYLE_UNDERLINE
+    jr      HxDispatch
+TagH4:
+    ld      b, 1
+    ld      c, STYLE_BOLD
+    jr      HxDispatch
+TagH5:
+    ld      b, 1
+    ld      c, STYLE_ITALIC | STYLE_UNDERLINE
+    jr      HxDispatch
+TagH6:
+    ld      b, 1
+    ld      c, STYLE_ITALIC
+HxDispatch:
     ld      a, [HtmlIsClose]
     or      a
-    jr      nz, .close
+    jp      nz, .hxClose
+    ; Open: blank above, then set scale + style bits.
+    push    bc
     call    EnsureLineStart
     call    EmitHalfLineGap
     call    ApplyBlockAttrs
+    pop     bc
     ld      a, [HtmlStyleFlags]
-    or      STYLE_BOLD
+    or      c
     ld      [HtmlStyleFlags], a
-    ld      a, 2
+    ld      a, b
     ld      [HtmlScaleY], a
     ret
-.close:
+.hxClose:
+    ; Close: end the line (at the heading's scale), reset scale to 1
+    ; before the half-line gap so it uses text-line pitch, then clear
+    ; the style bits this heading enabled.
+    push    bc
     call    EmitNewline
     ld      a, 1
     ld      [HtmlScaleY], a
     call    EmitHalfLineGap
     call    ResetBlockAttrs
+    pop     bc
+    ld      a, c
+    cpl
+    ld      b, a
     ld      a, [HtmlStyleFlags]
-    and     ~STYLE_BOLD & 0xFF
+    and     b
     ld      [HtmlStyleFlags], a
     ret
 
-TagH3:
-    ld      a, [HtmlIsClose]
-    or      a
-    jr      nz, .close
-    call    EnsureLineStart
-    call    EmitHalfLineGap
-    call    ApplyBlockAttrs
-    ld      a, [HtmlStyleFlags]
-    or      STYLE_BOLD | STYLE_UNDERLINE
-    ld      [HtmlStyleFlags], a
-    ret
-.close:
-    call    EmitNewline
-    call    EmitHalfLineGap
-    call    ResetBlockAttrs
-    ld      a, [HtmlStyleFlags]
-    and     ~(STYLE_BOLD | STYLE_UNDERLINE) & 0xFF
-    ld      [HtmlStyleFlags], a
-    ret
-
-TagH4:
-    ld      a, [HtmlIsClose]
-    or      a
-    jr      nz, .close
-    call    EnsureLineStart
-    call    EmitHalfLineGap
-    call    ApplyBlockAttrs
-    ld      a, [HtmlStyleFlags]
-    or      STYLE_BOLD
-    ld      [HtmlStyleFlags], a
-    ret
-.close:
-    call    EmitNewline
-    call    EmitHalfLineGap
-    call    ResetBlockAttrs
-    ld      a, [HtmlStyleFlags]
-    and     ~STYLE_BOLD & 0xFF
-    ld      [HtmlStyleFlags], a
-    ret
-
-TagH5:
-    ld      a, [HtmlIsClose]
-    or      a
-    jr      nz, .close
-    call    EnsureLineStart
-    call    EmitHalfLineGap
-    call    ApplyBlockAttrs
-    ld      a, [HtmlStyleFlags]
-    or      STYLE_ITALIC | STYLE_UNDERLINE
-    ld      [HtmlStyleFlags], a
-    ret
-.close:
-    call    EmitNewline
-    call    EmitHalfLineGap
-    call    ResetBlockAttrs
-    ld      a, [HtmlStyleFlags]
-    and     ~(STYLE_ITALIC | STYLE_UNDERLINE) & 0xFF
-    ld      [HtmlStyleFlags], a
-    ret
-
-TagH6:
-    ld      a, [HtmlIsClose]
-    or      a
-    jr      nz, .close
-    call    EnsureLineStart
-    call    EmitHalfLineGap
-    call    ApplyBlockAttrs
-    ld      a, [HtmlStyleFlags]
-    or      STYLE_ITALIC
-    ld      [HtmlStyleFlags], a
-    ret
-.close:
-    call    EmitNewline
-    call    EmitHalfLineGap
-    call    ResetBlockAttrs
-    ld      a, [HtmlStyleFlags]
-    and     ~STYLE_ITALIC & 0xFF
-    ld      [HtmlStyleFlags], a
-    ret
-
+; Inline style tags: <b>, <i>, <u>, <s> all do the same thing -- set
+; a single bit in HtmlStyleFlags on open, clear it on close. Each entry
+; loads the tag's bit mask into C and falls into the shared dispatcher.
 TagB:
-    ld      a, [HtmlStyleFlags]
-    ld      b, a
-    ld      a, [HtmlIsClose]
-    or      a
-    ld      a, b
-    jr      nz, .close
-    or      STYLE_BOLD
-    ld      [HtmlStyleFlags], a
-    ret
-.close:
-    and     0xFE
-    ld      [HtmlStyleFlags], a
-    ret
-
+    ld      c, STYLE_BOLD
+    jr      StyleBitDispatch
 TagI:
-    ld      a, [HtmlStyleFlags]
-    ld      b, a
-    ld      a, [HtmlIsClose]
-    or      a
-    ld      a, b
-    jr      nz, .close
-    or      STYLE_ITALIC
-    ld      [HtmlStyleFlags], a
-    ret
-.close:
-    and     0xFD
-    ld      [HtmlStyleFlags], a
-    ret
-
+    ld      c, STYLE_ITALIC
+    jr      StyleBitDispatch
 TagU:
-    ld      a, [HtmlStyleFlags]
-    ld      b, a
-    ld      a, [HtmlIsClose]
-    or      a
-    ld      a, b
-    jr      nz, .close
-    or      STYLE_UNDERLINE
-    ld      [HtmlStyleFlags], a
-    ret
-.close:
-    and     0xFB
-    ld      [HtmlStyleFlags], a
-    ret
-
+    ld      c, STYLE_UNDERLINE
+    jr      StyleBitDispatch
 TagS:
-    ld      a, [HtmlStyleFlags]
-    ld      b, a
+    ld      c, STYLE_STRIKE
+StyleBitDispatch:
     ld      a, [HtmlIsClose]
     or      a
-    ld      a, b
-    jr      nz, .close
-    or      STYLE_STRIKE
+    ld      a, [HtmlStyleFlags]
+    jr      nz, .sbdClose
+    or      c
     ld      [HtmlStyleFlags], a
     ret
-.close:
-    and     0xF7
+.sbdClose:
+    ld      b, a
+    ld      a, c
+    cpl
+    and     b
     ld      [HtmlStyleFlags], a
     ret
 
@@ -8585,7 +8376,6 @@ HtmlNextDir:    db 0xFF                 ; scratch: dir= parsed on current tag
 ; MSX-DOS leaves above the program.
 FileBuf         equ $
 FontBuf         equ FileBuf + FILE_BUF_SIZE
-; 1 KB scratch for the data:msx;base64 image decoder. Sits above the
-; font cache in TPA.
-IMG_BUF_SIZE    equ 1024
+; 128-byte DMA scratch used by the streaming external-image loaders
+; (SC6/PCX/BMP). Sits above the font cache in TPA.
 ImgBuf          equ FontBuf + 2048
