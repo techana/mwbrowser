@@ -151,6 +151,7 @@ Main:
     call    ClearContent                ; VRAM all white (colour 0)
     call    BindFnKeys                  ; make F1 inject 0xF1 on DIRIN
     call    InitState
+    call    BuildExtImgRemap            ; LUT for SC6/PCX palette fixup
 
     call    DrawTitlebar
     call    DrawSeparators
@@ -4556,6 +4557,7 @@ RenderSc6File:
     call    ImgStreamByte
     pop     bc
     jp      c, .rsfDone
+    call    RemapByte
     out     [VDP_DATA], a
     djnz    .rsfDraw
 
@@ -4720,6 +4722,7 @@ RenderPcxFile:
     call    PcxGetDecodedByte
     pop     bc
     jp      c, .pcxDone
+    call    RemapByte
     out     [VDP_DATA], a
     djnz    .pcxDraw
     ld      a, c
@@ -5189,6 +5192,85 @@ PcxGetDecodedByte:
     or      a                           ; CF=0 (A already has the byte)
     ret
 
+; BuildExtImgRemap: one-time init of the 256-entry palette remap table
+; used by external SC6/PCX images. Our UI palette puts slot 0 on a
+; dithered dgray and slot 3 on solid black, but SC6/PCX files are
+; almost always authored assuming slot 0 = black and slot 3 = white.
+; The table rewrites every 2-bit pixel with the permutation
+;   0 -> 3  (black)      saved black background shows as black
+;   1 -> 0  (dgray)      bright-ish colour stays as mid-tone
+;   2 -> 1  (lgray)
+;   3 -> 2  (white)
+; applied independently to each of the four pixels in a byte.
+BuildExtImgRemap:
+    ld      hl, ExtImgRemap
+    ld      c, 0                        ; input byte index 0..255
+.beiNext:
+    ld      a, c
+    ld      d, 0                        ; D accumulates output byte
+    ; pixel 0 = bits 7..6
+    rlca
+    rlca
+    and     3
+    call    .beiMap
+    rlca
+    rlca
+    rlca
+    rlca
+    rlca
+    rlca
+    or      d
+    ld      d, a
+    ; pixel 1 = bits 5..4
+    ld      a, c
+    rrca
+    rrca
+    rrca
+    rrca
+    and     3
+    call    .beiMap
+    rlca
+    rlca
+    rlca
+    rlca
+    or      d
+    ld      d, a
+    ; pixel 2 = bits 3..2
+    ld      a, c
+    rrca
+    rrca
+    and     3
+    call    .beiMap
+    rlca
+    rlca
+    or      d
+    ld      d, a
+    ; pixel 3 = bits 1..0
+    ld      a, c
+    and     3
+    call    .beiMap
+    or      d
+    ld      [hl], a
+    inc     hl
+    inc     c
+    jr      nz, .beiNext
+    ret
+.beiMap:
+    ; A = 0..3 input pixel -> A = 0..3 output pixel.
+    dec     a
+    and     3
+    ret
+
+; RemapByte: A = pixel byte -> A = byte rewritten through ExtImgRemap.
+; Preserves BC (the render loop's djnz counter). Clobbers DE/HL.
+RemapByte:
+    ld      e, a
+    ld      d, 0
+    ld      hl, ExtImgRemap
+    add     hl, de
+    ld      a, [hl]
+    ret
+
 ; Built-in page served when a requested URL can't be opened. Kept in ROM
 ; as raw HTML and copied into FileBuf + rendered via the normal path so
 ; the titlebar, scrollbar, and back-history all behave exactly like on a
@@ -5650,6 +5732,7 @@ BmpPackIdx:   db 0                     ; 0..3, position within packed byte
 BmpPackByte:  db 0
 IMG_NAME_MAX equ 32
 ImgNameBuf:   ds IMG_NAME_MAX + 1     ; scratch for <img src="..."> filenames
+ExtImgRemap:  ds 256                  ; palette fixup LUT built once at startup
 
 ; <font color="name">: push current fg, set new fg + CurrentFontLUT from
 ; the color name stored in HtmlCurHref (ScanHrefAttr captured it via the
