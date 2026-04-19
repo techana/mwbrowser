@@ -5250,6 +5250,7 @@ TagP:
     or      a
     jr      nz, .pClose
     call    EnsureLineStart
+    call    EmitHalfLineGap
     call    ApplyBlockAttrs
     ret
 .pClose:
@@ -5333,6 +5334,7 @@ TagH2:
     or      a
     jr      nz, .close
     call    EnsureLineStart
+    call    EmitHalfLineGap
     call    ApplyBlockAttrs
     ld      a, [HtmlStyleFlags]
     or      STYLE_BOLD
@@ -5360,6 +5362,7 @@ TagH6:
     or      a
     jr      nz, .close
     call    EnsureLineStart
+    call    EmitHalfLineGap
     call    ApplyBlockAttrs
     ld      a, [HtmlStyleFlags]
     or      STYLE_BOLD
