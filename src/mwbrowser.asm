@@ -119,7 +119,7 @@ KEY_F1         equ 0xF1        ; MSX F1 key (opens About popup)
 
 ; ---- URL / file state ----
 URL_MAX        equ 96
-FILE_BUF_SIZE  equ 4096        ; 4 KB — enough for Step 2 test files
+FILE_BUF_SIZE  equ 0x9000      ; 36 KB — fits image-heavy pages from the bridge
 FONT_BUF_SIZE  equ 2048        ; 256 glyphs * 8 rows
 CONTENT_X_END  equ 491         ; scrollbar now starts at x=492
 TEXT_LINE_H    equ 8           ; MSX font row height
@@ -1814,7 +1814,8 @@ LoadFile:
 .sizeOk:
 
     ld      hl, FileBuf
-    ld      b, FILE_BUF_SIZE / 128
+    ld      bc, FILE_BUF_SIZE / 128     ; 16-bit record counter: FILE_BUF_SIZE
+                                        ; up to 64 KB (8-bit B only reached 8 KB).
 .rl:
     push    bc
     push    hl
@@ -1830,7 +1831,10 @@ LoadFile:
     jr      nz, .done
     ld      de, 128
     add     hl, de
-    djnz    .rl
+    dec     bc
+    ld      a, b
+    or      c
+    jr      nz, .rl
 
 .done:
     ld      c, DOS_CLOSE
@@ -4248,47 +4252,121 @@ DataMsxPrefix:   db "data:msx;base64,"
 DataMsxPrefixLen equ $ - DataMsxPrefix
 
 ; RenderImageDataUri: HL points at the first base64 char of a
-; "data:msx;base64,..." value inside FileBuf. Decode the base64 stream
-; into ImgBuf, then blit the image to VRAM at the current pen position.
+; "data:msx;base64,..." value inside FileBuf. Streaming decoder: no
+; full-image buffer; each decoded byte is OUT'd straight to VRAM.
 ; Format: byte0 = width in bytes (pixels/4), byte1 = height in rows,
-; followed by width_bytes * height raw Screen-6 2bpp bytes.
+; then width_bytes * height raw Screen-6 2bpp bytes.
 RenderImageDataUri:
     ; Flush anything the current paragraph has accumulated so the image
-    ; doesn't overdraw pending text, then line-break so the image drops
-    ; onto a fresh baseline.
+    ; doesn't overdraw pending text.
     push    hl
     call    ArFlush
     call    LineFlush
     pop     hl
 
-    ; Decode base64 stream into ImgBuf. B64Decode reads from HL until
-    ; it hits a non-base64 terminator (quote, '>', NUL).
-    ld      de, ImgBuf
-    call    B64Decode
+    ; Fresh triplet state for B64DecodeByte.
+    ld      a, 3
+    ld      [BTripletIdx], a
+    ld      [BSrcPtr], hl
 
-    ; If we're in the scroll-skip phase just advance the bookkeeping by
-    ; the image's row count (ceil(height/8)) and bail out; otherwise
-    ; actually paint the pixels.
-    ld      hl, ImgBuf
-    ld      a, [hl]
+    ; Decode the two header bytes (width_bytes, height).
+    call    B64DecodeByte
     ld      [ImgWidthB], a
-    inc     hl
-    ld      a, [hl]
+    call    B64DecodeByte
     ld      [ImgHeightR], a
 
+    ; Start column + starting Y.
+    ld      a, [HtmlIndent]
+    srl     a
+    srl     a
+    ld      [ImgStartCol], a
+    ld      a, [TextY]
+    ld      [ImgCurY], a
+    xor     a
+    ld      [ImgCurRow], a
+
+    ; If we're in the scroll-skip phase we still have to consume the
+    ; base64 stream so the parser's next HL is correct, but we skip
+    ; the VRAM positioning + OUT so the page boundary isn't disturbed.
     ld      a, [HtmlLineSkip]
     or      a
-    jr      nz, .imgSkip
+    jr      nz, .rowLoopSkipPaint
 
-    ; Rendering path: blit at HtmlIndent, TextY.
-    ld      a, [HtmlIndent]
-    ld      [TextX], a
-    xor     a
-    ld      [TextX + 1], a
-    call    BlitImageFromImgBuf
+    ; --- render path: blit rows straight to VRAM ---------------------
+.rowLoop:
+    ld      a, [ImgCurRow]
+    ld      b, a
+    ld      a, [ImgHeightR]
+    cp      b
+    jr      z, .rowDone
 
-    ; Advance TextY by image height (minus 8) so the final EmitNewline
-    ; of the enclosing tag/flow lands on the line after the image.
+    ; Once ImgCurY passes the content area bottom, stop writing VRAM and
+    ; only consume the base64 stream so the source pointer tracks
+    ; correctly; otherwise VDP would auto-increment past the end of the
+    ; Screen-6 bitmap and wrap back over the titlebar.
+    ld      a, [ImgCurY]
+    cp      CONTENT_Y1 + 1
+    jr      nc, .rowConsume
+
+    ld      a, [ImgStartCol]
+    ld      b, a
+    ld      a, [ImgCurY]
+    ld      c, a
+    call    SetVramWritePos
+
+    ld      a, [ImgWidthB]
+    ld      b, a
+.colLoop:
+    push    bc
+    call    B64DecodeByte
+    pop     bc
+    out     [VDP_DATA], a
+    djnz    .colLoop
+    jr      .rowAdvance
+
+.rowConsume:
+    ld      a, [ImgWidthB]
+    ld      b, a
+.consumeLoop:
+    push    bc
+    call    B64DecodeByte
+    pop     bc
+    djnz    .consumeLoop
+
+.rowAdvance:
+    ld      a, [ImgCurY]
+    inc     a
+    ld      [ImgCurY], a
+    ld      a, [ImgCurRow]
+    inc     a
+    ld      [ImgCurRow], a
+    jr      .rowLoop
+
+    ; --- skip path: consume payload without VRAM writes --------------
+.rowLoopSkipPaint:
+    ld      a, [ImgCurRow]
+    ld      b, a
+    ld      a, [ImgHeightR]
+    cp      b
+    jr      z, .rowDone
+    ld      a, [ImgWidthB]
+    ld      b, a
+.colSkip:
+    push    bc
+    call    B64DecodeByte
+    pop     bc
+    djnz    .colSkip
+    ld      a, [ImgCurRow]
+    inc     a
+    ld      [ImgCurRow], a
+    jr      .rowLoopSkipPaint
+
+.rowDone:
+    ; Rendering path: advance TextY by image height (minus 8) so the
+    ; final EmitNewline of the enclosing tag lands below the image.
+    ld      a, [HtmlLineSkip]
+    or      a
+    jr      nz, .advCount
     ld      a, [ImgHeightR]
     ld      b, a
     ld      a, [TextY]
@@ -4298,34 +4376,161 @@ RenderImageDataUri:
     ld      a, CONTENT_Y1 - 8
 .tyOk:
     ld      [TextY], a
-    jr      .imgAdvanceCount
-
-.imgSkip:
-    ; No draw; just keep TextY pinned at its current value.
-
-.imgAdvanceCount:
+.advCount:
     ; Bump HtmlLineCount / HtmlLineSkip by ceil(height/8) rows.
     ld      a, [ImgHeightR]
     add     a, 7
     srl     a
     srl     a
     srl     a
-    ld      b, a                        ; B = rows
-.imgBumpLoop:
+    ld      b, a
+.bumpLoop:
     ld      a, b
     or      a
-    jr      z, .imgBumpDone
+    jr      z, .bumpDone
     push    bc
-    call    CountTableRow               ; reuse the row-counter helper
+    call    CountTableRow
     pop     bc
     dec     b
-    jr      .imgBumpLoop
-.imgBumpDone:
+    jr      .bumpLoop
+.bumpDone:
     ret
 
-; B64Decode: source in HL, destination in DE. Decodes until '"', '>',
-; or NUL in the source. Preserves DE and HL at return for no particular
-; reason; callers don't care.
+; B64DecodeByte: pull one decoded byte from the base64 stream whose
+; source pointer lives in BSrcPtr (so callers aren't forced to keep
+; HL intact across every invocation). Returns A = byte; clobbers
+; nothing else the caller relies on. When the input terminates early
+; (hits '"', '>', NUL, '=') the routine returns A = 0 to keep the
+; renderer from stalling.
+B64DecodeByte:
+    push    hl
+    push    bc
+    push    de
+    ld      a, [BTripletIdx]
+    cp      3
+    jr      c, .bdbHave
+
+    ; Need to decode a fresh triplet: four input chars -> three bytes.
+    ld      hl, [BSrcPtr]
+    call    B64ReadChar
+    ld      [BSrcPtr], hl
+    cp      0xFF
+    jp      z, .bdbEof
+    ld      b, a                        ; B = C0
+    ld      hl, [BSrcPtr]
+    call    B64ReadChar
+    ld      [BSrcPtr], hl
+    cp      0xFF
+    jp      z, .bdbEof
+    ld      c, a                        ; C = C1
+    ; byte0 = (C0 << 2) | (C1 >> 4)
+    ld      a, b
+    add     a, a
+    add     a, a
+    ld      d, a
+    ld      a, c
+    rrca
+    rrca
+    rrca
+    rrca
+    and     0x0F
+    or      d
+    ld      [BTripletByte0], a
+
+    ld      hl, [BSrcPtr]
+    call    B64ReadChar
+    ld      [BSrcPtr], hl
+    cp      0xFF
+    jp      z, .bdbEof2
+    ld      d, a                        ; D = C2
+    ; byte1 = ((C1 & 0x0F) << 4) | (C2 >> 2)
+    ld      a, c
+    and     0x0F
+    rlca
+    rlca
+    rlca
+    rlca
+    ld      e, a
+    ld      a, d
+    rrca
+    rrca
+    and     0x3F
+    or      e
+    ld      [BTripletByte1], a
+
+    ld      hl, [BSrcPtr]
+    call    B64ReadChar
+    ld      [BSrcPtr], hl
+    cp      0xFF
+    jp      z, .bdbEof3
+    ld      e, a                        ; E = C3
+    ; byte2 = ((C2 & 0x03) << 6) | C3
+    ld      a, d
+    and     0x03
+    rrca
+    rrca
+    ld      d, a
+    ld      a, e
+    or      d
+    ld      [BTripletByte2], a
+
+    xor     a
+    ld      [BTripletIdx], a
+
+.bdbHave:
+    ld      a, [BTripletIdx]
+    ld      c, a
+    ld      b, 0
+    ld      hl, BTripletByte0
+    add     hl, bc
+    ld      a, [hl]
+    ld      [BResult], a
+    ld      a, c
+    inc     a
+    ld      [BTripletIdx], a
+    ld      a, [BResult]
+    pop     de
+    pop     bc
+    pop     hl
+    ret
+
+.bdbEof:
+    ; No more chars; return 0 and keep subsequent calls returning 0 by
+    ; leaving BTripletIdx at 0 with all three bytes already zeroed.
+    xor     a
+    ld      [BTripletByte0], a
+    ld      [BTripletByte1], a
+    ld      [BTripletByte2], a
+    ld      [BTripletIdx], a
+    ld      [BResult], a
+    pop     de
+    pop     bc
+    pop     hl
+    ret
+.bdbEof2:
+    xor     a
+    ld      [BTripletByte1], a
+    ld      [BTripletByte2], a
+    ld      [BTripletIdx], a
+    ld      a, [BTripletByte0]
+    ld      [BResult], a
+    pop     de
+    pop     bc
+    pop     hl
+    ret
+.bdbEof3:
+    xor     a
+    ld      [BTripletByte2], a
+    ld      [BTripletIdx], a
+    ld      a, [BTripletByte0]
+    ld      [BResult], a
+    pop     de
+    pop     bc
+    pop     hl
+    ret
+
+; B64Decode (legacy): kept for the non-streaming caller. Unused now but
+; left in case a future path still wants the old behaviour.
 B64Decode:
 .b64Loop:
     call    B64ReadChar
@@ -4481,6 +4686,17 @@ B64C0:        db 0
 B64C1:        db 0
 B64C2:        db 0
 B64C3:        db 0
+; Streaming-decoder state. A triplet holds the three bytes produced
+; from the last four base64 chars; BTripletIdx cycles 0..2 as callers
+; consume those bytes, hitting 3 when a fresh quartet must be read.
+; BSrcPtr keeps the source pointer between calls so we don't have to
+; preserve HL across arbitrary OUT loops.
+BTripletByte0: db 0
+BTripletByte1: db 0
+BTripletByte2: db 0
+BTripletIdx:   db 3
+BSrcPtr:       dw 0
+BResult:       db 0
 ImgWidthB:    db 0
 ImgHeightR:   db 0
 ImgStartCol:  db 0
