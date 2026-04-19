@@ -4297,7 +4297,7 @@ DataMsxPrefix:   db "data:msx;base64,"
 ; loaded document.
 NotFoundHtml:
     db  "<title>404 Not Found</title>"
-    db  "<h1>404 Not Found</h1>"
+    db  "<h2>Error 404 - Not Found</h2>"
     db  "<p>The requested file could not be opened.</p>"
 NotFoundHtmlLen equ $ - NotFoundHtml
 DataMsxPrefixLen equ $ - DataMsxPrefix
@@ -6093,35 +6093,11 @@ NavigateToCurrentUrl:
     or      a
     jr      nz, .err
 
-    call    HistoryPush                 ; records UrlBuf -> history[cursor]
-    call    HistoryUpdateFlags
-
+    ; Successful navigation: history gets a new entry and any prior
+    ; 404 state is cleared so forward/back navigation no longer hits
+    ; the built-in error page.
     xor     a
-    ld      [ScrollLine], a
-    call    ClearContentArea
-    call    PrintFileContent
-    ld      a, [HtmlLineCount]
-    ld      [TotalLines], a
-    call    ComputeThumb
-    call    DrawScrollbar
-    xor     a
-    ld      [Busy], a
-    jp      PaintToolbar
-
-.err:
-    ; Load failed (file not found, disk error, etc.). Fall back to a
-    ; built-in 404 document so the viewport carries a real page instead
-    ; of a blank canvas. Push the attempted URL to history so Back
-    ; returns to whatever page the user came from.
-    ld      hl, NotFoundHtml
-    ld      de, FileBuf
-    ld      bc, NotFoundHtmlLen
-    ldir
-    ld      hl, NotFoundHtmlLen
-    ld      [FileLen], hl
-    xor     a
-    ld      [PlainTextMode], a
-
+    ld      [On404], a
     call    HistoryPush
     call    HistoryUpdateFlags
 
@@ -6137,9 +6113,58 @@ NavigateToCurrentUrl:
     ld      [Busy], a
     jp      PaintToolbar
 
+.err:
+    ; Load failed. If the address bar is empty (Enter pressed with no
+    ; URL typed, or program just launched) there's nothing to error
+    ; about -- silently leave the viewport alone.
+    ld      a, [UrlLen]
+    or      a
+    jr      z, .errSilent
+
+    ; Real typed URL that didn't resolve: swap in the built-in 404
+    ; document and render it via the normal pipeline. Do NOT push to
+    ; history -- the attempted URL stays only in UrlBuf and On404
+    ; marks the current view as synthetic, so Back re-loads the
+    ; previous real page and Forward skips the 404 entirely.
+    ld      a, 1
+    ld      [On404], a
+
+    ld      hl, NotFoundHtml
+    ld      de, FileBuf
+    ld      bc, NotFoundHtmlLen
+    ldir
+    ld      hl, NotFoundHtmlLen
+    ld      [FileLen], hl
+    xor     a
+    ld      [PlainTextMode], a
+
+    xor     a
+    ld      [ScrollLine], a
+    call    ClearContentArea
+    call    PrintFileContent
+    ld      a, [HtmlLineCount]
+    ld      [TotalLines], a
+    call    ComputeThumb
+    call    DrawScrollbar
+    xor     a
+    ld      [Busy], a
+    jp      PaintToolbar
+
+.errSilent:
+    xor     a
+    ld      [Busy], a
+    call    ClearContentArea
+    jp      PaintToolbar
+
 ; GoBack / GoForward walk the history cursor. They do not push a new
 ; entry; they re-load whatever URL sits at the new cursor position.
+; When the viewport is currently showing the synthetic 404 page, the
+; cursor still points at the last real entry (A), so Back just reloads
+; cursor (= A) and Forward stays at the same real page.
 GoBack:
+    ld      a, [On404]
+    or      a
+    jr      nz, .backFrom404
     ld      a, [HistoryCursor]
     or      a
     ret     z
@@ -6149,7 +6174,17 @@ GoBack:
     call    HistoryUpdateFlags
     jr      ReloadCurrent
 
+.backFrom404:
+    xor     a
+    ld      [On404], a
+    call    HistoryLoadAtCursor
+    call    HistoryUpdateFlags
+    jr      ReloadCurrent
+
 GoForward:
+    ld      a, [On404]
+    or      a
+    jr      nz, .forwardFrom404
     ld      a, [HistoryCount]
     or      a
     ret     z
@@ -6160,6 +6195,13 @@ GoForward:
     ret     nc                          ; already at newest
     inc     a
     ld      [HistoryCursor], a
+    call    HistoryLoadAtCursor
+    call    HistoryUpdateFlags
+    jr      ReloadCurrent
+
+.forwardFrom404:
+    xor     a
+    ld      [On404], a
     call    HistoryLoadAtCursor
     call    HistoryUpdateFlags
 
@@ -7454,6 +7496,7 @@ HistoryCount:   db 0
 HistoryCursor:  db 0
 HasPrev:        db 0
 HasNext:        db 0
+On404:          db 0                    ; 1 while the synthetic 404 page is in view
 
 ; Arabic word buffer for Step 5A reshaping. EmitIsoByte appends bytes with
 ; IsoJoin != 0 here; on any boundary char (or newline) the buffer is
