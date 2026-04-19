@@ -4424,6 +4424,19 @@ MatchImgExt:
 ; ImgStreamOpen must have done the DOS_OPEN; ImgStreamClose must close.
 
 ImgStreamRefill:
+    ; Nothing left to read?
+    ld      a, [ImgBytesLeft]
+    ld      b, a
+    ld      a, [ImgBytesLeft + 1]
+    or      b
+    ld      b, a
+    ld      a, [ImgBytesLeft + 2]
+    or      b
+    ld      b, a
+    ld      a, [ImgBytesLeft + 3]
+    or      b
+    jr      z, .isrEof
+
     ld      c, DOS_SETDMA
     ld      de, ImgBuf
     call    BDOS_ENTRY
@@ -4432,11 +4445,49 @@ ImgStreamRefill:
     call    BDOS_ENTRY
     or      a
     jr      nz, .isrEof
+
+    ; How many of those 128 bytes are actually file data? Capped at
+    ; ImgBytesLeft so MSX-DOS's padding of a short last record can't
+    ; slip into the renderer as pixel data.
+    ld      a, [ImgBytesLeft + 1]
+    or      a
+    jr      nz, .isrFull
+    ld      a, [ImgBytesLeft + 2]
+    or      a
+    jr      nz, .isrFull
+    ld      a, [ImgBytesLeft + 3]
+    or      a
+    jr      nz, .isrFull
+    ld      a, [ImgBytesLeft]
+    cp      128
+    jr      nc, .isrFull
+    ; Partial last record: A valid bytes, then stop.
+    ld      [ImgReadLen], a
+    xor     a
+    ld      [ImgBytesLeft], a
+    ld      hl, ImgBuf
+    ld      [ImgReadPtr], hl
+    or      a
+    ret
+.isrFull:
+    ; 128 bytes valid. Decrement the 32-bit remaining counter.
+    ld      hl, [ImgBytesLeft]
+    ld      de, 128
+    or      a
+    sbc     hl, de
+    ld      [ImgBytesLeft], hl
+    jr      nc, .isrFullSaveRest
+    ld      hl, [ImgBytesLeft + 2]
+    ld      de, 1
+    or      a
+    sbc     hl, de
+    ld      [ImgBytesLeft + 2], hl
+.isrFullSaveRest:
     ld      a, 128
     ld      [ImgReadLen], a
     ld      hl, ImgBuf
     ld      [ImgReadPtr], hl
-    or      a                           ; Z=1 success (return carry clear)
+    or      a
     ret
 .isrEof:
     xor     a
@@ -4479,6 +4530,13 @@ ImgStreamOpenName:
     call    BDOS_ENTRY
     or      a
     jr      nz, .isoFail
+    ; Snapshot the file size (32-bit) from FCB+16 so the stream reader
+    ; can stop exactly at EOF and never feed MSX-DOS's last-record zero
+    ; padding back into the image decoder.
+    ld      hl, [Fcb + 16]
+    ld      [ImgBytesLeft], hl
+    ld      hl, [Fcb + 18]
+    ld      [ImgBytesLeft + 2], hl
     xor     a
     ld      [ImgReadLen], a
     or      a
@@ -5782,6 +5840,7 @@ ImgCurRow:    db 0
 HtmlCurSrcPtr: dw 0
 ImgReadPtr:   dw 0                     ; next byte in ImgBuf for ImgStreamByte
 ImgReadLen:   db 0                     ; bytes still unread in the DMA buffer
+ImgBytesLeft: db 0, 0, 0, 0            ; 32-bit bytes remaining in the open file
 PcxRepCount:  db 0                     ; repeat counter for PCX RLE decoder
 PcxRepVal:    db 0                     ; byte being repeated
 PcxBpl:       db 0                     ; BytesPerLine from PCX header
@@ -6377,10 +6436,11 @@ ResetBlockAttrs:
 TagBr:
     jp      EmitNewline
 
-; <center>: block-level centering. Equivalent to wrapping the content in
-; a paragraph with align="center", but without the implicit margins -- we
-; only insert the usual half-line gap above/below so a <center> around
-; an image doesn't push extra whitespace in.
+; <center>: block-level centering. Sets HtmlAlign = center for the
+; enclosed block, with a half-line gap above (so an image/line doesn't
+; butt up against the previous paragraph) but no gap below -- the next
+; block tag supplies its own top gap so doubling the spacing below
+; </center> looks odd, especially wrapping a centered image.
 TagCenter:
     ld      a, [HtmlIsClose]
     or      a
@@ -6392,7 +6452,6 @@ TagCenter:
     ret
 .close:
     call    EmitNewline
-    call    EmitHalfLineGap
     call    ResetBlockAttrs
     ret
 
