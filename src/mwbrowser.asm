@@ -3432,6 +3432,7 @@ EmitNewline:
     ld      b, a
     ld      a, [TextY]
     add     a, b                        ; A = proposed new TextY
+    jr      c, .flagsDone               ; wrapped past 255 -> page full
     cp      CONTENT_Y1 + 1
     jr      nc, .flagsDone              ; new line wouldn't fit -> stop
     ld      [TextY], a
@@ -3489,6 +3490,7 @@ EmitHalfLineGap:
 .hgAdvance:
     ld      a, [TextY]
     add     a, HALF_LINE_H
+    ret     c                           ; wrapped past 255 -> don't advance
     cp      CONTENT_Y1 + 1
     ret     nc
     ld      [TextY], a
@@ -6043,6 +6045,12 @@ TagTableTag:
     ld      a, [TextY]
     ld      [TableTopY], a              ; remember top for full-height borders
     add     a, TABLE_ROW_GAP
+    jr      c, .ttOpenClamp
+    cp      CONTENT_Y1 + 1
+    jr      c, .ttOpenOk
+.ttOpenClamp:
+    ld      a, CONTENT_Y1 + 1
+.ttOpenOk:
     ld      [TextY], a
     ld      [HtmlRowTopY], a
     ret
@@ -6057,6 +6065,12 @@ TagTableTag:
     ; Close the last row's bottom rule.
     ld      a, [HtmlRowTopY]
     add     a, TEXT_LINE_H
+    jr      c, .ttCloseClamp
+    cp      CONTENT_Y1 + 1
+    jr      c, .ttCloseOk
+.ttCloseClamp:
+    ld      a, CONTENT_Y1 + 1
+.ttCloseOk:
     ld      [TextY], a
     call    DrawTableRuleHere
     ; Paint the vertical borders as continuous lines on top of the
@@ -6145,10 +6159,22 @@ TagTr:
     jr      nz, .trNoAdvance
     ld      a, [HtmlRowTopY]
     add     a, TEXT_LINE_H
+    jr      c, .trClampBot              ; wrapped 8-bit -> bottom
+    cp      CONTENT_Y1 + 1
+    jr      c, .trTyOk
+.trClampBot:
+    ld      a, CONTENT_Y1 + 1
+.trTyOk:
     ld      [TextY], a
     call    DrawTableRuleHere
     ld      a, [TextY]
     add     a, TABLE_ROW_GAP
+    jr      c, .trClampGap
+    cp      CONTENT_Y1 + 1
+    jr      c, .trGapOk
+.trClampGap:
+    ld      a, CONTENT_Y1 + 1
+.trGapOk:
     ld      [TextY], a
 .trNoAdvance:
 
