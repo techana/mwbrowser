@@ -3437,6 +3437,16 @@ EmitBlankLine:
 .skipBreak:
     jp      EmitNewline
 
+; EnsureLineStart: end the current line if there's any text on it; no-op
+; otherwise. Used by block-level open tags (<p>, <h1>..<h6>) when the
+; preceding close already produced its own bottom gap -- calling
+; EmitBlankLine would stack an extra blank row on top of that gap.
+EnsureLineStart:
+    ld      a, [HtmlLineEmpty]
+    or      a
+    ret     nz
+    jp      EmitNewline
+
 ; EmitHalfLineGap: advance TextY by half a text line (4 px) to add a small
 ; visual gap below block-close tags (</p>, </hx>), mirroring how browsers
 ; give each paragraph bottom margin. The gap counts as a full row in the
@@ -5239,7 +5249,7 @@ TagP:
     ld      a, [HtmlIsClose]
     or      a
     jr      nz, .pClose
-    call    EmitBlankLine
+    call    EnsureLineStart
     call    ApplyBlockAttrs
     ret
 .pClose:
@@ -5322,7 +5332,7 @@ TagH2:
     ld      a, [HtmlIsClose]
     or      a
     jr      nz, .close
-    call    EmitBlankLine
+    call    EnsureLineStart
     call    ApplyBlockAttrs
     ld      a, [HtmlStyleFlags]
     or      STYLE_BOLD
@@ -5349,7 +5359,7 @@ TagH6:
     ld      a, [HtmlIsClose]
     or      a
     jr      nz, .close
-    call    EmitBlankLine
+    call    EnsureLineStart
     call    ApplyBlockAttrs
     ld      a, [HtmlStyleFlags]
     or      STYLE_BOLD
