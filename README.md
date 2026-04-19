@@ -12,9 +12,21 @@ ligatures, and basic bidirectional text support.
 - **Screen-6 chrome** — title bar, back/forward/refresh toolbar, address
   bar, scrollable content area, and a pixel-aligned scrollbar.
 - **HTML subset** — `<h1>`–`<h6>`, `<p>`, `<b>`, `<i>`, `<u>`, `<s>`,
-  `<font color>`, `<a href>`, `<img alt>`, `<hr>`, `<br>`, `<pre>`,
+  `<font color>`, `<a href>`, `<center>`, `<hr>`, `<br>`, `<pre>`,
   `<ul>`/`<ol>`/`<li>`, `<blockquote>`, `<table>`/`<tr>`/`<td>`/`<th>`,
   `&nbsp;`/`&amp;`/`&lt;`/`&gt;`/`&quot;` entities.
+- **Images** — `<img src="..." alt="...">` loads bitmap assets from the
+  same disk. Supported formats:
+  - `.sc6` — MSX Screen-6 BSAVE dump. Use `tools/png_to_sc6.py` (with
+    optional `-c` to centre-pad narrow logos) to convert PNG/BMP
+    artwork into a browser-ready SC6 file.
+  - `.pcx` — ZSoft PCX at 2 bpp / 1 plane (RLE encoded).
+  - `.bmp` — uncompressed Windows BMP at 4 bpp (16-colour palette) or
+    24 bpp; luminance-quantised onto the 4-colour Screen-6 palette.
+  - Inline `data:msx;base64,…` payloads produced by
+    `tools/img_encode/img_encode.py`.
+  - Unsupported formats or missing files fall back to `[alt]` /
+    `[img]` inline text.
 - **Arabic** — ISO-8859-6 input, joining-form shaping (isolated / initial
   / medial / final), lam-alef ligatures, Arabic-Indic digits.
 - **BiDi (L2)** — multi-word Arabic runs reorder correctly inside
