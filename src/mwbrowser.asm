@@ -8440,7 +8440,7 @@ AboutLine2:     db 0x4D, 0x53, 0x58, 0x32, 0x20
 AboutLine3:     db "github.com/techana/mwbrowser", 0
 AboutLine4:     db "F1 shows this dialog.", 0
 AboutLine5:     db "Esc closes / quits.", 0
-AboutFooter:    db "v0.4 demo build", 0
+AboutFooter:    db "v0.5 demo build", 0
 
 ; Screen-6 icon bitmaps (4 px/byte, 11=black, 01=bg/lgray).
 
