@@ -1979,6 +1979,29 @@ PrintFileContent:
     ld      hl, FileBuf
 
 .loop:
+    ; Viewport-full short-circuit. Once HtmlLineSkip has drained (0) and
+    ; the Y cursor has painted past the bottom of the content area,
+    ; nothing we parse from here on can appear on screen. Bailing out
+    ; skips every subsequent <img src=...> file-open, which is the
+    ; dominant cost when an HTM file stacks many screenshots (the
+    ; WEBSITE.HTM wrapper emitted by tools/web_to_sc6.py). Without
+    ; this, every PageDown re-opens and drains all trailing images.
+    ;
+    ; Only safe to fire on scrolled renders (ScrollLine != 0). The
+    ; initial-load pass needs to walk to EOF so HtmlLineCount reflects
+    ; the true document height -- the caller latches it into
+    ; TotalLines straight after this routine returns, and a short
+    ; count would clamp PageDown before the user reaches the end.
+    ld      a, [ScrollLine]
+    or      a
+    jr      z, .loopNotFull
+    ld      a, [HtmlLineSkip]
+    or      a
+    jr      nz, .loopNotFull
+    ld      a, [TextY]
+    cp      CONTENT_Y1 + 1
+    jr      nc, .eof
+.loopNotFull:
     ; End-of-buffer check.
     push    hl
     ld      de, [HtmlEnd]
@@ -4565,9 +4588,76 @@ RenderSc6File:
     call    ImgStreamOpenName
     jp      c, .rsfOpenFail             ; file not found -> let caller fallback
 
-    ; File is open -- now it's safe to end the current text line.
+    ; Commit any pending text line now so both the fast-path and the
+    ; streaming decoder start at a clean Y cursor. LineFlush is also
+    ; what deducts the line's height from HtmlLineSkip on scrolled
+    ; pages, so the fast-path that follows sees a consistent count.
     call    ArFlush
     call    LineFlush
+
+    ; Measure the image's height from the FCB size snapshot so we can
+    ; decide whether to stream any pixel bytes at all. SC6 on disk is
+    ; a 7-byte BLOAD header plus pixel_rows * 128 bytes; every file we
+    ; accept sits well under 64 KB, so the low word of ImgBytesLeft
+    ; carries the full size.
+    ld      hl, [ImgBytesLeft]
+    ld      de, 7
+    and     a
+    sbc     hl, de                      ; HL = pixel-byte count
+    jr      c, .rsfHeader               ; truncated -> let the slow path bail
+    ld      b, 7                        ; HL >>= 7  (each row is 128 bytes)
+.rsfShr7:
+    srl     h
+    rr      l
+    djnz    .rsfShr7
+    ld      a, h
+    or      a
+    jr      nz, .rsfHeader              ; rows > 255 -> clamp via slow path
+    ld      a, l
+    or      a
+    jr      z, .rsfHeader               ; empty image -> slow path (alt fallback)
+    add     a, 7
+    jr      c, .rsfHeader               ; ceil((>248)/8) wraps -> slow path
+    srl     a
+    srl     a
+    srl     a                           ; A = ceil(pixel_rows / 8) = image lines
+    ld      b, a                        ; B = image lines (preserved below)
+
+    ; Case A: scrolled render, image entirely above the fold. Deduct
+    ; B lines from HtmlLineSkip and close -- no pixel bytes streamed.
+    ld      a, [HtmlLineSkip]
+    or      a
+    jr      z, .rsfCheckBelow           ; not scrolling -> try case B
+    cp      b
+    jr      c, .rsfHeader               ; straddles fold -> slow path
+    sub     b
+    ld      [HtmlLineSkip], a
+    jr      .rsfFastAccount
+
+    ; Case B: initial / already-scrolled render, image entirely below
+    ; the fold. The parser can't early-exit on the initial pass
+    ; (HtmlLineCount must still count this image for TotalLines), so
+    ; without this branch every off-screen <img> on page 1 would
+    ; drain its full file just to tally rows.
+.rsfCheckBelow:
+    ld      a, [TextY]
+    cp      CONTENT_Y1 + 1
+    jr      c, .rsfHeader               ; viewport not full yet -> draw normally
+
+.rsfFastAccount:
+    ; Charge the height against the total line count so the scroll
+    ; thumb still reflects this image even when no pixels were drawn.
+    ld      a, [HtmlLineCount]
+    add     a, b
+    jr      nc, .rsfFastLC
+    ld      a, 0xFF
+.rsfFastLC:
+    ld      [HtmlLineCount], a
+    call    ImgStreamClose
+    scf                                 ; image "handled"
+    ret
+
+.rsfHeader:
 
     ; Skip the 7-byte BSAVE header (magic 0xFE + start/end/exec addrs).
     ld      b, 7
