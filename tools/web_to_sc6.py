@@ -302,22 +302,19 @@ async def _run(args) -> int:
         print(f"note: page renders to {num_pages} chunks; capping at {args.max_pages}")
         num_pages = args.max_pages
 
-    # Keep PREFIX + "NNX" (two-digit page + A/B) <= 8 chars so MSX-DOS 1's
-    # FCB parser doesn't truncate PREFIX10A+ back onto PREFIX01A.
-    if len(args.prefix) > 5:
-        sys.exit(f"prefix '{args.prefix}' too long: max 5 chars (8.3 FCB limit with NN + A/B suffix)")
+    # Keep PREFIX + two-digit page index <= 8 chars so MSX-DOS 1's
+    # FCB parser doesn't truncate PREFIX10 back onto PREFIX01.
+    if len(args.prefix) > 6:
+        sys.exit(f"prefix '{args.prefix}' too long: max 6 chars (8.3 FCB limit with 2-digit numbering)")
 
     print(f"Slicing   {total_w}x{total_h} into {num_pages} x {rows_per_page}-row chunks")
     chunks_meta: list[dict] = []
 
     def _chunk_name(i: int) -> str:
-        # Two half-viewport chunks per logical viewport page: chunk 0
-        # and 1 pair up as PG01A + PG01B, chunks 2/3 as PG02A + PG02B,
-        # and so on. Keeps the disk directory grouping visually
-        # aligned with what a user sees as "page N".
-        page = i // 2 + 1
-        half = "A" if i % 2 == 0 else "B"
-        return f"{args.prefix}{page:02d}{half}.SC6"
+        # One full-viewport chunk per logical page -- PG01.SC6 is the
+        # first screenful, PG02.SC6 the second, etc. One file per
+        # PageDown hop.
+        return f"{args.prefix}{i+1:02d}.SC6"
 
     for i in range(num_pages):
         top = i * rows_per_page
@@ -332,9 +329,8 @@ async def _run(args) -> int:
         areas = _clip_links_to_chunk(links, chunk_top_msx=top, chunk_h=bot - top)
         map_id = None
         if areas:
-            # Map names go on the directory too in case the browser
-            # ever wants to external-resolve them. Keep them 8.3-ish:
-            # 'M' + the chunk's 3-char page+half tag (e.g. M01A).
+            # Keep map names 8.3-safe: 'M' + the chunk's 2-digit page
+            # index (e.g. M01).
             map_id = "M" + name[len(args.prefix):-4]
         chunks_meta.append({
             "name":   name,
@@ -368,17 +364,15 @@ def main() -> int:
     ap.add_argument("--out-dir", default="samples",
                     help="Where to write the .sc6 + .htm (default: samples)")
     ap.add_argument("--prefix", default="PG",
-                    help="Base filename -- each logical viewport page becomes "
-                         "two half-viewport chunks, suffixed A/B: "
-                         "PREFIX01A.SC6 + PREFIX01B.SC6, PREFIX02A.SC6 + "
-                         "PREFIX02B.SC6, etc. Index file is PREFIX.HTM "
+                    help="Base filename -- pages become PREFIX01.SC6, "
+                         "PREFIX02.SC6, ... and the index is PREFIX.HTM "
                          "(default: PG). MSX-DOS 1 enforces 8.3 filenames; "
-                         "with two-digit page numbers + A/B suffix the "
-                         "prefix has to be <= 5 characters.")
-    ap.add_argument("--rows-per-page", type=int, default=MSX_VIEWPORT_H // 2,
-                    help=f"Rows per .sc6 chunk (default: {MSX_VIEWPORT_H // 2}"
-                         f" = half a viewport, so each image loads faster"
-                         f" while flipping through the wrapper HTM)")
+                         "with two-digit page numbers the prefix must be "
+                         "<= 6 characters.")
+    ap.add_argument("--rows-per-page", type=int, default=MSX_VIEWPORT_H,
+                    help=f"Rows per .sc6 chunk (default: {MSX_VIEWPORT_H}"
+                         f" = one full viewport per image, so each chunk"
+                         f" corresponds to one PageDown of scrolling)")
     ap.add_argument("--max-pages", type=int, default=0,
                     help="Cap the number of half-viewport chunks (default 0 = no"
                          " cap; the full page is sliced, bounded only by disk"

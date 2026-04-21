@@ -23,4 +23,4 @@
 !tools/*.py
 !tools/*.sh
 !samples/PG.HTM
-!samples/PG[0-9][0-9][AB].SC6
+!samples/PG[0-9][0-9].SC6
