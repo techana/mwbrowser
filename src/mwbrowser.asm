@@ -8816,10 +8816,10 @@ TitleShapeOne:
 UART_DATA       equ 0x80
 UART_STATUS     equ 0x81
 
-; Screen-6's R1 value (0xE2 = Screen 6 defaults incl. VBLANK enabled).
-; SerialMaskVblank clears bit 5 around a remote load so the VBLANK ISR
-; can't eat CPU time mid-receive; SerialUnmaskVblank restores it.
-SerialR1Value  equ 0xE2
+; Screen-6 R1 is 0xE0 after CHGMOD (display enable + VBLANK enable,
+; mode bits for 512x212). Masking bit 5 disables just the VBLANK
+; interrupt without touching any other mode bit.
+SerialR1Value   equ 0xE0
 
 SerialMaskVblank:
     ld      a, SerialR1Value & 0xDF      ; VBLANK off
