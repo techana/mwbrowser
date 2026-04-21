@@ -114,7 +114,26 @@ READABILITY_CSS = """
 GRAYSCALE_CSS = "html { filter: grayscale(100%) !important; }"
 
 
+def _build_palette_image() -> Image.Image:
+    """A 4-slot palette image the 'quantize' call can snap pixels onto.
+    Slot indices match FILE_RGB so the output 'P' mode pixels are
+    already the 2 bpp values we need to pack into SC6/PCX bytes."""
+    pal_im = Image.new("P", (1, 1))
+    flat = []
+    for idx in sorted(FILE_RGB):
+        flat.extend(FILE_RGB[idx])
+    flat.extend([0] * (768 - len(flat)))
+    pal_im.putpalette(flat)
+    return pal_im
+
+
+_PALETTE_IM = _build_palette_image()
+
+
 def nearest_palette_index(rgb):
+    """Per-pixel slow path kept for the few callers that still want a
+    single-pixel answer; the main chunk path uses _quantize_whole which
+    is O(pixels) in C rather than Python."""
     r, g, b = rgb
     best_idx, best_d = 0, None
     for idx, (pr, pg, pb) in FILE_RGB.items():
@@ -122,6 +141,13 @@ def nearest_palette_index(rgb):
         if best_d is None or d < best_d:
             best_idx, best_d = idx, d
     return best_idx
+
+
+def _quantize_whole(im: Image.Image) -> Image.Image:
+    """Snap every pixel of `im` to the nearest of the four Screen-6
+    palette slots, returning a mode-'P' image whose byte values are the
+    2 bpp indices the packers write into each output byte."""
+    return im.convert("RGB").quantize(palette=_PALETTE_IM, dither=0)
 
 
 async def _fetch_png(url: str, png_path: Path, grayscale: bool):
@@ -181,40 +207,60 @@ async def _fetch_png(url: str, png_path: Path, grayscale: bool):
         return title, links
 
 
-def _resize_to_msx(im: Image.Image) -> Image.Image:
-    """Enforce 492 wide, then halve height to compensate for Screen 6's
-    ~1:2 pixel aspect. Use NEAREST for the vertical halve so we simply
-    drop every other row -- LANCZOS averages two adjacent source rows
-    into a mid-grey that the 4-slot palette then snaps into a dithered
-    speckle pattern, blurring text. Keeping only even rows preserves
-    the sharpest possible glyph edges at the cost of a tiny bit of
-    vertical aliasing on horizontal lines."""
+# Resample filter lookup for the vertical halve. BOX (2x2 block
+# average) is the default because:
+#   - NEAREST drops every other row, which makes 8-px glyphs lose
+#     half their vertical strokes and look broken.
+#   - LANCZOS / BICUBIC produce ringing halos on pure-black text
+#     that the 4-slot palette then snaps into dark-grey noise
+#     around the characters.
+#   - BOX averages pairs of source rows cleanly -- horizontal
+#     strokes stay horizontal, diagonals anti-alias to grey slots,
+#     and the output has no ringing so per-pixel nearest-palette
+#     quantization produces crisp, legible text.
+RESAMPLE = {
+    "nearest":  Image.NEAREST,
+    "box":      Image.BOX,
+    "bilinear": Image.BILINEAR,
+    "hamming":  Image.HAMMING,
+    "bicubic":  Image.BICUBIC,
+    "lanczos":  Image.LANCZOS,
+}
+
+
+def _resize_to_msx(im: Image.Image, resample: int) -> Image.Image:
+    """Enforce 492 wide (Chrome already captures at native MSX viewport
+    width), then halve height with the chosen filter to compensate for
+    Screen 6's ~1:2 pixel aspect. Horizontal resampling is avoided --
+    resizing twice throws away more detail than a single pass."""
     im = im.convert("RGB")
     if im.size[0] != MSX_VIEWPORT_W:
         new_h = max(1, round(im.size[1] * MSX_VIEWPORT_W / im.size[0]))
-        im = im.resize((MSX_VIEWPORT_W, new_h), Image.LANCZOS)
-    return im.resize((MSX_VIEWPORT_W, max(1, im.size[1] // 2)), Image.NEAREST)
+        im = im.resize((MSX_VIEWPORT_W, new_h), resample)
+    return im.resize((MSX_VIEWPORT_W, max(1, im.size[1] // 2)), resample)
 
 
 def _pack_sc6_chunk(im: Image.Image) -> bytes:
     """Pack an image of <=SC6_MAX_ROWS rows to 2 bpp SC6 bytes, each
-    row right-padded to 128 B with white."""
-    pixels = im.load()
-    w, h = im.size
+    row right-padded to 128 B with white. Quantization is done in bulk
+    by Pillow (C loop) so each byte's 4 pixels cost constant Python
+    overhead to assemble."""
+    q = _quantize_whole(im)                 # mode 'P', values 0..3
+    w, h = q.size
+    data = q.tobytes()                      # row-major, 1 byte per pixel
     img_bytes = (w + 3) // 4
     raw = bytearray()
     for y in range(h):
+        row_src = data[y * w : (y + 1) * w]
         row = bytearray()
         for bx in range(img_bytes):
-            packed = 0
-            for k in range(4):
-                x = bx * 4 + k
-                if x < w:
-                    idx = nearest_palette_index(pixels[x, y])
-                else:
-                    idx = 3
-                packed |= (idx & 3) << ((3 - k) * 2)
-            row.append(packed)
+            base = bx * 4
+            p0 = row_src[base]     if base     < w else 3
+            p1 = row_src[base + 1] if base + 1 < w else 3
+            p2 = row_src[base + 2] if base + 2 < w else 3
+            p3 = row_src[base + 3] if base + 3 < w else 3
+            row.append(((p0 & 3) << 6) | ((p1 & 3) << 4) |
+                       ((p2 & 3) << 2) |  (p3 & 3))
         if len(row) < SC6_ROW_BYTES:
             row.extend([PAD_BYTE] * (SC6_ROW_BYTES - len(row)))
         raw.extend(row)
@@ -332,7 +378,7 @@ async def _run(args) -> int:
     title, links = await _fetch_png(args.url, png_tmp, grayscale=not args.no_grayscale)
     print(f"Captured  title={title!r}  links={len(links)}")
 
-    im = _resize_to_msx(Image.open(png_tmp))
+    im = _resize_to_msx(Image.open(png_tmp), RESAMPLE[args.resample])
     total_w, total_h = im.size
     rows_per_page = min(args.rows_per_page, SC6_MAX_ROWS)
     num_pages = (total_h + rows_per_page - 1) // rows_per_page
@@ -428,6 +474,13 @@ def main() -> int:
                     help="Also write a {PREFIX}{N}.PNG next to each .sc6"
                          " chunk so a human can eyeball what the encoder"
                          " saw before 4-shade quantisation.")
+    ap.add_argument("--resample", choices=tuple(RESAMPLE), default="box",
+                    help="Vertical halving filter (default 'box'). 'box'"
+                         " averages each pair of source rows, producing"
+                         " legible 4-shade text without the speckle that"
+                         " LANCZOS creates around high-contrast edges."
+                         " 'nearest' is sharpest on diagonals but drops"
+                         " every other row so small type collapses.")
     ap.add_argument("--format", choices=("sc6", "pcx"), default="sc6",
                     help="Output format per chunk: 'sc6' (default, fixed"
                          " 128 B/row, no compression) or 'pcx' (2 bpp / 1"
