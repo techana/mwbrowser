@@ -8352,6 +8352,127 @@ PrepTitleDraw:
     add     hl, de
     xor     a
     ld      [hl], a
+
+    ; --- BiDi fix-up for Latin runs inside an RTL title ----------------
+    ; .ptLoop reversed the whole string so Arabic reads correctly under
+    ; the LTR GRPPRT renderer. That also reverses Latin/digit/space runs
+    ; ("BBC News" came out "sweN CBB"). Walk the source: for every
+    ; maximal non-Arabic run at logical positions [i..j-1], its reversed
+    ; image sits at TitleDrawBuf[N-j..N-i-1]. Swap that slice end-for-
+    ; end to restore the run's natural reading order while leaving the
+    ; Arabic slices alone.
+    xor     a
+    ld      [TitleI], a                 ; i = 0
+.ptfScanI:
+    ld      a, [TitleI]
+    ld      b, a
+    ld      a, [TitleN]
+    cp      b
+    jp      z, .ptDone                  ; i == N -> finished
+    ld      a, b                        ; A = i
+    call    .ptfProbeAt                 ; Z = non-Arabic at index A
+    jr      nz, .ptfSkipArabic          ; Arabic char at i -> advance one
+    ; Start of a non-Arabic run. Set TitleJ = i and extend until Arabic
+    ; or end-of-string.
+    ld      a, b
+    ld      [TitleJ], a
+.ptfExtendJ:
+    ld      a, [TitleN]
+    ld      c, a
+    ld      a, [TitleJ]
+    cp      c
+    jr      z, .ptfRunFound             ; reached end
+    call    .ptfProbeAt                 ; A still = TitleJ after the cp
+    jr      nz, .ptfRunFound            ; Arabic boundary
+    ld      a, [TitleJ]
+    inc     a
+    ld      [TitleJ], a
+    jr      .ptfExtendJ
+.ptfRunFound:
+    ; The run lives at source[TitleI .. TitleJ-1] (non-Arabic only).
+    ; In the main pass we wrote src[k] to buf[N-1-k], so the reversed
+    ; image of that slice sits at buf[N-TitleJ .. N-TitleI-1]. Swap the
+    ; slice end-for-end to put the Latin letters back in reading order.
+    ; Registers after the math:
+    ;   E = lo  = N - j
+    ;   D = hi  = N - i - 1
+    ld      a, [TitleN]
+    ld      b, a
+    ld      a, [TitleJ]
+    ld      c, a
+    ld      a, b
+    sub     c                           ; A = N - j
+    ld      e, a                        ; E = lo
+    ld      a, [TitleI]
+    ld      c, a
+    ld      a, b
+    sub     c
+    dec     a                           ; A = N - i - 1
+    ld      d, a                        ; D = hi
+    cp      e
+    jr      c, .ptfRunNext              ; hi <  lo -> empty slice
+    jr      z, .ptfRunNext              ; hi == lo -> single char, no swap
+    sub     e                           ; A = hi - lo
+    inc     a                           ; A = slice width
+    srl     a                           ; A = swap count
+    jr      z, .ptfRunNext
+    ld      [TitleConn], a              ; stash count; B is about to be clobbered
+    ; HL = &buf[lo]
+    ld      hl, TitleDrawBuf
+    ld      c, e
+    ld      b, 0
+    add     hl, bc
+    ; IX = HL + (hi - lo)  = &buf[hi]
+    push    hl
+    pop     ix
+    ld      a, d
+    sub     e
+    ld      c, a
+    add     ix, bc                      ; B is still 0 here
+    ld      a, [TitleConn]
+    ld      b, a                        ; B = swaps remaining
+.ptfSwap:
+    ld      a, [hl]
+    ld      c, [ix + 0]
+    ld      [hl], c
+    ld      [ix + 0], a
+    inc     hl
+    dec     ix
+    djnz    .ptfSwap
+.ptfRunNext:
+    ld      a, [TitleJ]
+    ld      [TitleI], a                 ; i = j, continue scan
+    jp      .ptfScanI
+.ptfSkipArabic:
+    ld      a, [TitleI]
+    inc     a
+    ld      [TitleI], a
+    jr      .ptfScanI
+
+.ptfProbeAt:
+    ; Input:  A = index into HtmlTitleBuf
+    ; Output: Z set  iff the byte is ASCII or a non-Arabic upper-ISO char.
+    ;         Destroys D,E,HL; preserves B,C,TitleI,TitleJ.
+    ld      e, a
+    ld      d, 0
+    ld      hl, HtmlTitleBuf
+    add     hl, de
+    ld      a, [hl]
+    cp      0x80
+    jr      c, .ptfProbeAscii           ; ASCII -> not Arabic
+    sub     0x80
+    ld      e, a
+    ld      d, 0
+    ld      hl, IsoJoin
+    add     hl, de
+    ld      a, [hl]
+    and     IS_ARABIC
+    ret                                 ; Z = not Arabic
+.ptfProbeAscii:
+    xor     a                           ; Z flag set
+    ret
+
+.ptDone:
     ld      hl, TitleDrawBuf
     ld      a, [TitleN]
     ret
@@ -8500,6 +8621,7 @@ TitleN:         db 0
 TitleCur:       db 0
 TitleCurFlags:  db 0
 TitleConn:      db 0
+TitleJ:         db 0                    ; end index of current non-Arabic run
 TitleDrawBuf:   ds TITLE_BUF_MAX + 1
 
 ; ============================================================================

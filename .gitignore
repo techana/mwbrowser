@@ -24,3 +24,5 @@
 !tools/*.sh
 !samples/PG.HTM
 !samples/PG[0-9][0-9].SC6
+!samples/PG[0-9][0-9].PCX
+!samples/PG[0-9][0-9].PNG

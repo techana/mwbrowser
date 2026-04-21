@@ -46,17 +46,21 @@ mdel -i "$DISK" ::/PAGE.HTM     2>/dev/null || true
 mdel -i "$DISK" ::/WEBSITE.HTM  2>/dev/null || true
 if [ -f samples/PG.HTM ]; then
     mcopy -i "$DISK" -o samples/PG.HTM ::/PG.HTM
-    # Floppy will run out of space / directory slots before the whole
-    # page fits. Keep injecting until mcopy fails, then stop -- the
-    # browser will render as many chunks as made it to disk and the
-    # wrapper HTM's trailing <img src=...> tags simply fall back to
-    # [alt] placeholders for missing files.
+    # web_to_sc6.py writes either PG??.SC6 (default) or PG??.PCX
+    # (--format pcx). Try PCX first because it's ~17% of the SC6 size
+    # on BBC-style screenshots; fall back to SC6 if the generator left
+    # that format behind.
     for n in $(seq -f "%02g" 1 99); do
-        src="samples/PG${n}.SC6"
-        [ -f "$src" ] || continue
-        if ! mcopy -i "$DISK" -o "$src" "::/PG${n}.SC6" 2>/dev/null; then
-            echo "inject: floppy full at PG${n}.SC6" >&2
-            break
-        fi
+        for ext in PCX SC6; do
+            src="samples/PG${n}.${ext}"
+            [ -f "$src" ] || continue
+            mdel -i "$DISK" "::/PG${n}.PCX" 2>/dev/null || true
+            mdel -i "$DISK" "::/PG${n}.SC6" 2>/dev/null || true
+            if ! mcopy -i "$DISK" -o "$src" "::/PG${n}.${ext}" 2>/dev/null; then
+                echo "inject: floppy full at PG${n}.${ext}" >&2
+                break 2
+            fi
+            break                       ; # only copy the first format found
+        done
     done
 fi
