@@ -7,8 +7,11 @@
 !src/
 !src/mwbrowser.asm
 !src/iso8859_6.inc
+!src/serial_poc.asm
 !dist/
 !dist/mwbro.com
+!dist/serpoc.com
+!tools/plug_rs232.tcl
 !samples/
 !samples/*.htm
 !samples/*.html
