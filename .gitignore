@@ -12,6 +12,7 @@
 !dist/mwbro.com
 !dist/serpoc.com
 !tools/plug_rs232.tcl
+!tools/NOTES_serial_bridge.md
 !samples/
 !samples/*.htm
 !samples/*.html
