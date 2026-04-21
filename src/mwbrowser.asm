@@ -158,6 +158,7 @@ Main:
     call    DrawScrollbar
     call    DrawTitleLabel
     call    PaintToolbar
+    call    SerialInit
 
 MainLoop:
     call    PollMouse
@@ -1842,6 +1843,20 @@ ResetFcbTail:
     ret
 
 LoadFile:
+    ; URL shape routes the load. "http://..." (or any "scheme:/" prefix)
+    ; goes to the serial bridge; anything else is opened as a local
+    ; file via MSX-DOS. IsRemoteSession stays set through the render so
+    ; <img src="pgNN.pcx"> loads also land on the UART.
+    ld      hl, UrlBuf
+    call    HasScheme
+    jr      nz, .lfLocal
+    ld      a, 1
+    ld      [IsRemoteSession], a
+    jp      RemoteLoadFile
+.lfLocal:
+    xor     a
+    ld      [IsRemoteSession], a
+
     call    ResetFcbTail
 
     ld      c, DOS_OPEN
@@ -4495,6 +4510,9 @@ MatchImgExt:
 ; ImgStreamOpen must have done the DOS_OPEN; ImgStreamClose must close.
 
 ImgStreamRefill:
+    ld      a, [IsRemoteSession]
+    or      a
+    jp      nz, RemoteImgRefill
     ; Nothing left to read?
     ld      a, [ImgBytesLeft]
     ld      b, a
@@ -4566,8 +4584,12 @@ ImgStreamRefill:
     scf
     ret
 
-; ImgStreamByte: returns A = next byte, CF=1 on EOF.
+; ImgStreamByte: returns A = next byte, CF=1 on EOF. Remote session
+; pulls from the UART instead of the FCB.
 ImgStreamByte:
+    ld      a, [IsRemoteSession]
+    or      a
+    jp      nz, RemoteImgByte
     ld      a, [ImgReadLen]
     or      a
     jr      z, .isbRefill
@@ -4584,8 +4606,12 @@ ImgStreamByte:
     ret     c
     jr      ImgStreamByte
 
-; ImgStreamClose: close the file that ImgStreamOpen opened.
+; ImgStreamClose: close the file that ImgStreamOpen opened. Remote
+; session just drains any leftover body bytes from the bridge.
 ImgStreamClose:
+    ld      a, [IsRemoteSession]
+    or      a
+    jp      nz, RemoteImgClose
     ld      c, DOS_CLOSE
     ld      de, Fcb
     jp      BDOS_ENTRY
@@ -4594,6 +4620,9 @@ ImgStreamClose:
 ; the FCB and opens. Returns CF=0 on success and leaves ImgReadLen=0 so
 ; the first ImgStreamByte call triggers an initial refill.
 ImgStreamOpenName:
+    ld      a, [IsRemoteSession]
+    or      a
+    jp      nz, RemoteImgOpen
     call    BuildFcbFromHL
     call    ResetFcbTail                ; record / position / random-read slots
     ld      c, DOS_OPEN
@@ -5726,15 +5755,10 @@ RemapByte:
     ld      a, [hl]
     ret
 
-; Built-in page served when a requested URL can't be opened. Kept in ROM
-; as raw HTML and copied into FileBuf + rendered via the normal path so
-; the titlebar, scrollbar, and back-history all behave exactly like on a
-; loaded document.
-NotFoundHtml:
-    db  "<title>404 Not Found</title>"
-    db  "<h2>Error 404 - Not Found</h2>"
-    db  "<p>The requested file could not be opened.</p>"
-NotFoundHtmlLen equ $ - NotFoundHtml
+; Minimal "file not found" message drawn directly into the content
+; area when a local file fails to load. URL loads that fail come back
+; from the serial bridge as ERR and are handled the same way.
+NotFoundMsg:    db "404 File Not Found", 0
 DataMsxPrefixLen equ $ - DataMsxPrefix
 
 ; RenderImageDataUri: HL points at the first base64 char of a
@@ -7433,29 +7457,23 @@ NavigateToCurrentUrl:
     or      a
     jr      z, .errSilent
 
-    ; Real typed URL that didn't resolve: swap in the built-in 404
-    ; document and render it via the normal pipeline. Do NOT push to
-    ; history -- the attempted URL stays only in UrlBuf and On404
-    ; marks the current view as synthetic, so Back re-loads the
-    ; previous real page and Forward skips the 404 entirely.
+    ; Typed URL that didn't resolve: paint a minimal one-line "404
+    ; File Not Found" message directly into the content area. On404
+    ; keeps Back pointing at the last real page so forward/back work.
     ld      a, 1
     ld      [On404], a
-
-    ld      hl, NotFoundHtml
-    ld      de, FileBuf
-    ld      bc, NotFoundHtmlLen
-    ldir
-    ld      hl, NotFoundHtmlLen
-    ld      [FileLen], hl
-    xor     a
-    ld      [PlainTextMode], a
-
     ld      hl, 0
     ld      [ScrollLine], hl
-    call    ClearContentArea
-    call    PrintFileContent
-    ld      hl, [HtmlLineCount]
     ld      [TotalLines], hl
+    ld      [HtmlLineCount], hl
+    call    ClearContentArea
+    ld      a, COL_BLACK
+    ld      l, COL_WHITE
+    call    SetTextColours
+    ld      de, 8
+    ld      c, CONTENT_Y0 + 8
+    ld      hl, NotFoundMsg
+    call    DrawString
     call    ComputeThumb
     call    DrawScrollbar
     xor     a
@@ -8785,6 +8803,321 @@ TitleShapeOne:
     add     hl, de
     ld      a, [hl]
     ret
+
+; ============================================================================
+; Serial web-bridge transport  (Generic MSX RS-232C, Intel 8251)
+;
+; Protocol (see tools/web_bridge.py for the other end):
+;   MSX -> bridge: GET <target>\r\n
+;   bridge -> MSX: OK <KIND> <len>\r\n<body>   KIND = "HTM" | "PCX"
+;                  ERR <code>\r\n
+; ============================================================================
+
+UART_DATA       equ 0x80
+UART_STATUS     equ 0x81
+
+; SerialInit: program the 8251 for 8-N-1 async with RxEN + TxEN. The
+; cartridge ROM leaves the receiver disabled so raw I/O code hangs on
+; the first status poll. Sequence: three dummy writes to flush any
+; pending mode-byte expectation, software reset, mode, command.
+SerialInit:
+    xor     a
+    out     [UART_STATUS], a
+    out     [UART_STATUS], a
+    out     [UART_STATUS], a
+    ld      a, 0x40                     ; IR = internal reset
+    out     [UART_STATUS], a
+    ld      a, 0x4E                     ; mode: 8 data, no parity, 1 stop, /16
+    out     [UART_STATUS], a
+    ld      a, 0x37                     ; cmd: RTS | ER | RxEN | DTR | TxEN
+    out     [UART_STATUS], a
+    ret
+
+SerialWrite:    ; send byte in A; blocks until TxRDY.
+    push    af
+.sw:
+    in      a, [UART_STATUS]
+    rrca
+    jr      nc, .sw                     ; bit 0 = TxRDY
+    pop     af
+    out     [UART_DATA], a
+    ret
+
+SerialRead:     ; block for RxRDY then return byte in A.
+    in      a, [UART_STATUS]
+    and     2                           ; bit 1 = RxRDY
+    jr      z, SerialRead
+    in      a, [UART_DATA]
+    ret
+
+SerialWriteZ:   ; HL -> NUL-terminated string.
+    ld      a, [hl]
+    or      a
+    ret     z
+    push    hl
+    call    SerialWrite
+    pop     hl
+    inc     hl
+    jr      SerialWriteZ
+
+; HasScheme: HL -> NUL string. Z set when ":/" occurs. Rough "http://"
+; detector; any URL shape works, bare filenames don't.
+HasScheme:
+    push    hl
+.hs:
+    ld      a, [hl]
+    or      a
+    jr      z, .hsNo
+    inc     hl
+    cp      ':'
+    jr      nz, .hs
+    ld      a, [hl]
+    cp      '/'
+    jr      nz, .hs
+    pop     hl
+    xor     a
+    ret
+.hsNo:
+    pop     hl
+    or      1
+    ret
+
+; RemoteGet: HL -> NUL target. Sends "GET <target>\r\n", reads status
+; line, leaves body bytes queued on the UART. Outputs:
+;   SerialKind: 1=HTM, 2=PCX, 0=ERR
+;   SerialLen:  16-bit body length
+; Returns CF=1 on ERR / parse failure.
+RgGet:          db "GET ", 0
+RemoteGet:
+    push    hl
+    ld      hl, RgGet
+    call    SerialWriteZ
+    pop     hl
+    call    SerialWriteZ
+    ld      a, 0x0D
+    call    SerialWrite
+    ld      a, 0x0A
+    call    SerialWrite
+    ; Drain status line into SerialBuf (16 B); parser reads fresh bytes
+    ; from the UART directly rather than buffering so we save code.
+    call    SerialRead                  ; 'O' or 'E'
+    cp      'E'
+    jr      z, .rgDrainErr
+    cp      'O'
+    jr      nz, .rgFail
+    call    SerialRead                  ; 'K'
+    cp      'K'
+    jr      nz, .rgFail
+    call    SerialRead                  ; ' '
+    call    SerialRead                  ; 'H' or 'P'
+    ld      b, 1
+    cp      'H'
+    jr      z, .rgKind
+    ld      b, 2
+    cp      'P'
+    jr      nz, .rgFail
+.rgKind:
+    ld      a, b
+    ld      [SerialKind], a
+    call    SerialRead                  ; second kind char (T/C)
+    call    SerialRead                  ; third kind char (M/X)
+    call    SerialRead                  ; space
+    ld      de, 0
+.rgDigit:
+    call    SerialRead
+    cp      0x0D
+    jr      z, .rgEol
+    sub     '0'
+    cp      10
+    jr      nc, .rgFail
+    ld      c, a
+    ex      de, hl
+    ld      d, h
+    ld      e, l
+    add     hl, hl
+    add     hl, hl
+    add     hl, de
+    add     hl, hl
+    ex      de, hl                      ; DE *= 10
+    ld      a, e
+    add     a, c
+    ld      e, a
+    ld      a, d
+    adc     a, 0
+    ld      d, a
+    jr      .rgDigit
+.rgEol:
+    call    SerialRead                  ; consume LF
+    ld      [SerialLen], de
+    and     a
+    ret
+.rgDrainErr:
+    call    SerialRead                  ; consume remainder of "ERR ..." line
+    cp      0x0A
+    jr      nz, .rgDrainErr
+.rgFail:
+    xor     a
+    ld      [SerialKind], a
+    scf
+    ret
+
+; RemoteLoadFile: URL sits in UrlBuf. Expects OK HTM; streams body into
+; FileBuf (capped at FILE_BUF_SIZE, extra bytes drained so the next
+; request finds a clean stream). Returns A=0 on success.
+RemoteLoadFile:
+    ld      hl, UrlBuf
+    call    RemoteGet
+    jr      c, .rlfFail
+    ld      a, [SerialKind]
+    cp      1
+    jr      nz, .rlfFail
+    ; FileLen = min(SerialLen, FILE_BUF_SIZE)
+    ld      hl, [SerialLen]
+    ld      de, FILE_BUF_SIZE
+    push    hl
+    and     a
+    sbc     hl, de
+    pop     hl
+    jr      c, .rlfOk
+    ld      hl, FILE_BUF_SIZE
+.rlfOk:
+    ld      [FileLen], hl
+    ld      de, FileBuf
+    ld      bc, [FileLen]
+.rlfBody:
+    ld      a, b
+    or      c
+    jr      z, .rlfTail
+    push    bc
+    push    de
+    call    SerialRead
+    pop     de
+    pop     bc
+    ld      [de], a
+    inc     de
+    dec     bc
+    jr      .rlfBody
+.rlfTail:
+    ld      hl, [SerialLen]
+    ld      de, [FileLen]
+    and     a
+    sbc     hl, de
+    ld      b, h
+    ld      c, l
+.rlfDrain:
+    ld      a, b
+    or      c
+    jr      z, .rlfDone
+    push    bc
+    call    SerialRead
+    pop     bc
+    dec     bc
+    jr      .rlfDrain
+.rlfDone:
+    xor     a
+    ret
+.rlfFail:
+    ld      a, 1
+    ret
+
+; RemoteImgOpen: filename is in ImgNameBuf. Expects OK PCX; saves body
+; length into ImgBytesLeft so ImgStreamByte can pull from the UART.
+RemoteImgOpen:
+    ld      hl, ImgNameBuf
+    call    RemoteGet
+    ret     c
+    ld      a, [SerialKind]
+    cp      2
+    jr      nz, .rioFail
+    ld      hl, [SerialLen]
+    ld      [ImgBytesLeft], hl
+    ld      hl, 0
+    ld      [ImgBytesLeft + 2], hl
+    xor     a
+    ld      [ImgReadLen], a
+    ret                                 ; CF already 0 from RemoteGet
+.rioFail:
+    scf
+    ret
+
+; RemoteImgByte: pull next body byte from the UART and decrement
+; ImgBytesLeft. CF=1 on EOF.
+RemoteImgByte:
+    ld      hl, [ImgBytesLeft]
+    ld      a, h
+    or      l
+    jr      nz, .ribGo
+    ld      hl, [ImgBytesLeft + 2]
+    ld      a, h
+    or      l
+    scf
+    ret     z
+.ribGo:
+    call    SerialRead
+    push    af
+    ld      hl, [ImgBytesLeft]
+    ld      a, h
+    or      l
+    jr      nz, .ribLo
+    ld      hl, [ImgBytesLeft + 2]
+    dec     hl
+    ld      [ImgBytesLeft + 2], hl
+    ld      hl, 0xFFFF
+.ribLo:
+    dec     hl
+    ld      [ImgBytesLeft], hl
+    pop     af
+    and     a
+    ret
+
+; RemoteImgRefill: pull up to 128 bytes from the UART into ImgBuf. The
+; per-byte dec of ImgBytesLeft happens inside RemoteImgByte so no
+; parallel 32-bit bookkeeping is needed here.
+RemoteImgRefill:
+    ld      hl, ImgBuf
+    ld      [ImgReadPtr], hl
+    ld      b, 128
+    ld      c, 0                        ; C = bytes successfully read
+.rirL:
+    push    bc
+    push    hl
+    call    RemoteImgByte
+    pop     hl
+    pop     bc
+    jr      c, .rirEof
+    ld      [hl], a
+    inc     hl
+    inc     c
+    djnz    .rirL
+.rirEof:
+    ld      a, c
+    ld      [ImgReadLen], a
+    or      a
+    scf
+    ret     z                           ; 0 bytes == EOF
+    and     a
+    ret
+
+; RemoteImgClose: drain any leftover body bytes so the next GET finds
+; a clean socket. Cheap -- happens rarely since images typically
+; stream to completion.
+RemoteImgClose:
+.ricL:
+    ld      hl, [ImgBytesLeft]
+    ld      a, h
+    or      l
+    jr      nz, .ricP
+    ld      hl, [ImgBytesLeft + 2]
+    ld      a, h
+    or      l
+    ret     z
+.ricP:
+    call    RemoteImgByte
+    jr      .ricL
+
+SerialKind:     db 0                    ; 0=ERR, 1=HTM, 2=PCX
+SerialLen:      dw 0
+IsRemoteSession: db 0                   ; 1 during a bridge-served render
 
 TitleI:         db 0
 TitleN:         db 0
