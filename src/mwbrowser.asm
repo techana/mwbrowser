@@ -8843,10 +8843,21 @@ SerialWrite:    ; send byte in A; blocks until TxRDY.
     out     [UART_DATA], a
     ret
 
-SerialRead:     ; block for RxRDY then return byte in A.
+SerialRead:     ; block for RxRDY then return byte in A. 8251 latches
+                ; Overrun / Parity / Framing errors (status bits 3..5)
+                ; and stops asserting RxRDY until the command register
+                ; is re-written with bit 4 (Error Reset) set. Handle
+                ; that path or the receiver stalls mid-burst.
+.srPoll:
     in      a, [UART_STATUS]
-    and     2                           ; bit 1 = RxRDY
-    jr      z, SerialRead
+    bit     1, a                        ; RxRDY
+    jr      nz, .srGot
+    and     0x38                        ; PE | OE | FE
+    jr      z, .srPoll
+    ld      a, 0x37                     ; RTS | ErrRst | RxEN | DTR | TxEN
+    out     [UART_STATUS], a
+    jr      .srPoll
+.srGot:
     in      a, [UART_DATA]
     ret
 
