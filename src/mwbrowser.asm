@@ -877,7 +877,7 @@ DrawScrollbar:
 CountTotalLines:
     ld      hl, FileBuf
     ld      bc, [FileLen]
-    ld      d, 0
+    ld      de, 0                       ; DE = 16-bit line count
 .loop:
     ld      a, b
     or      c
@@ -887,13 +887,15 @@ CountTotalLines:
     dec     bc
     cp      0x0A
     jr      nz, .loop
-    inc     d
-    jr      nz, .loop                   ; saturate at 255
-    dec     d
+    ; Saturate the count at 0xFFFF so a gigantic text file can't wrap.
+    inc     de
+    ld      a, d
+    or      e
+    jr      nz, .loop
+    dec     de
     jr      .loop
 .done:
-    ld      a, d
-    ld      [TotalLines], a
+    ld      [TotalLines], de
     ret
 
 ; ComputeThumb: set ThumbTop + ThumbHeight from ScrollLine and TotalLines.
@@ -901,14 +903,41 @@ CountTotalLines:
 ;   Else:
 ;     ThumbHeight = max(4, TEXT_MAX_LINES * TRACK_H / TotalLines)
 ;     ThumbTop    = THUMB_Y0 + (ScrollLine * TRACK_H / TotalLines)
+;
+; TotalLines / ScrollLine are 16-bit; DivU16By8 only takes an 8-bit
+; divisor. Compute a common right-shift that collapses TotalLines into
+; 8 bits and apply it to ScrollLine too -- precision loss inside a
+; ~200 px scroll track is at worst one pixel, which is imperceptible.
 ComputeThumb:
-    ld      a, [TotalLines]
+    ld      hl, [TotalLines]
+    ld      a, h
+    or      a
+    jr      nz, .ctLong
+    ld      a, l
     cp      TEXT_MAX_LINES + 1
-    jr      c, .fullThumb
+    jp      c, .fullThumb
+.ctLong:
+    ; Scale TotalLines / ScrollLine so TotalLines fits in 8 bits.
+    ld      de, [ScrollLine]
+    ld      b, 0                        ; B = shift count (debug only)
+.ctScale:
+    ld      a, h
+    or      a
+    jr      z, .ctScaled
+    srl     h
+    rr      l
+    srl     d
+    rr      e
+    inc     b
+    jr      .ctScale
+.ctScaled:
+    ld      c, l                        ; C = divisor (scaled TotalLines, <=255)
+    ld      a, c
+    or      a
+    jp      z, .fullThumb               ; degenerate: zero total -> full thumb
 
-    ld      c, a                        ; C = divisor (TotalLines)
-
-    ; ThumbHeight = TEXT_MAX_LINES * TRACK_H / TotalLines
+    push    de                          ; save scaled ScrollLine
+    ; ThumbHeight = TEXT_MAX_LINES * TRACK_H / (scaled TotalLines)
     ld      hl, TEXT_MAX_LINES * (THUMB_Y1 - THUMB_Y0 + 1)
     call    DivU16By8
     ld      a, l
@@ -917,19 +946,22 @@ ComputeThumb:
     ld      a, 4
 .h_ok:
     ld      [ThumbHeight], a
-
-    ; ThumbTop = THUMB_Y0 + (ScrollLine * TRACK_H / TotalLines)
-    ld      a, [ScrollLine]
-    or      a
+    pop     de                          ; DE = scaled ScrollLine
+    ld      a, d
+    or      e
     jr      z, .topAtZero
-    ld      b, a                        ; B = ScrollLine (multiplier)
+    ; ThumbTop = THUMB_Y0 + (scaled ScrollLine * TRACK_H / scaled TotalLines)
+    ; Multiplier may exceed 255 post-scale, so use a 16-bit add loop.
+    push    bc
     ld      hl, 0
-    ld      de, THUMB_Y1 - THUMB_Y0 + 1
+    ld      bc, THUMB_Y1 - THUMB_Y0 + 1
 .mulLoop:
-    add     hl, de
-    djnz    .mulLoop
-    ld      a, [TotalLines]
-    ld      c, a
+    add     hl, bc
+    dec     de
+    ld      a, d
+    or      e
+    jr      nz, .mulLoop
+    pop     bc
     call    DivU16By8
     ld      a, l
     add     a, THUMB_Y0
@@ -1913,7 +1945,8 @@ PrintFileContent:
     xor     a
     ld      [HtmlTitleLen], a
     ld      [HtmlTitleSeen], a
-    ld      [HtmlLineCount], a
+    ld      [HtmlLineCount], a          ; 16-bit -- low byte
+    ld      [HtmlLineCount + 1], a      ; high byte
     ld      [HtmlInAnchor], a
     ld      [LinkCount], a
     ld      [LineLen], a                ; drop any cells left from previous render
@@ -1958,8 +1991,8 @@ PrintFileContent:
     ld      [HtmlFgDepth], a
     ld      a, COL_BLACK
     ld      [HtmlFg], a
-    ld      a, [ScrollLine]             ; skip this many rendered lines
-    ld      [HtmlLineSkip], a
+    ld      hl, [ScrollLine]            ; skip this many rendered lines
+    ld      [HtmlLineSkip], hl
     ld      a, 1
     ld      [HtmlScaleY], a
 
@@ -1993,10 +2026,14 @@ PrintFileContent:
     ; TotalLines straight after this routine returns, and a short
     ; count would clamp PageDown before the user reaches the end.
     ld      a, [ScrollLine]
-    or      a
+    ld      b, a
+    ld      a, [ScrollLine + 1]
+    or      b
     jr      z, .loopNotFull
     ld      a, [HtmlLineSkip]
-    or      a
+    ld      b, a
+    ld      a, [HtmlLineSkip + 1]
+    or      b
     jr      nz, .loopNotFull
     ld      a, [TextY]
     cp      CONTENT_Y1 + 1
@@ -2541,7 +2578,9 @@ EmitRaw:
     ; append and the TextY bottom check, but keep TextX advancing so the
     ; next wrap fires at the same X as it would during a full render.
     ld      a, [HtmlLineSkip]
-    or      a
+    ld      b, a
+    ld      a, [HtmlLineSkip + 1]
+    or      b
     jr      z, .doAppend
     ld      hl, [TextX]
     ld      de, 8
@@ -3420,13 +3459,14 @@ EmitNewline:
     ; pixels -- otherwise a page of scaled headings would scroll more than
     ; one visual page worth of content.
     ld      a, [HtmlScaleY]
-    ld      b, a                        ; B = rows to add (1 or 2)
-    ld      a, [HtmlLineCount]
-    add     a, b
+    ld      c, a                        ; C = rows to add (1 or 2)
+    ld      b, 0
+    ld      hl, [HtmlLineCount]
+    add     hl, bc
     jr      nc, .lcStore
-    ld      a, 0xFF                     ; saturate
+    ld      hl, 0xFFFF                  ; saturate at 65535
 .lcStore:
-    ld      [HtmlLineCount], a
+    ld      [HtmlLineCount], hl
 
     ; Start of new line: reset TextX to the current indent.
     ld      a, [HtmlIndent]
@@ -3435,15 +3475,18 @@ EmitNewline:
     ld      [TextX + 1], a
 
     ; If we're still skipping, decrement by the line's row count and stay
-    ; pinned at the top-of-canvas.
-    ld      a, [HtmlLineSkip]
-    or      a
+    ; pinned at the top-of-canvas. BC is still (0, rows-to-add) from the
+    ; HtmlLineCount increment above.
+    ld      hl, [HtmlLineSkip]
+    ld      a, h
+    or      l
     jr      z, .advance
-    sub     b
+    and     a
+    sbc     hl, bc
     jr      nc, .skStore
-    xor     a                           ; don't underflow past 0
+    ld      hl, 0                       ; don't underflow past 0
 .skStore:
-    ld      [HtmlLineSkip], a
+    ld      [HtmlLineSkip], hl
     jr      .flagsDone
 
 .advance:
@@ -3499,16 +3542,19 @@ EmitHalfLineGap:
     ; Bookkeeping: treat this gap as one 8-px row for scroll math. When
     ; a scrolled pass is still skipping, burn a skip count instead of
     ; advancing TextY (pin-to-top behaviour matches EmitNewline).
-    ld      a, [HtmlLineCount]
-    inc     a
+    ld      hl, [HtmlLineCount]
+    inc     hl
+    ld      a, h
+    or      l
     jr      z, .hgSat                   ; saturate at 0xFF
-    ld      [HtmlLineCount], a
+    ld      [HtmlLineCount], hl
 .hgSat:
-    ld      a, [HtmlLineSkip]
-    or      a
+    ld      hl, [HtmlLineSkip]
+    ld      a, h
+    or      l
     jr      z, .hgAdvance
-    dec     a
-    ld      [HtmlLineSkip], a
+    dec     hl
+    ld      [HtmlLineSkip], hl
     ret
 .hgAdvance:
     ld      a, [TextY]
@@ -4621,17 +4667,20 @@ RenderSc6File:
     srl     a
     srl     a
     srl     a                           ; A = ceil(pixel_rows / 8) = image lines
-    ld      b, a                        ; B = image lines (preserved below)
+    ld      c, a                        ; C = image lines (<= 255, fits a byte)
 
     ; Case A: scrolled render, image entirely above the fold. Deduct
-    ; B lines from HtmlLineSkip and close -- no pixel bytes streamed.
-    ld      a, [HtmlLineSkip]
-    or      a
+    ; C lines from HtmlLineSkip and close -- no pixel bytes streamed.
+    ld      hl, [HtmlLineSkip]
+    ld      a, h
+    or      l
     jr      z, .rsfCheckBelow           ; not scrolling -> try case B
-    cp      b
+    ld      e, c
+    ld      d, 0
+    and     a
+    sbc     hl, de                      ; HL = HtmlLineSkip - image_lines
     jr      c, .rsfHeader               ; straddles fold -> slow path
-    sub     b
-    ld      [HtmlLineSkip], a
+    ld      [HtmlLineSkip], hl
     jr      .rsfFastAccount
 
     ; Case B: initial / already-scrolled render, image entirely below
@@ -4647,12 +4696,14 @@ RenderSc6File:
 .rsfFastAccount:
     ; Charge the height against the total line count so the scroll
     ; thumb still reflects this image even when no pixels were drawn.
-    ld      a, [HtmlLineCount]
-    add     a, b
+    ld      hl, [HtmlLineCount]
+    ld      e, c                        ; C still holds image lines
+    ld      d, 0
+    add     hl, de
     jr      nc, .rsfFastLC
-    ld      a, 0xFF
+    ld      hl, 0xFFFF
 .rsfFastLC:
-    ld      [HtmlLineCount], a
+    ld      [HtmlLineCount], hl
     call    ImgStreamClose
     scf                                 ; image "handled"
     ret
@@ -4694,7 +4745,9 @@ RenderSc6File:
     cp      SC6_MAX_ROWS
     jr      nc, .rsfDone
     ld      a, [HtmlLineSkip]
-    or      a
+    ld      b, a
+    ld      a, [HtmlLineSkip + 1]
+    or      b
     jr      nz, .rsfConsume
     ld      a, [ImgCurY]
     cp      CONTENT_Y1 + 1
@@ -4757,7 +4810,9 @@ RenderSc6File:
     ; overdraw the image. If we hit the viewport bottom, push TextY
     ; past the content area to suppress further drawing on this page.
     ld      a, [HtmlLineSkip]
-    or      a
+    ld      b, a
+    ld      a, [HtmlLineSkip + 1]
+    or      b
     jr      nz, .rsfNoTy
     ld      a, [ImgCurY]
     cp      CONTENT_Y1 + 1
@@ -4859,6 +4914,72 @@ RenderPcxFile:
     call    ArFlush
     call    LineFlush
 
+    ; Fast path -- same idea as RenderSc6File. We already have the full
+    ; 128-byte header in ImgBuf, so the image height comes from
+    ; Ymax - Ymin + 1 (offsets 6/10 = low bytes, 7/11 = high bytes).
+    ; If the image is entirely above the scrolled fold, or entirely
+    ; below the visible bottom on the initial pass, we skip the RLE
+    ; decoder, bump the scroll bookkeeping, and close the file. A
+    ; 23 KB PCX chunk that's off-screen then costs exactly one
+    ; OPEN + one 128 B READ instead of a full drain.
+    ld      a, [ImgBuf + 10]            ; Ymax low
+    ld      l, a
+    ld      a, [ImgBuf + 11]            ; Ymax high
+    ld      h, a
+    ld      a, [ImgBuf + 6]             ; Ymin low
+    ld      e, a
+    ld      a, [ImgBuf + 7]             ; Ymin high
+    ld      d, a
+    and     a
+    sbc     hl, de                      ; HL = Ymax - Ymin (pixel rows - 1)
+    jr      c, .pcxNoFast               ; negative/wrap -> bail
+    inc     hl                          ; HL = pixel rows
+    ld      a, h
+    or      a
+    jr      nz, .pcxNoFast              ; > 255 rows -> slow path
+    ld      a, l
+    or      a
+    jr      z, .pcxNoFast               ; 0 rows -> slow path
+    add     a, 7
+    jr      c, .pcxNoFast
+    srl     a
+    srl     a
+    srl     a                           ; A = ceil(rows / 8) = image lines
+    ld      c, a                        ; C = image lines
+
+    ; Case A: scrolled render, image entirely above the fold.
+    ld      hl, [HtmlLineSkip]
+    ld      a, h
+    or      l
+    jr      z, .pcxCheckBelow
+    ld      e, c
+    ld      d, 0
+    and     a
+    sbc     hl, de                      ; HL = HtmlLineSkip - image_lines
+    jr      c, .pcxNoFast               ; straddles fold
+    ld      [HtmlLineSkip], hl
+    jr      .pcxFastAccount
+
+.pcxCheckBelow:
+    ; Case B: initial pass, viewport already full below TextY.
+    ld      a, [TextY]
+    cp      CONTENT_Y1 + 1
+    jr      c, .pcxNoFast
+
+.pcxFastAccount:
+    ld      hl, [HtmlLineCount]
+    ld      e, c
+    ld      d, 0
+    add     hl, de
+    jr      nc, .pcxFastLC
+    ld      hl, 0xFFFF
+.pcxFastLC:
+    ld      [HtmlLineCount], hl
+    call    ImgStreamClose
+    scf
+    ret
+
+.pcxNoFast:
     ; Mark the header buffer consumed -- the next ImgStreamByte call
     ; will refill from byte 128 (first RLE byte).
     xor     a
@@ -4882,7 +5003,9 @@ RenderPcxFile:
     cp      SC6_MAX_ROWS
     jp      nc, .pcxDone
     ld      a, [HtmlLineSkip]
-    or      a
+    ld      b, a
+    ld      a, [HtmlLineSkip + 1]
+    or      b
     jr      nz, .pcxConsume
     ld      a, [ImgCurY]
     cp      CONTENT_Y1 + 1
@@ -4961,7 +5084,9 @@ RenderPcxFile:
 .pcxDone:
     call    ImgStreamClose
     ld      a, [HtmlLineSkip]
-    or      a
+    ld      b, a
+    ld      a, [HtmlLineSkip + 1]
+    or      b
     jr      nz, .pcxNoTy
     ld      a, [ImgCurY]
     cp      CONTENT_Y1 + 1
@@ -5239,7 +5364,9 @@ RenderBmpFile:
     jp      z, .bmpDone
 
     ld      a, [HtmlLineSkip]
-    or      a
+    ld      b, a
+    ld      a, [HtmlLineSkip + 1]
+    or      b
     jp      nz, .bmpSkipRow
     ld      a, [BmpCurY]
     cp      CONTENT_Y0
@@ -5351,7 +5478,9 @@ RenderBmpFile:
     ; Park TextY below the drawn image (height advance was done upfront
     ; into BmpCurY, but TextY still points at the top -- move it down).
     ld      a, [HtmlLineSkip]
-    or      a
+    ld      b, a
+    ld      a, [HtmlLineSkip + 1]
+    or      b
     jr      nz, .bmpNoTy
     ld      a, [TextY]
     ld      b, a
@@ -5661,7 +5790,9 @@ RenderImageDataUri:
     ;       so drawing would wrap through VDP's linear write-address
     ;       and reappear on the titlebar / toolbar.
     ld      a, [HtmlLineSkip]
-    or      a
+    ld      b, a
+    ld      a, [HtmlLineSkip + 1]
+    or      b
     jr      nz, .consumeRow
     ld      a, [ImgCurY]
     cp      CONTENT_Y1 + 1
@@ -5716,7 +5847,9 @@ RenderImageDataUri:
     ; the image's last rows -- the user sees the image filling the
     ; viewport edge and the remainder continues on page 2.
     ld      a, [HtmlLineSkip]
-    or      a
+    ld      b, a
+    ld      a, [HtmlLineSkip + 1]
+    or      b
     jr      nz, .noTextYAdv
     ld      a, [ImgCurY]
     cp      CONTENT_Y1 + 1
@@ -6150,7 +6283,9 @@ TagTableTag:
     call    FlushPendingCell
     call    CountTableRow
     ld      a, [HtmlLineSkip]
-    or      a
+    ld      b, a
+    ld      a, [HtmlLineSkip + 1]
+    or      b
     jr      nz, .ttSkipAdv
     ; Close the last row's bottom rule.
     ld      a, [HtmlRowTopY]
@@ -6208,16 +6343,19 @@ DrawTableVerticals:
 ; a tag-driven EmitNewline would. Preserves all other state.
 CountTableRow:
     push    af
-    ld      a, [HtmlLineCount]
-    inc     a
+    ld      hl, [HtmlLineCount]
+    inc     hl
+    ld      a, h
+    or      l
     jr      z, .ctSat                   ; saturate at 0xFF
-    ld      [HtmlLineCount], a
+    ld      [HtmlLineCount], hl
 .ctSat:
-    ld      a, [HtmlLineSkip]
-    or      a
+    ld      hl, [HtmlLineSkip]
+    ld      a, h
+    or      l
     jr      z, .ctDone
-    dec     a
-    ld      [HtmlLineSkip], a
+    dec     hl
+    ld      [HtmlLineSkip], hl
 .ctDone:
     pop     af
     ret
@@ -6245,7 +6383,9 @@ TagTr:
 
     ; Close previous row: advance TextY past its text, draw rule, gap.
     ld      a, [HtmlLineSkip]
-    or      a
+    ld      b, a
+    ld      a, [HtmlLineSkip + 1]
+    or      b
     jr      nz, .trNoAdvance
     ld      a, [HtmlRowTopY]
     add     a, TEXT_LINE_H
@@ -6444,7 +6584,9 @@ TableColEndX:
 ; while LineSkip is non-zero.
 DrawTableRuleHere:
     ld      a, [HtmlLineSkip]
-    or      a
+    ld      b, a
+    ld      a, [HtmlLineSkip + 1]
+    or      b
     ret     nz
     ld      a, [TextY]
     cp      CONTENT_Y1 - TEXT_LINE_H + 2
@@ -6461,7 +6603,9 @@ DrawTableRuleHere:
 DrawCellDividerAt_HL:
     push    hl
     ld      a, [HtmlLineSkip]
-    or      a
+    ld      b, a
+    ld      a, [HtmlLineSkip + 1]
+    or      b
     pop     hl
     ret     nz
     srl     h
@@ -6579,7 +6723,9 @@ TagHr:
     ; while LineSkip is non-zero. Drawing then would leave a stray rule at
     ; the top of the page after any scroll.
     ld      a, [HtmlLineSkip]
-    or      a
+    ld      b, a
+    ld      a, [HtmlLineSkip + 1]
+    or      b
     jp      nz, EmitBlankLine
     ld      a, [TextY]
     cp      CONTENT_Y1 - TEXT_LINE_H + 2
@@ -7267,12 +7413,12 @@ NavigateToCurrentUrl:
     call    HistoryPush
     call    HistoryUpdateFlags
 
-    xor     a
-    ld      [ScrollLine], a
+    ld      hl, 0
+    ld      [ScrollLine], hl
     call    ClearContentArea
     call    PrintFileContent
-    ld      a, [HtmlLineCount]
-    ld      [TotalLines], a
+    ld      hl, [HtmlLineCount]
+    ld      [TotalLines], hl
     call    ComputeThumb
     call    DrawScrollbar
     xor     a
@@ -7304,12 +7450,12 @@ NavigateToCurrentUrl:
     xor     a
     ld      [PlainTextMode], a
 
-    xor     a
-    ld      [ScrollLine], a
+    ld      hl, 0
+    ld      [ScrollLine], hl
     call    ClearContentArea
     call    PrintFileContent
-    ld      a, [HtmlLineCount]
-    ld      [TotalLines], a
+    ld      hl, [HtmlLineCount]
+    ld      [TotalLines], hl
     call    ComputeThumb
     call    DrawScrollbar
     xor     a
@@ -7382,12 +7528,12 @@ ReloadCurrent:
     call    BuildFcbFromUrl
     call    DetectPlainText
     call    LoadFile
-    xor     a
-    ld      [ScrollLine], a
+    ld      hl, 0
+    ld      [ScrollLine], hl
     call    ClearContentArea
     call    PrintFileContent
-    ld      a, [HtmlLineCount]
-    ld      [TotalLines], a
+    ld      hl, [HtmlLineCount]
+    ld      [TotalLines], hl
     call    ComputeThumb
     call    DrawScrollbar
     xor     a
@@ -7530,63 +7676,85 @@ RefreshAfterScroll:
 
 ; ScrollUp: decrement ScrollLine if > 0, refresh.
 ScrollUp:
-    ld      a, [ScrollLine]
-    or      a
+    ld      hl, [ScrollLine]
+    ld      a, h
+    or      l
     ret     z
-    dec     a
-    ld      [ScrollLine], a
+    dec     hl
+    ld      [ScrollLine], hl
     jp      RefreshAfterScroll
 
 ; PageUp: subtract PAGE_SCROLL_STEP from ScrollLine (clamping to 0), refresh.
 PageUp:
-    ld      a, [ScrollLine]
-    sub     PAGE_SCROLL_STEP
-    jr      nc, .store
-    xor     a
-.store:
-    ld      [ScrollLine], a
+    ld      hl, [ScrollLine]
+    ld      de, PAGE_SCROLL_STEP
+    and     a
+    sbc     hl, de
+    jr      nc, .puStore
+    ld      hl, 0
+.puStore:
+    ld      [ScrollLine], hl
     jp      RefreshAfterScroll
 
-; PageDown: advance ScrollLine by TEXT_MAX_LINES - 2 (so two lines of
-; overlap carry over) and clamp the target so the viewport stays full
-; -- the final page pins to max(0, TotalLines - TEXT_MAX_LINES) instead
-; of TotalLines-1, which would leave the content area mostly blank.
+; PageDown: advance ScrollLine by TEXT_MAX_LINES - 1 and clamp the target
+; so the viewport stays full -- the final page pins to
+; max(0, TotalLines - TEXT_MAX_LINES) instead of TotalLines-1, which
+; would leave the content area mostly blank.
 PAGE_SCROLL_STEP equ TEXT_MAX_LINES - 1
 
 PageDown:
-    ld      a, [TotalLines]
-    or      a
-    ret     z
-    cp      TEXT_MAX_LINES + 1
-    ret     c                           ; all content fits: nothing to scroll
-    sub     TEXT_MAX_LINES              ; A = last reachable top-line
-    ld      d, a                        ; D = max ScrollLine
-    ld      a, [ScrollLine]
-    cp      d
-    ret     nc                          ; already at (or past) last page: no-op
-    add     a, PAGE_SCROLL_STEP
-    cp      d
-    jr      c, .pdStore
-    ld      a, d                        ; clamp to max so viewport stays full
+    ld      hl, [TotalLines]
+    ld      a, h
+    or      l
+    ret     z                           ; zero-line doc -> nothing to scroll
+    ld      de, TEXT_MAX_LINES + 1
+    and     a
+    sbc     hl, de
+    ret     c                           ; TotalLines <= TEXT_MAX_LINES
+    ; HL = TotalLines - TEXT_MAX_LINES - 1; add 1 back so HL = max ScrollLine.
+    inc     hl
+    ex      de, hl                      ; DE = max ScrollLine
+    ld      hl, [ScrollLine]
+    and     a
+    sbc     hl, de
+    jr      nc, .pdAtMax                ; already at (or past) the bottom
+    ; ScrollLine + PAGE_SCROLL_STEP
+    ld      hl, [ScrollLine]
+    ld      bc, PAGE_SCROLL_STEP
+    add     hl, bc
+    and     a
+    push    hl
+    sbc     hl, de
+    pop     hl
+    jr      c, .pdStore                 ; sum < max -> use it
+    ex      de, hl                      ; clamp: HL = max ScrollLine
 .pdStore:
-    ld      [ScrollLine], a
+    ld      [ScrollLine], hl
     jp      RefreshAfterScroll
+.pdAtMax:
+    ret
 
 ; ScrollDown: if there's more content below the viewport, bump ScrollLine
 ; and refresh. Clamps at max(0, TotalLines - TEXT_MAX_LINES) so the
 ; viewport never bottoms out with a mostly-blank canvas.
 ScrollDown:
-    ld      a, [TotalLines]
-    cp      TEXT_MAX_LINES + 1
+    ld      hl, [TotalLines]
+    ld      de, TEXT_MAX_LINES + 1
+    and     a
+    sbc     hl, de
     ret     c                           ; everything fits
-    sub     TEXT_MAX_LINES              ; A = max ScrollLine
-    ld      d, a
-    ld      a, [ScrollLine]
-    cp      d
-    ret     nc                          ; already at max
-    inc     a
-    ld      [ScrollLine], a
+    inc     hl                          ; HL = max ScrollLine
+    ex      de, hl                      ; DE = max ScrollLine
+    ld      hl, [ScrollLine]
+    and     a
+    sbc     hl, de
+    jr      nc, .sdAtMax
+    ld      hl, [ScrollLine]
+    inc     hl
+    ld      [ScrollLine], hl
     jp      RefreshAfterScroll
+.sdAtMax:
+    ret
 
 ; ============================================================================
 ; Step 2.5: Mouse (direct PSG reads on joyporta) + click dispatch
@@ -8026,8 +8194,10 @@ ClickContent:
     ; and PageDown would otherwise push the view past the end leaving only the
     ; last line visible.
     ld      b, a                        ; B = click Y
-    ld      a, [TotalLines]
-    cp      TEXT_MAX_LINES + 1
+    ld      hl, [TotalLines]
+    ld      de, TEXT_MAX_LINES + 1
+    and     a
+    sbc     hl, de
     ret     c                           ; <= TEXT_MAX_LINES -> no-op
     ld      a, [ThumbTop]
     cp      b
@@ -8712,8 +8882,8 @@ EntrySP:        dw 0                    ; SP at Main entry (restored on Shutdown
 ; File I/O and navigation state.
 Fcb:            ds 37                   ; MSX-DOS 1 FCB (36 bytes + 1 pad)
 FileLen:        dw 0                    ; bytes actually loaded (clamped to buffer)
-ScrollLine:     db 0                    ; first visible line (0 = top of file)
-TotalLines:     db 0                    ; LF count in loaded file (for thumb math)
+ScrollLine:     dw 0                    ; first visible line (0 = top of file)
+TotalLines:     dw 0                    ; rendered line count for thumb math
 ThumbTop:       db THUMB_Y0             ; current thumb top y (set by ComputeThumb)
 ThumbHeight:    db THUMB_Y1 - THUMB_Y0 + 1
 AboutOpen:      db 0                    ; 1 while the About popup is on screen
@@ -8738,8 +8908,8 @@ HtmlLineEmpty:  db 1                    ; 1 = cursor at start of a line (trim le
 HtmlIsClose:    db 0                    ; scratch: 1 inside a closing tag
 HtmlTitleSeen:  db 0                    ; 1 once <title>..</title> has resolved
 HtmlTitleLen:   db 0                    ; bytes stored in HtmlTitleBuf
-HtmlLineSkip:   db 0                    ; rendered lines still to skip (scroll)
-HtmlLineCount:  db 0                    ; total rendered lines (for thumb math)
+HtmlLineSkip:   dw 0                    ; rendered lines still to skip (scroll)
+HtmlLineCount:  dw 0                    ; total rendered lines (for thumb math)
 HtmlScaleY:     db 1                    ; 1 = normal glyph height, 2 = H1/H2
 HtmlInAnchor:   db 0                    ; 1 while inside an <a>..</a>
 HtmlFocusLink:  db 0xFF                 ; index of Tab-focused link (0xFF = none)
