@@ -8816,6 +8816,24 @@ TitleShapeOne:
 UART_DATA       equ 0x80
 UART_STATUS     equ 0x81
 
+; Screen-6's R1 value (0xE2 = Screen 6 defaults incl. VBLANK enabled).
+; SerialMaskVblank clears bit 5 around a remote load so the VBLANK ISR
+; can't eat CPU time mid-receive; SerialUnmaskVblank restores it.
+SerialR1Value  equ 0xE2
+
+SerialMaskVblank:
+    ld      a, SerialR1Value & 0xDF      ; VBLANK off
+    jr      SerialWriteR1
+SerialUnmaskVblank:
+    ld      a, SerialR1Value
+SerialWriteR1:
+    di
+    out     [VDP_CMD], a
+    ld      a, 0x80 | 1
+    out     [VDP_CMD], a
+    ei
+    ret
+
 ; SerialInit: program the 8251 for 8-N-1 async with RxEN + TxEN. The
 ; cartridge ROM leaves the receiver disabled so raw I/O code hangs on
 ; the first status poll. Sequence: three dummy writes to flush any
@@ -8843,11 +8861,12 @@ SerialWrite:    ; send byte in A; blocks until TxRDY.
     out     [UART_DATA], a
     ret
 
-SerialRead:     ; block for RxRDY then return byte in A. 8251 latches
-                ; Overrun / Parity / Framing errors (status bits 3..5)
-                ; and stops asserting RxRDY until the command register
-                ; is re-written with bit 4 (Error Reset) set. Handle
-                ; that path or the receiver stalls mid-burst.
+SerialRead:     ; block for RxRDY then return byte in A. Overrun /
+                ; Parity / Framing errors in status bits 3..5 latch
+                ; until the command register is rewritten with ER=1;
+                ; handle that inline. VBLANK gets masked at the VDP
+                ; level by SerialMaskVblank around the outer call so
+                ; the receiver can't be starved mid-burst.
 .srPoll:
     in      a, [UART_STATUS]
     bit     1, a                        ; RxRDY
@@ -8976,6 +8995,7 @@ RemoteGet:
 ; FileBuf (capped at FILE_BUF_SIZE, extra bytes drained so the next
 ; request finds a clean stream). Returns A=0 on success.
 RemoteLoadFile:
+    call    SerialMaskVblank             ; VDP R1 bit 5 off = no VBLANK
     ld      hl, UrlBuf
     call    RemoteGet
     jr      c, .rlfFail
@@ -9025,18 +9045,21 @@ RemoteLoadFile:
     dec     bc
     jr      .rlfDrain
 .rlfDone:
+    call    SerialUnmaskVblank
     xor     a
     ret
 .rlfFail:
+    call    SerialUnmaskVblank
     ld      a, 1
     ret
 
 ; RemoteImgOpen: filename is in ImgNameBuf. Expects OK PCX; saves body
 ; length into ImgBytesLeft so ImgStreamByte can pull from the UART.
 RemoteImgOpen:
+    call    SerialMaskVblank
     ld      hl, ImgNameBuf
     call    RemoteGet
-    ret     c
+    jr      c, .rioFail
     ld      a, [SerialKind]
     cp      2
     jr      nz, .rioFail
@@ -9046,8 +9069,10 @@ RemoteImgOpen:
     ld      [ImgBytesLeft + 2], hl
     xor     a
     ld      [ImgReadLen], a
-    ret                                 ; CF already 0 from RemoteGet
+    and     a                           ; CF=0
+    ret                                 ; mask stays on across body drain
 .rioFail:
+    call    SerialUnmaskVblank
     scf
     ret
 
@@ -9121,7 +9146,8 @@ RemoteImgClose:
     ld      hl, [ImgBytesLeft + 2]
     ld      a, h
     or      l
-    ret     z
+    jr      nz, .ricP
+    jp      SerialUnmaskVblank          ; tail-call returns for us
 .ricP:
     call    RemoteImgByte
     jr      .ricL
