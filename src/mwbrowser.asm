@@ -4990,10 +4990,12 @@ RenderPcxFile:
     jr      .pcxFastAccount
 
 .pcxCheckBelow:
-    ; Case B: initial pass, viewport already full below TextY.
-    ld      a, [TextY]
-    cp      CONTENT_Y1 + 1
-    jr      c, .pcxNoFast
+    ; Case B skipped: the below-fold fast-path occasionally reads
+    ; stale ImgBuf bytes over the serial transport and feeds a huge
+    ; image_lines into HtmlLineCount; the scroll thumb then overflows
+    ; the track and paints black into titlebar VRAM. Slow-drain
+    ; below-fold images via the normal PCX loop instead.
+    jr      .pcxNoFast
 
 .pcxFastAccount:
     ld      hl, [HtmlLineCount]
@@ -8816,9 +8818,12 @@ TitleShapeOne:
 UART_DATA       equ 0x80
 UART_STATUS     equ 0x81
 
-; Screen-6 R1 is 0xE0 after CHGMOD (display enable + VBLANK enable,
-; mode bits for 512x212). Masking bit 5 disables just the VBLANK
-; interrupt without touching any other mode bit.
+; Screen-6 R1 default: display + VBLANK enabled. BIOS shadow
+; (RG1SAV @ 0xF3E0) after CHGMOD 6 reads 0x60; the top bit in our
+; write turns out to be don't-care on the V9938's R1, and the value
+; 0xE0 is what renders cleanly on example.com. See
+; tools/NOTES_serial_bridge.md for the frogfind chrome-glitch
+; writeup.
 SerialR1Value   equ 0xE0
 
 SerialMaskVblank:
@@ -8995,7 +9000,7 @@ RemoteGet:
 ; FileBuf (capped at FILE_BUF_SIZE, extra bytes drained so the next
 ; request finds a clean stream). Returns A=0 on success.
 RemoteLoadFile:
-    call    SerialMaskVblank             ; VDP R1 bit 5 off = no VBLANK
+    call    SerialMaskVblank
     ld      hl, UrlBuf
     call    RemoteGet
     jr      c, .rlfFail
@@ -9147,7 +9152,7 @@ RemoteImgClose:
     ld      a, h
     or      l
     jr      nz, .ricP
-    jp      SerialUnmaskVblank          ; tail-call returns for us
+    jp      SerialUnmaskVblank
 .ricP:
     call    RemoteImgByte
     jr      .ricL
