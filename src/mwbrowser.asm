@@ -2092,7 +2092,11 @@ PrintFileContent:
     ; the buffer would leak into the top of the next rendered page.
     call    ArFlush
     call    LineFlush
-    ret
+    ; Safety: if a Remote* path exited with VBLANK still masked (the
+    ; PCX drain sometimes leaves ImgBytesLeft non-zero which stalls
+    ; SerialUnmaskVblank), force VBLANK back on so the keyboard ISR
+    ; fires again and the main loop sees keypresses.
+    jp      SerialUnmaskVblank
 
 .tag:
     ; Flush any pending Arabic word BEFORE the tag handler runs so that
