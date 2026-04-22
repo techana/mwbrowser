@@ -2088,14 +2088,11 @@ PrintFileContent:
 
 .eof:
     ; Drain any trailing Arabic word and pending line cells so content
-    ; that doesn't end with a block tag still reaches VRAM. Without this
-    ; the buffer would leak into the top of the next rendered page.
+    ; that doesn't end with a block tag still reaches VRAM. Always
+    ; unmask VBLANK so the keyboard ISR is back even if some Remote*
+    ; path exited with the mask on.
     call    ArFlush
     call    LineFlush
-    ; Safety: if a Remote* path exited with VBLANK still masked (the
-    ; PCX drain sometimes leaves ImgBytesLeft non-zero which stalls
-    ; SerialUnmaskVblank), force VBLANK back on so the keyboard ISR
-    ; fires again and the main loop sees keypresses.
     jp      SerialUnmaskVblank
 
 .tag:
@@ -5118,10 +5115,6 @@ RenderPcxFile:
 
 .pcxDone:
     call    ImgStreamClose
-    call    SerialUnmaskVblank           ; belt-and-braces: restore VBLANK even
-                                         ; if ImgStreamClose was the FCB path
-                                         ; (ImgStreamClose only unmasks on the
-                                         ; remote branch via the drain tail-call)
     ld      a, [HtmlLineSkip]
     ld      b, a
     ld      a, [HtmlLineSkip + 1]
@@ -9062,9 +9055,8 @@ RemoteLoadFile:
     xor     a
     ret
 .rlfFail:
-    call    SerialUnmaskVblank
     ld      a, 1
-    ret
+    ret                                  ; caller's 404 handler paints via DrawString
 
 ; RemoteImgOpen: filename is in ImgNameBuf. Expects OK PCX; saves body
 ; length into ImgBytesLeft so ImgStreamByte can pull from the UART.
@@ -9159,8 +9151,7 @@ RemoteImgClose:
     ld      hl, [ImgBytesLeft + 2]
     ld      a, h
     or      l
-    jr      nz, .ricP
-    jp      SerialUnmaskVblank
+    jp      z, SerialUnmaskVblank        ; EOF -> tail-call restores VBLANK
 .ricP:
     call    RemoteImgByte
     jr      .ricL
