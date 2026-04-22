@@ -5118,6 +5118,10 @@ RenderPcxFile:
 
 .pcxDone:
     call    ImgStreamClose
+    call    SerialUnmaskVblank           ; belt-and-braces: restore VBLANK even
+                                         ; if ImgStreamClose was the FCB path
+                                         ; (ImgStreamClose only unmasks on the
+                                         ; remote branch via the drain tail-call)
     ld      a, [HtmlLineSkip]
     ld      b, a
     ld      a, [HtmlLineSkip + 1]
