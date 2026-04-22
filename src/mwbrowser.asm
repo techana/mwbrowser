@@ -21,8 +21,8 @@
 ; Back/Forward are disabled and swallow Enter/Space.
 ; ============================================================================
 
-    .MSXDOS
-    .bios
+    DEVICE NOSLOT64K                ; SjASMPlus: full 64 KB address space
+    ORG 0x0100                      ; MSX-DOS 1 .COM entry point
 
 ; ---- DOS / VDP / BIOS equates ----
 BDOS_ENTRY     equ 0x0005
@@ -37,6 +37,23 @@ DOS_SETDMA     equ 0x1A        ; set disk transfer address
 VDP_DATA       equ 0x98
 VDP_CMD        equ 0x99
 VDP_PAL        equ 0x9A
+
+; ---- MSX BIOS entry points (invoked via CALLBIOS macro below) ----
+; Matches the byte sequence asMSX's ".CALLBIOS NAME" emitted:
+;   ld iy, (EXPTBL)  ; 4 B
+;   ld ix, NAME      ; 4 B
+;   call CALSLT      ; 3 B   (CALSLT pages the BIOS slot into page 0)
+BIOS_CHGMOD    equ 0x005F      ; change screen mode (A = mode)
+BIOS_RDSLT     equ 0x000C      ; read byte from a slot
+BIOS_GRPPRT    equ 0x008D      ; print char on graphics screen
+CALSLT         equ 0x001C      ; inter-slot call target
+EXPTBL         equ 0xFCC0      ; main BIOS slot table (read by CALSLT)
+
+    MACRO CALLBIOS entry
+        ld      iy, (EXPTBL)
+        ld      ix, entry
+        call    CALSLT
+    ENDM
 
 ; Work-area pointer CGPNT (0xF91F) is a 3-byte record that tells us where the
 ; live MSX font lives: byte 0 = slot specifier, bytes 1..2 = address in that
@@ -143,7 +160,7 @@ BTN_FOCUSED    equ 0x02
 Main:
     ld      [EntrySP], sp               ; remember caller's SP for clean Esc exit
     ld      a, 6
-    .CALLBIOS CHGMOD                    ; Screen 6
+    CALLBIOS BIOS_CHGMOD                    ; Screen 6
 
     call    ExtractFont                 ; pull BIOS font into FontBuf (once)
     call    SetPalette
@@ -383,28 +400,28 @@ Shutdown:
 
     di
     xor     a
-    out     [VDP_CMD], a                ; palette index 0
+    out     (VDP_CMD), a                ; palette index 0
     ld      a, 0x80 | 16
-    out     [VDP_CMD], a
+    out     (VDP_CMD), a
     ld      hl, Screen0Palette
     ld      b, 32
 .palLoop:
     ld      a, [hl]
-    out     [VDP_PAL], a
+    out     (VDP_PAL), a
     inc     hl
     djnz    .palLoop
     ei
 
     xor     a
-    .CALLBIOS CHGMOD
+    CALLBIOS BIOS_CHGMOD
 
     ; Explicitly restore R7 = 0xF4 (fg=15 white, bg=4 dark blue). CHGMOD
     ; does not reset this register, so the Screen 6 value lingers.
     di
     ld      a, 0xF4
-    out     [VDP_CMD], a
+    out     (VDP_CMD), a
     ld      a, 0x80 | 7
-    out     [VDP_CMD], a
+    out     (VDP_CMD), a
     ei
 
     ld      c, DOS_TERM
@@ -538,16 +555,16 @@ ComputeFocusState:
 SetPalette:
     di
     xor     a
-    out     [VDP_CMD], a                ; index 0
+    out     (VDP_CMD), a                ; index 0
     ld      a, 0x80 | 16
-    out     [VDP_CMD], a
+    out     (VDP_CMD), a
     ei
 
     ld      hl, PaletteData
     ld      b, 8
 .loop:
     ld      a, [hl]
-    out     [VDP_PAL], a
+    out     (VDP_PAL), a
     inc     hl
     djnz    .loop
     ret
@@ -562,9 +579,9 @@ PaletteData:
 SetBorder:
     di
     ld      a, COL_LGRAY
-    out     [VDP_CMD], a
+    out     (VDP_CMD), a
     ld      a, 0x80 | 7
-    out     [VDP_CMD], a
+    out     (VDP_CMD), a
     ei
     ret
 
@@ -576,11 +593,11 @@ SetBorder:
 VdpSetWriteAddr:
     di
     ld      a, l
-    out     [VDP_CMD], a
+    out     (VDP_CMD), a
     ld      a, h
     and     0x3F
     or      0x40                        ; write mode
-    out     [VDP_CMD], a
+    out     (VDP_CMD), a
     ei
     ret
 
@@ -588,10 +605,10 @@ VdpSetWriteAddr:
 VdpSetReadAddr:
     di
     ld      a, l
-    out     [VDP_CMD], a
+    out     (VDP_CMD), a
     ld      a, h
     and     0x3F                        ; mode = 00 (read)
-    out     [VDP_CMD], a
+    out     (VDP_CMD), a
     ei
     ret
 
@@ -601,7 +618,7 @@ VdpFill:
     call    VdpSetWriteAddr
     pop     af
 .loop:
-    out     [VDP_DATA], a
+    out     (VDP_DATA), a
     dec     de
     ld      b, a
     ld      a, d
@@ -681,7 +698,7 @@ FillRect:
     ld      a, [PackedColour]
     ld      b, d
 .rowLoop:
-    out     [VDP_DATA], a
+    out     (VDP_DATA), a
     djnz    .rowLoop
     pop     de
     pop     bc
@@ -787,9 +804,9 @@ VdpSetR14Zero:
     xor     a
 VdpSetR14:
     di
-    out     [VDP_CMD], a
+    out     (VDP_CMD), a
     ld      a, 0x80 | 14
-    out     [VDP_CMD], a
+    out     (VDP_CMD), a
     ei
     ret
 
@@ -861,7 +878,7 @@ DrawScrollbar:
     ld      b, SCROLL_X0 / 4 + 3
     call    SetVramWritePos
     ld      a, 0xFD
-    out     [VDP_DATA], a
+    out     (VDP_DATA), a
     pop     de
     pop     bc
     inc     c
@@ -1216,7 +1233,7 @@ SetVramByte:
     ld      [SVB_TMP], a
     call    SetVramWritePos
     ld      a, [SVB_TMP]
-    out     [VDP_DATA], a
+    out     (VDP_DATA), a
     ret
 
 RC_LB: db 0
@@ -1275,7 +1292,7 @@ DrawBitmapReverse:
     ld      b, d
 .rowLoop:
     ld      a, [hl]
-    out     [VDP_DATA], a
+    out     (VDP_DATA), a
     inc     hl
     djnz    .rowLoop
     pop     hl                          ; restore current row start
@@ -1308,7 +1325,7 @@ DrawBitmap:
     ld      b, d                        ; bytes/row counter
 .rowLoop:
     ld      a, [hl]
-    out     [VDP_DATA], a
+    out     (VDP_DATA), a
     inc     hl
     djnz    .rowLoop
     pop     de
@@ -1410,7 +1427,7 @@ DrawString:
     or      a
     ret     z
     push    hl
-    .CALLBIOS GRPPRT
+    CALLBIOS BIOS_GRPPRT
     pop     hl
     inc     hl
     jr      .loop
@@ -1476,7 +1493,7 @@ ExtractFont:
     push    de
     push    hl
     ld      a, [FastCgSlot]
-    .CALLBIOS RDSLT
+    CALLBIOS BIOS_RDSLT
     pop     hl
     pop     de
     ld      [de], a
@@ -1631,7 +1648,7 @@ EmitStyledByte:
     ld      e, a
     add     hl, de
     ld      a, [hl]
-    out     [VDP_DATA], a
+    out     (VDP_DATA), a
     pop     af
     and     0x0F
     ld      hl, [CurrentFontLUT]
@@ -1639,7 +1656,7 @@ EmitStyledByte:
     ld      e, a
     add     hl, de
     ld      a, [hl]
-    out     [VDP_DATA], a
+    out     (VDP_DATA), a
     ret
 
 ; ============================================================================
@@ -1712,7 +1729,7 @@ BuildFcbFromHL:
 .skipExtra:
     ld      a, [hl]
     or      a
-    jr      z, .fillExt
+    jr      z, FillExtField
     cp      '.'
     jr      z, .afterDot
     inc     hl
@@ -1727,9 +1744,9 @@ BuildFcbFromHL:
     jr      nz, .pn
     ld      a, [hl]
     or      a
-    jr      z, .fillExt
+    jr      z, FillExtField
     cp      '.'
-    jr      nz, .fillExt
+    jr      nz, FillExtField
 
 .afterDot:
     inc     hl
@@ -1807,7 +1824,7 @@ DetectPlainText:
     ld      [PlainTextMode], a
     ret
 
-.fillExt:
+FillExtField:
     ld      a, ' '
     ld      b, 3
 .fe:
@@ -4798,7 +4815,7 @@ RenderSc6File:
     pop     bc
     jp      c, .rsfDone
     call    RemapByte
-    out     [VDP_DATA], a
+    out     (VDP_DATA), a
     djnz    .rsfDraw
 
     ld      b, SC6_WIDTH_B - SC6_VISIBLE_B
@@ -5068,7 +5085,7 @@ RenderPcxFile:
     pop     bc
     jp      c, .pcxDone
     call    RemapByte
-    out     [VDP_DATA], a
+    out     (VDP_DATA), a
     djnz    .pcxDraw
     ld      a, c
     or      a
@@ -5448,7 +5465,7 @@ RenderBmpFile:
     cp      4
     jr      nz, .bmpPxPack
     ld      a, [BmpPackByte]
-    out     [VDP_DATA], a
+    out     (VDP_DATA), a
     xor     a
     ld      [BmpPackByte], a
 .bmpPxPack:
@@ -5465,7 +5482,7 @@ RenderBmpFile:
     or      a
     jr      z, .bmpRowPadSkip
     ld      a, [BmpPackByte]
-    out     [VDP_DATA], a
+    out     (VDP_DATA), a
 .bmpRowPadSkip:
     ld      a, [BmpPad]
     or      a
@@ -5837,7 +5854,7 @@ RenderImageDataUri:
     push    bc
     call    B64DecodeByte
     pop     bc
-    out     [VDP_DATA], a
+    out     (VDP_DATA), a
     djnz    .colRender
     ld      a, [ImgCurY]
     inc     a
@@ -7828,15 +7845,15 @@ GetMouseAxis:
 GetMouseNibble:
     di
     ld      a, 15
-    out     [PSG_ADDR_PORT], a
+    out     (PSG_ADDR_PORT), a
     ld      a, d
-    out     [PSG_DATA_WR], a
+    out     (PSG_DATA_WR), a
     ld      b, 10
 .wait:
     djnz    .wait
     ld      a, 14
-    out     [PSG_ADDR_PORT], a
-    in      a, [PSG_DATA_RD]
+    out     (PSG_ADDR_PORT), a
+    in      a, (PSG_DATA_RD)
     ei
     ret
 
@@ -7870,10 +7887,10 @@ EraseCursor:
     pop     de
     ld      hl, [CursorBgPtr]
     ld      a, [hl]
-    out     [VDP_DATA], a
+    out     (VDP_DATA), a
     inc     hl
     ld      a, [hl]
-    out     [VDP_DATA], a
+    out     (VDP_DATA), a
     inc     hl
     ld      [CursorBgPtr], hl
 
@@ -7921,11 +7938,11 @@ DrawCursor:
     push    de
     call    SetVramReadPos
     pop     de
-    in      a, [VDP_DATA]
+    in      a, (VDP_DATA)
     ld      hl, [CursorBgPtr]
     ld      [hl], a
     inc     hl
-    in      a, [VDP_DATA]
+    in      a, (VDP_DATA)
     ld      [hl], a
     inc     hl
     ld      [CursorBgPtr], hl
@@ -7953,10 +7970,10 @@ DrawCursor:
 
     ld      a, [ix + 0]
     or      [iy + 0]
-    out     [VDP_DATA], a
+    out     (VDP_DATA), a
     ld      a, [ix + 1]
     or      [iy + 1]
-    out     [VDP_DATA], a
+    out     (VDP_DATA), a
 
     inc     ix
     inc     ix
@@ -8383,7 +8400,7 @@ DrawLogoBitmap:
     ld      b, LOGO_W_BYTES
 .dlbCol:
     ld      a, [hl]
-    out     [VDP_DATA], a
+    out     (VDP_DATA), a
     inc     hl
     djnz    .dlbCol
     ld      a, [LogoCurY]
@@ -8835,9 +8852,9 @@ SerialUnmaskVblank:
     ld      a, SerialR1Value
 SerialWriteR1:
     di
-    out     [VDP_CMD], a
+    out     (VDP_CMD), a
     ld      a, 0x80 | 1
-    out     [VDP_CMD], a
+    out     (VDP_CMD), a
     ei
     ret
 
@@ -8847,25 +8864,25 @@ SerialWriteR1:
 ; pending mode-byte expectation, software reset, mode, command.
 SerialInit:
     xor     a
-    out     [UART_STATUS], a
-    out     [UART_STATUS], a
-    out     [UART_STATUS], a
+    out     (UART_STATUS), a
+    out     (UART_STATUS), a
+    out     (UART_STATUS), a
     ld      a, 0x40                     ; IR = internal reset
-    out     [UART_STATUS], a
+    out     (UART_STATUS), a
     ld      a, 0x4E                     ; mode: 8 data, no parity, 1 stop, /16
-    out     [UART_STATUS], a
+    out     (UART_STATUS), a
     ld      a, 0x37                     ; cmd: RTS | ER | RxEN | DTR | TxEN
-    out     [UART_STATUS], a
+    out     (UART_STATUS), a
     ret
 
 SerialWrite:    ; send byte in A; blocks until TxRDY.
     push    af
 .sw:
-    in      a, [UART_STATUS]
+    in      a, (UART_STATUS)
     rrca
     jr      nc, .sw                     ; bit 0 = TxRDY
     pop     af
-    out     [UART_DATA], a
+    out     (UART_DATA), a
     ret
 
 SerialRead:     ; block for RxRDY then return byte in A. Overrun /
@@ -8875,16 +8892,16 @@ SerialRead:     ; block for RxRDY then return byte in A. Overrun /
                 ; level by SerialMaskVblank around the outer call so
                 ; the receiver can't be starved mid-burst.
 .srPoll:
-    in      a, [UART_STATUS]
+    in      a, (UART_STATUS)
     bit     1, a                        ; RxRDY
     jr      nz, .srGot
     and     0x38                        ; PE | OE | FE
     jr      z, .srPoll
     ld      a, 0x37                     ; RTS | ErrRst | RxEN | DTR | TxEN
-    out     [UART_STATUS], a
+    out     (UART_STATUS), a
     jr      .srPoll
 .srGot:
-    in      a, [UART_DATA]
+    in      a, (UART_DATA)
     ret
 
 SerialWriteZ:   ; HL -> NUL-terminated string.
@@ -9390,6 +9407,10 @@ HtmlNextDir:    db 0xFF                 ; scratch: dir= parsed on current tag
 ; tools/gen_iso8859_6.py. Kept as a separate include so the table stays
 ; machine-derived and can be regenerated without touching this source.
     include "iso8859_6.inc"
+
+; Emit the .COM to disk. FileBuf (just below) is the next free byte after
+; the last emitted code/data; we save exactly that many bytes.
+    SAVEBIN "dist/mwbro.com", 0x0100, $-0x0100
 
 ; FileBuf and FontBuf both live in free TPA memory past the .COM image.
 ; Declaring them as pure label equates avoids emitting any bytes, so the disk
