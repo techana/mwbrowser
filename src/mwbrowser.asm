@@ -2593,10 +2593,11 @@ EmitRaw:
     ; Skip phase: wrap has already been handled above; skip the buffer
     ; append and the TextY bottom check, but keep TextX advancing so the
     ; next wrap fires at the same X as it would during a full render.
+    ; B still holds the glyph -- scratch through C for the 16-bit OR.
     ld      a, [HtmlLineSkip]
-    ld      b, a
+    ld      c, a
     ld      a, [HtmlLineSkip + 1]
-    or      b
+    or      c
     jr      z, .doAppend
     ld      hl, [TextX]
     ld      de, 8
