@@ -3903,6 +3903,15 @@ LineDrawCells:
 .alHave:
     ld      [LineStartCol], a
 
+    ; Form widgets captured their X at tag-parse time as the raw TextX
+    ; (which tracks HtmlIndent + cellIdx*8 assuming a left-aligned
+    ; line). For centered / right-aligned paragraphs the actual first-
+    ; cell pixel is LineStartCol*4, so the captured X is off by
+    ; (LineStartCol*4 - HtmlIndent). Push that delta into every slot
+    ; whose Y matches the line we're about to paint so click hit-test
+    ; + in-place typing paint land at the visible pixels.
+    call    FormApplyLineOffset
+
     ; For RTL paragraphs the BiDi reorder drew cells in reverse visual
     ; order, but any link rects captured at parse time still hold the
     ; logical X where TextX was pointing. Mirror them now so mouse
@@ -9729,6 +9738,84 @@ FormTypeIsFocusable:
     ld      a, 1
     or      a                                ; focusable: NZ
     ret
+
+; FormApplyLineOffset: for every slot whose FormScreenY matches the
+; current TextY, add (LineStartCol*4 - HtmlIndent) pixels to
+; FormScreenX. Called from LineDrawCells right after LineStartCol is
+; finalised so centered / right-aligned paragraphs still produce
+; correct hit-test + in-place-paint coordinates. Stores delta/line-Y
+; in scratch vars up-front so the inner loop can stay simple.
+FormApplyLineOffset:
+    push    bc
+    push    de
+    push    hl
+    ; delta = LineStartCol*4 - HtmlIndent; line-Y = TextY.
+    ld      a, [LineStartCol]
+    add     a, a
+    add     a, a
+    ld      b, a
+    ld      a, [HtmlIndent]
+    neg
+    add     a, b                         ; A = delta (signed 8-bit)
+    ld      [FaloDelta], a
+    or      a
+    jr      z, .faloDone                 ; no offset needed
+    ld      a, [TextY]
+    ld      [FaloLineY], a
+    ld      a, [FormCount]
+    or      a
+    jr      z, .faloDone
+    ld      [FaloCount], a
+    xor     a
+    ld      [FaloSlot], a
+.faloLoop:
+    ld      a, [FaloSlot]
+    ld      e, a
+    ld      d, 0
+    ld      hl, FormScreenY
+    add     hl, de
+    ld      a, [hl]
+    ld      hl, FaloLineY
+    cp      [hl]
+    jr      nz, .faloAdvance
+    ; Match: FormScreenX[slot] += FaloDelta (sign-extended).
+    ld      a, [FaloSlot]
+    ld      e, a
+    ld      d, 0
+    ld      hl, FormScreenX
+    add     hl, de
+    add     hl, de                       ; HL -> FormScreenX[slot] low byte
+    ld      a, [FaloDelta]
+    ld      b, a
+    ld      c, 0                          ; C = sign extension byte
+    bit     7, b
+    jr      z, .faloSignOk
+    dec     c                             ; C = 0xFF (negative)
+.faloSignOk:
+    ld      a, [hl]
+    add     a, b
+    ld      [hl], a
+    inc     hl
+    ld      a, [hl]
+    adc     a, c
+    ld      [hl], a
+.faloAdvance:
+    ld      a, [FaloSlot]
+    inc     a
+    ld      [FaloSlot], a
+    ld      hl, FaloCount
+    cp      [hl]
+    jr      c, .faloLoop
+.faloDone:
+    pop     hl
+    pop     de
+    pop     bc
+    ret
+
+FaloDelta:      db 0
+FaloLineY:      db 0
+FaloSlot:       db 0
+FaloCount:      db 0
 
 ; FormOptCaptureByte: called from EmitSink when HtmlOptCapturing is
 ; set. Append the char in B to the end of FormValue[HtmlSelectSlot]
