@@ -11009,7 +11009,7 @@ WidgetRadOff:
     db  0xAA, 0xAA      ; row 13: blank
 
 ; Filled radio: same outer ring; the "selected" indicator is a 6-px-wide
-; x 4-px-tall dark-grey blob at cols 1..6, rows 5..8 -- a chunky
+; x 5-px-tall dark-grey blob at cols 1..6, rows 5..9 -- a chunky
 ; horizontal bar through the centre that reads cleanly even at
 ; small render scales.
 WidgetRadOn:
@@ -11021,8 +11021,8 @@ WidgetRadOn:
     db  0x80, 0x02      ; row 5:  W G G G G G G W  (blob top)
     db  0x80, 0x02      ; row 6
     db  0x80, 0x02      ; row 7
-    db  0x80, 0x02      ; row 8:  blob bottom
-    db  0x8A, 0xA2      ; row 9
+    db  0x80, 0x02      ; row 8
+    db  0x80, 0x02      ; row 9:  blob bottom
     db  0x8A, 0xA2      ; row 10
     db  0xA2, 0x8A      ; row 11
     db  0xA8, 0x2A      ; row 12: bottom cap
