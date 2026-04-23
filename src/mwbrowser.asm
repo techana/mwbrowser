@@ -409,6 +409,15 @@ OnContent:
     jr      z, .ocFireBtn
     cp      'B'
     jr      z, .ocFireBtn
+    cp      'L'
+    jr      z, .ocSelect
+    jr      .ocNoForm
+.ocSelect:
+    ld      a, b
+    cp      ' '
+    jp      z, DoFormSelectCycle
+    cp      KEY_ENTER
+    jp      z, DoFormSubmit
     jr      .ocNoForm
 .ocText:
     ld      a, b
@@ -643,6 +652,34 @@ DoFormToggle:
     jp      MainLoop
 
 DftSlot:        db 0
+
+; DoFormSelectCycle: advance the focused <select>'s visible option
+; index. FormSelectIdx[slot] = (FormSelectIdx[slot] + 1) mod
+; FormOptCount[slot]. Triggers a re-render so the new option's text
+; appears inside the box.
+DoFormSelectCycle:
+    ld      a, [HtmlFormFocus]
+    cp      0xFF
+    jp      z, MainLoop
+    ld      e, a
+    ld      d, 0
+    ld      hl, FormOptCount
+    add     hl, de
+    ld      a, [hl]
+    or      a
+    jp      z, MainLoop                     ; no options yet -> do nothing
+    ld      b, a                            ; B = count
+    ld      hl, FormSelectIdx
+    add     hl, de
+    ld      a, [hl]
+    inc     a
+    cp      b
+    jr      c, .dfsWrite
+    xor     a                                ; wrap to 0
+.dfsWrite:
+    ld      [hl], a
+    call    RefreshContentInPlace
+    jp      MainLoop
 
 ; DoFormClearRadioGroup: empty the value buffer of every slot whose
 ; NAME matches the focused slot's NAME (excluding the focused slot
@@ -2880,6 +2917,23 @@ EmitSink:
     or      a
     ld      a, b
     ret     nz
+    ; If the currently-visible <option> is streaming its label, also
+    ; mirror the char into FormValue[HtmlSelectSlot] so submit sends
+    ; the user's pick. (Widget sentinel glyphs -- the L/M/R box cells
+    ; emitted around the label -- fall in the < 0x20 range; skip them
+    ; so the value doesn't include the box chrome.)
+    ld      a, [HtmlOptCapturing]
+    or      a
+    jr      z, .esNoCapture
+    ld      a, b
+    cp      ' '
+    jr      c, .esNoCapture
+    push    af
+    push    bc
+    call    FormOptCaptureByte
+    pop     bc
+    pop     af
+.esNoCapture:
     ld      a, [HtmlInTitle]
     or      a
     jr      nz, .toTitle
@@ -4464,6 +4518,9 @@ TagNeedsAttrScan:
     ld      de, TnISINDEX
     call    TnCompare
     ret     nz
+    ld      de, TnSELECT
+    call    TnCompare
+    ret     nz
     xor     a
     ret
 
@@ -4508,6 +4565,7 @@ TnIMG:  db "IMG", 0
 TnFONT: db "FONT", 0
 TnINPUT: db "INPUT", 0
 TnISINDEX: db "ISINDEX", 0
+TnSELECT: db "SELECT", 0
 
 ; ScanBlockAttrs: walks HL from first char after the tag name through '>',
 ; looking for align=<value> and dir=<value> (case-insensitive). Parses
@@ -9056,7 +9114,12 @@ TagInput:
     call    nc, FormStoreFromSlotA
     pop     af
     ld      [.tisSlot], a
-    call    FormCaptureRect
+    ; Only capture rect when a slot was actually allocated (CF=0). With
+    ; CF=1 (table full) A=0xFF and FormCaptureRect would write 510
+    ; bytes past FormScreenX, scribbling into code.
+    push    af
+    call    nc, FormCaptureRect
+    pop     af
     ; Decide focused vs unfocused for L/M/R. Reload slot index from
     ; .tisSlot because FormCaptureRect doesn't preserve A.
     ld      a, [.tisSlot]
@@ -9260,6 +9323,8 @@ FormScreenW:    ds FORM_MAX * 2
 ; FormFinishRect once the widget's cells have been emitted. Clobbers
 ; A, BC, DE, HL.
 FormCaptureRect:
+    cp      FORM_MAX
+    ret     nc                              ; slot out of range (table full)
     ld      e, a
     ld      d, 0
     push    de
@@ -9295,6 +9360,8 @@ FormCaptureRect:
 ; FormFinishRect: A = slot. Compute width = TextX - FormScreenX[A].
 ; Stores into FormScreenW[A] (16-bit). Clobbers A, BC, DE, HL.
 FormFinishRect:
+    cp      FORM_MAX
+    ret     nc                              ; slot out of range
     ld      e, a
     ld      d, 0
     ld      hl, FormScreenX
@@ -9580,11 +9647,42 @@ FormTypeIsFocusable:
     jr      z, .ftfYes
     cp      'B'
     jr      z, .ftfYes
+    cp      'L'                              ; <select>
+    jr      z, .ftfYes
     xor     a                                ; not focusable: Z set
     ret
 .ftfYes:
     ld      a, 1
     or      a                                ; focusable: NZ
+    ret
+
+; FormOptCaptureByte: called from EmitSink when HtmlOptCapturing is
+; set. Append the char in B to the end of FormValue[HtmlSelectSlot]
+; (capped at FORM_VALUE_MAX). Preserves no registers other than via
+; the caller's push/pop wrapping.
+FormOptCaptureByte:
+    ld      a, [HtmlSelectSlot]
+    call    FormGetValuePtr                 ; HL -> value buf
+    ; Walk to NUL.
+    ld      c, 0
+.focLen:
+    ld      a, [hl]
+    or      a
+    jr      z, .focAtEnd
+    inc     hl
+    inc     c
+    ld      a, c
+    cp      FORM_VALUE_MAX
+    jr      c, .focLen
+.focAtEnd:
+    ld      a, c
+    cp      FORM_VALUE_MAX
+    ret     nc                              ; full -> drop char
+    ld      a, b
+    ld      [hl], a
+    inc     hl
+    xor     a
+    ld      [hl], a
     ret
 
 ; FormPrevFocusableSlot: walk BACKWARD from HtmlFormFocus-1 looking
@@ -9683,62 +9781,155 @@ EmitSinkZ:
     inc     hl
     jr      EmitSinkZ
 
-; <select>...</select>: render as a text-input-shaped widget. The first
-; <option>'s label flows into the box (via HtmlSelectFound + the OPTION
-; handler); subsequent options stay suppressed. The box opens with the
-; left edge + one pad cell, and closes with one pad cell + the right
-; edge -- so the visible width is `1 + len(option) + 1` cells, hugging
-; the label.
+; <select>...</select>: render as a text-input-shaped widget with a
+; dropdown arrow on the right. The *visible* option is the one whose
+; parse-order index matches FormSelectIdx[slot]. Space on a focused
+; select cycles FormSelectIdx modulo FormOptCount, so the user can
+; step through options without a real dropdown popup. While rendering
+; the matching option, EmitSink also appends each char to FormValue
+; so submit sends the user's pick.
 TagSelect:
     ld      a, [HtmlIsClose]
     or      a
     jr      nz, .tsClose
+    ; Allocate + capture rect. On a sticky re-render FormAllocCurrent
+    ; just steps the parse cursor; the slot's FormSelectIdx / count
+    ; survive from the previous render.
+    call    FormAllocCurrent
+    push    af
+    call    nc, FormStoreFromSlotA
+    pop     af
+    ld      [HtmlSelectSlot], a
+    ; Fresh render only: stamp the slot's type byte as 'L' (seLect) so
+    ; OnContent's dispatch tells selects apart from text inputs, and
+    ; zero the per-slot FormSelectIdx / FormOptCount so the next Space
+    ; wraps from 0. Sticky re-renders keep whatever the user edited.
+    ld      a, [FormSticky]
+    or      a
+    jr      nz, .tsAfterInit
+    ld      a, [HtmlSelectSlot]
+    ld      e, a
+    ld      d, 0
+    ld      hl, FormType
+    add     hl, de
+    ld      a, 'L'
+    ld      [hl], a
+    ld      hl, FormSelectIdx
+    add     hl, de
+    xor     a
+    ld      [hl], a
+    ld      hl, FormOptCount
+    add     hl, de
+    ld      [hl], a
+.tsAfterInit:
+    ld      a, [HtmlSelectSlot]
+    call    FormCaptureRect
+    ; Decide focus visual for the L edge (re-use WG_BOX_LF / _MF / _RF
+    ; for the focused state, same as submit/text).
+    ld      b, a
+    ld      a, [HtmlFormFocus]
+    cp      b
+    ld      a, 0
+    jr      nz, .tsFlagStored
+    ld      a, 1
+.tsFlagStored:
+    ld      [HtmlSelectFocus], a
+    ld      a, [HtmlSelectFocus]
+    or      a
     ld      a, WG_BOX_L
+    jr      z, .tsEmitL
+    ld      a, WG_BOX_LF
+.tsEmitL:
     call    EmitSink
+    ld      a, [HtmlSelectFocus]
+    or      a
     ld      a, WG_BOX_M
-    call    EmitSink                        ; left pad cell
+    jr      z, .tsEmitMl
+    ld      a, WG_BOX_MF
+.tsEmitMl:
+    call    EmitSink
+    ; Reset per-render option state.
+    xor     a
+    ld      [HtmlOptCurIdx], a
     ld      a, 1
     ld      [HtmlSkipBody], a
-    xor     a
-    ld      [HtmlSelectFound], a            ; no option seen yet
     ret
 .tsClose:
-    ; Clear SkipBody FIRST -- the previous </option> left it on so any
-    ; trailing OPTION text would stay suppressed, but the closing cells
-    ; we emit here still need to flow through EmitSink. Without this
-    ; the box's right edge silently vanishes and the next text on the
-    ; line floats outside an "open" rectangle.
+    ; Record total option count for this slot so Space can wrap
+    ; FormSelectIdx modulo the count.
+    ld      a, [HtmlSelectSlot]
+    ld      e, a
+    ld      d, 0
+    ld      hl, FormOptCount
+    add     hl, de
+    ld      a, [HtmlOptCurIdx]
+    ld      [hl], a
+    ; Clear SkipBody so the closing cells actually render.
     xor     a
     ld      [HtmlSkipBody], a
+    ld      a, [HtmlSelectFocus]
+    or      a
     ld      a, WG_BOX_M
-    call    EmitSink                        ; right pad cell
+    jr      z, .tsEmitMr
+    ld      a, WG_BOX_MF
+.tsEmitMr:
+    call    EmitSink
     ld      a, WG_SEL_ARROW
-    call    EmitSink                        ; dropdown indicator
+    call    EmitSink
+    ld      a, [HtmlSelectFocus]
+    or      a
     ld      a, WG_BOX_R
-    jp      EmitSink
+    jr      z, .tsEmitR
+    ld      a, WG_BOX_RF
+.tsEmitR:
+    call    EmitSink
+    ld      a, [HtmlSelectSlot]
+    jp      FormFinishRect
 
-; <option>...</option>: routes the label text into the parent <select>'s
-; box. The first OPTION inside a SELECT clears HtmlSkipBody so its
-; text is emitted; the closing tag turns suppression back on. Any
-; later OPTIONs see HtmlSelectFound set and stay quiet.
+HtmlSelectSlot:  db 0
+HtmlSelectFocus: db 0
+
+; <option>...</option>: the Nth option (0-indexed) shows when
+; HtmlOptCurIdx reaches FormSelectIdx[select_slot]. While the matching
+; option is open we also enable HtmlOptCapturing so EmitSink mirrors
+; each char into FormValue[select_slot] for the eventual submit.
 TagOption:
     ld      a, [HtmlIsClose]
     or      a
-    jr      nz, .toClose
-    ld      a, [HtmlSelectFound]
-    or      a
-    ret     nz                              ; already shown one
-    ld      a, 1
-    ld      [HtmlSelectFound], a
+    jp      nz, .toClose
+    ; Is this the "visible" option? Compare HtmlOptCurIdx to
+    ; FormSelectIdx[HtmlSelectSlot].
+    ld      a, [HtmlSelectSlot]
+    ld      e, a
+    ld      d, 0
+    ld      hl, FormSelectIdx
+    add     hl, de
+    ld      a, [hl]                         ; target idx
+    ld      b, a
+    ld      a, [HtmlOptCurIdx]
+    cp      b
+    ret     nz                              ; not the visible one
+    ; Visible: unmask text and start capturing into FormValue.
     xor     a
-    ld      [HtmlSkipBody], a               ; let this option's text flow
+    ld      [HtmlSkipBody], a
+    ld      a, 1
+    ld      [HtmlOptCapturing], a
+    ; Zero FormValue[select_slot] so we capture fresh text.
+    ld      a, [HtmlSelectSlot]
+    call    FormGetValuePtr
+    xor     a
+    ld      [hl], a
     ret
 .toClose:
-    ld      a, [HtmlSelectFound]
-    or      a
-    ret     z
+    ; Always bump the option counter on close, matched-or-not.
+    ld      a, [HtmlOptCurIdx]
+    inc     a
+    ld      [HtmlOptCurIdx], a
+    ; Stop capturing + re-suppress body text.
+    xor     a
+    ld      [HtmlOptCapturing], a
     ld      a, 1
-    ld      [HtmlSkipBody], a               ; suppress siblings again
+    ld      [HtmlSkipBody], a
     ret
 
 ; <textarea>...</textarea>: render as a single-row text-box widget for
@@ -12713,6 +12904,14 @@ HtmlChecked:    db 0
 ; need a 2-pass scan to do that without rolling back already-emitted
 ; cells). For now: first option = the visible one.
 HtmlSelectFound: db 0
+; HtmlOptCurIdx counts <option>s visited in the current <select>
+; during parse. HtmlOptCapturing gates whether EmitSink should mirror
+; emitted chars into FormValue[HtmlSelectSlot] so submit carries the
+; currently-shown option's text.
+HtmlOptCurIdx:   db 0
+HtmlOptCapturing: db 0
+FormSelectIdx:   ds FORM_MAX
+FormOptCount:    ds FORM_MAX
 
 ; ---------------------------------------------------------------------------
 ; Form-field slot table. One slot per <input> we want to remember after
