@@ -101,13 +101,15 @@ BTN_H          equ 15
 BTN1_X         equ 4                    ; Back,    byte col 1 (ends at 35)
 BTN3_X         equ 40                   ; Forward, byte col 10 (ends at 71)
 ADDR_X0        equ 76                   ; byte col 19
-ADDR_X1        equ 455                  ; ADDR width = 380 px (95 byte-cols)
-BTN2_X         equ 460                  ; Refresh, byte col 115 (ends at 491)
+ADDR_X1        equ 451                  ; ADDR width = 376 px (94 byte-cols)
+BTN2_X         equ 456                  ; Refresh, byte col 114 (ends at 487)
+                                        ; right-edge gap = 4 px == left-edge gap
 
-; Chars that fit in the address bar's text area. Text starts 4 px in
-; from ADDR_X0 and must stop before the clear-x glyph at ADDR_X1-12.
-; (ADDR_X1 - ADDR_X0 - 4 - 12) / 8 = 45.
-URL_VISIBLE    equ 45
+; Chars that fit in the address bar's text area. Text starts 5 px in
+; from ADDR_X0 (1-px gap after the 4-px border) and must stop before
+; the clear-x glyph at ADDR_X1-12.
+; ((ADDR_X1-12) - (ADDR_X0+5)) / 8 = 358 / 8 = 44 (integer floor).
+URL_VISIBLE    equ 44
 
 ; Scrollbar is 20 wide (5 bytes) -- 1 byte wider than before. An 8-wide arrow
 ; icon (2 bytes) sits inside 1-byte (4-px) left/right track borders.
@@ -1404,7 +1406,7 @@ PaintAddressBar:
     ld      d, 0
     add     hl, de
 .urlDraw:
-    ld      de, ADDR_X0 + 4
+    ld      de, ADDR_X0 + 5              ; 1 empty pixel between border and text
     ld      c, BTN_Y0 + 4
     call    DrawString
 
@@ -1426,7 +1428,7 @@ PaintAddressBar:
     add     hl, hl
     add     hl, hl
     add     hl, hl                       ; HL = visible_len * 8
-    ld      de, ADDR_X0 + 4
+    ld      de, ADDR_X0 + 5              ; matches URL's text origin
     add     hl, de                       ; HL = caret pixel X
     srl     h
     rr      l
@@ -10193,15 +10195,20 @@ AboutFooter:    db "v0.5 demo build", 0
 ; Right-pointing arrow = up-arrow rotated 90 deg CW. 8 px wide x 8 rows.
 ; Used as the Refresh-button glyph; the "stop" (busy) case renders an 'X'
 ; via DrawCharFast so we don't need a separate bitmap.
+; Refresh-button "play" triangle, 8x8 px, 2 bpp (11 = black, 01 = lgray).
+; The tip is shifted 1 MSX pixel to the right inside its 8-wide cell
+; so the icon sits visually centred in the 32-px-wide button's lgray
+; face; without the shift the triangle hugs the left side of its
+; byte-col pair and reads as off-centre.
 IconArrowRight:
-    db  0xD5, 0x55
-    db  0xF5, 0x55
-    db  0xFD, 0x55
-    db  0xFF, 0x55
-    db  0xFF, 0x55
-    db  0xFD, 0x55
-    db  0xF5, 0x55
-    db  0xD5, 0x55
+    db  0x75, 0x55      ; row 0: 1 black pixel at x=1
+    db  0x7D, 0x55      ; row 1: 2 black pixels at x=1..2
+    db  0x7F, 0x55      ; row 2: 3 black pixels at x=1..3
+    db  0x7F, 0xD5      ; row 3: 4 black pixels at x=1..4 (crosses byte)
+    db  0x7F, 0xD5      ; row 4: same as row 3
+    db  0x7F, 0x55      ; row 5: same as row 2
+    db  0x7D, 0x55      ; row 6: same as row 1
+    db  0x75, 0x55      ; row 7: same as row 0
 
 ; resources/up.png -> 8x5 MSX pixels. DrawDownArrow reuses this by reading
 ; rows in reverse (DrawBitmapReverse), so no separate down-arrow bitmap.
