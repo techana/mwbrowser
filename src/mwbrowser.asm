@@ -4004,6 +4004,13 @@ LineDrawCells:
     jr      nc, .ldcText
     or      a
     jr      z, .ldcText                 ; NUL never reaches here, paranoia
+    ; Flag the line as tall so the next EmitNewline advances 16 px instead
+    ; of 8 -- widgets are 14 px and would otherwise overlap the head of
+    ; the next line's widgets by 6 px.
+    push    af
+    ld      a, 1
+    ld      [HtmlLineHasWidget], a
+    pop     af
     call    DrawWidgetGlyph
     jr      .ldcDrawn
 .ldcText:
@@ -4368,11 +4375,16 @@ EmitNewline:
     ld      [LineLastSpace], a
     pop     af
     ; Count this rendered line in units of 8-pixel rows so H1/H2 (scale 2)
-    ; contribute 2. This keeps scroll-by-page math in sync with actual VRAM
-    ; pixels -- otherwise a page of scaled headings would scroll more than
-    ; one visual page worth of content.
+    ; contribute 2. A line that contained a form widget counts as 2 rows
+    ; too, because its pitch is bumped to 16 below. This keeps scroll-by-
+    ; page math in sync with actual VRAM pixels.
     ld      a, [HtmlScaleY]
     ld      c, a                        ; C = rows to add (1 or 2)
+    ld      a, [HtmlLineHasWidget]
+    or      a
+    jr      z, .lcNoWidgetRow
+    inc     c                           ; widget line counts as +1 extra row
+.lcNoWidgetRow:
     ld      b, 0
     ld      hl, [HtmlLineCount]
     add     hl, bc
@@ -4403,12 +4415,21 @@ EmitNewline:
     jr      .flagsDone
 
 .advance:
-    ; Row pitch depends on current HtmlScaleY (1 or 2).
+    ; Row pitch depends on current HtmlScaleY (1 or 2). A line that
+    ; carried a widget bumps pitch by an extra 8 px so the widget's
+    ; 3-px footroom clears the next line's 3-px headroom.
     ld      a, [HtmlScaleY]
     add     a, a                        ; A = scale*2
     add     a, a                        ; A = scale*4
     add     a, a                        ; A = scale*8 = pitch
     ld      b, a
+    ld      a, [HtmlLineHasWidget]
+    or      a
+    jr      z, .advNoWidget
+    ld      a, b
+    add     a, 8
+    ld      b, a
+.advNoWidget:
     ld      a, [TextY]
     add     a, b                        ; A = proposed new TextY
     jr      c, .flagsDone               ; wrapped past 255 -> page full
@@ -4421,6 +4442,7 @@ EmitNewline:
     ld      [HtmlLineEmpty], a
     xor     a
     ld      [HtmlWsPending], a
+    ld      [HtmlLineHasWidget], a      ; consume: next line starts clean
     ret
 
 ; EmitBlankLine: ensure we're at start of a line and leave one blank line
@@ -5861,6 +5883,27 @@ TagImg:
     jp      AttachPendingAreas          ; tail call -> RET
 
 TagImgBody:
+    ; Sticky re-render (e.g. Tab changed focus, keystroke repainted
+    ; widgets): the image is already on VRAM from the first render.
+    ; Skip the fetch/decode entirely and just reserve the same layout
+    ; rectangle so TextY / HtmlLineCount / ScrollLine land where the
+    ; original render left them. Requires width+height on the tag,
+    ; which the bridge always rewrites into imNN.pcx handles for us.
+    ld      a, [FormSticky]
+    or      a
+    jr      z, .tibFresh
+    ld      a, [HtmlImgWidth]
+    ld      b, a
+    ld      a, [HtmlImgWidth + 1]
+    or      b
+    jr      z, .tibFresh
+    ld      a, [HtmlImgHeight]
+    ld      b, a
+    ld      a, [HtmlImgHeight + 1]
+    or      b
+    jr      z, .tibFresh
+    jp      ReserveImgLayout
+.tibFresh:
     ld      hl, [HtmlCurSrcPtr]
     ld      a, h
     or      l
@@ -7718,6 +7761,104 @@ RenderMissingImgBox:
     ld      [RmbHPixels], a
     jr      .rmbDone
 
+; ReserveImgLayout: same layout math as RenderMissingImgBox but without
+; any VDP writes. Used on sticky re-renders where the image bytes are
+; already on screen from the first render -- we just need TextY and the
+; line counters to land where they did last time. Assumes HtmlImgWidth
+; and HtmlImgHeight are both non-zero (TagImgBody gates on that).
+; CF=1 on return so TagImgBody can `ret c` out as if the image rendered.
+ReserveImgLayout:
+    ld      hl, [HtmlImgWidth]
+    ld      de, CONTENT_X_END + 1
+    and     a
+    sbc     hl, de
+    jr      c, .rilWOk
+    ld      hl, CONTENT_X_END + 1
+    ld      [HtmlImgWidth], hl
+.rilWOk:
+    ; Clamp height to remaining viewport.
+    ld      hl, [HtmlImgHeight]
+    ld      a, h
+    or      a
+    jr      nz, .rilHClamp
+    ld      c, l
+    jr      .rilHMaybe
+.rilHClamp:
+    ld      c, CONTENT_Y1 - CONTENT_Y0 + 1
+.rilHMaybe:
+    ld      a, [TextY]
+    ld      b, a
+    ld      a, CONTENT_Y1 + 1
+    sub     b
+    jr      c, .rilHZero
+    cp      c
+    jr      nc, .rilHOk
+    ld      c, a
+.rilHOk:
+    ; image_lines = ceil(height / 8) for line-count / skip math.
+    ld      a, c
+    add     a, 7
+    jr      c, .rilLinesSat
+    srl     a
+    srl     a
+    srl     a
+    jr      .rilLinesStore
+.rilLinesSat:
+    ld      a, 255
+.rilLinesStore:
+    or      a
+    jr      nz, .rilLinesNonZero
+    ld      a, 1
+.rilLinesNonZero:
+    ld      b, a                        ; B = image_lines
+
+    call    ArFlush
+    call    LineFlush
+
+    ld      a, b
+    push    bc                          ; preserve (B=lines, C=height)
+    ld      c, a
+    ld      b, 0
+    ld      hl, [HtmlLineCount]
+    add     hl, bc
+    jr      nc, .rilLCStore
+    ld      hl, 0xFFFF
+.rilLCStore:
+    ld      [HtmlLineCount], hl
+
+    ; Honour HtmlLineSkip so scrolling past the image still lines up.
+    ld      hl, [HtmlLineSkip]
+    ld      a, h
+    or      l
+    jr      z, .rilAdvance
+    and     a
+    sbc     hl, bc
+    jr      c, .rilAdvance              ; straddles fold -> still advance TextY
+    ld      [HtmlLineSkip], hl
+    pop     bc
+    scf
+    ret
+
+.rilAdvance:
+    pop     bc                          ; B=lines, C=height
+    ld      a, [TextY]
+    add     a, c
+    jr      c, .rilTyCap
+    cp      CONTENT_Y1 + 1
+    jr      c, .rilTyStore
+.rilTyCap:
+    ld      a, CONTENT_Y1 + 1
+.rilTyStore:
+    ld      [TextY], a
+    scf
+    ret
+
+.rilHZero:
+    ; No vertical room left. Still advance line counters so scroll math
+    ; matches the non-sticky path.
+    scf
+    ret
+
 RmbWBytes:      db 0
 RmbHPixels:     db 0
 RmbImgLines:    db 0
@@ -9507,13 +9648,15 @@ FormSlotTmp:    db 0
 ; immediately so the user's typed value isn't clobbered by the original
 ; VALUE= attribute on every keystroke.
 FormStoreFromSlotA:
-    push    af
+    ; Stash slot once in FormSlotTmp; reload as needed. Avoids five
+    ; push af/pop af pairs (10 bytes, ~100 T saved) that previously
+    ; shuttled A across the internal calls.
+    ld      [FormSlotTmp], a
     ld      a, [FormSticky]
     or      a
-    jr      nz, .fsfSticky
-    pop     af
-    push    af
+    ret     nz                          ; sticky re-render: keep user value
     ; --- type byte ---
+    ld      a, [FormSlotTmp]
     ld      e, a
     ld      d, 0
     ld      hl, FormType
@@ -9521,8 +9664,7 @@ FormStoreFromSlotA:
     ld      a, [HtmlInputType]
     ld      [hl], a
     ; --- width ---
-    pop     af
-    push    af
+    ld      a, [FormSlotTmp]
     ld      e, a
     ld      d, 0
     ld      hl, FormWidth
@@ -9530,23 +9672,19 @@ FormStoreFromSlotA:
     ld      a, TI_TEXT_DEFAULT_W
     ld      [hl], a
     ; --- name ---
-    pop     af
-    push    af
+    ld      a, [FormSlotTmp]
     call    FormGetNamePtr
     ex      de, hl
     ld      hl, HtmlNameAttr
     ld      bc, FORM_NAME_MAX + 1
     ldir
     ; --- value ---
-    pop     af
-    push    af
+    ld      a, [FormSlotTmp]
     call    FormGetValuePtr             ; HL -> dest
     ex      de, hl                      ; DE = dest
-    pop     af
     ; For checkbox / radio the value buffer holds toggle state
     ; ("" = off, "1" = on); seed from HtmlChecked. For other types
     ; (text/pass/submit/...), seed from HtmlCurHref like before.
-    push    af
     ld      hl, HtmlInputType
     ld      a, [hl]
     cp      'C'
@@ -9556,7 +9694,6 @@ FormStoreFromSlotA:
     ld      hl, HtmlCurHref
     ld      bc, FORM_VALUE_MAX + 1
     ldir
-    pop     af
     ret
 .fsfTogState:
     ld      a, [HtmlChecked]
@@ -9569,18 +9706,15 @@ FormStoreFromSlotA:
     inc     de
     xor     a
     ld      [de], a
-    pop     af
-    ret
-.fsfSticky:
-    pop     af
     ret
 
 ; FormGetNamePtr: A = slot. Returns HL -> FormName[A * (NAME_MAX + 1)].
 ; Clobbers HL, DE. Preserves A.
 FormGetNamePtr:
+    ; A is read once into E and then never written again, so it survives
+    ; the HL/DE math naturally -- no push/pop needed to "preserve" it.
     ld      e, a
     ld      d, 0
-    push    af
     ; offset = A * 13. Use a tiny shift+add chain.
     ld      h, d
     ld      l, e                            ; HL = A
@@ -9594,7 +9728,6 @@ FormGetNamePtr:
     add     hl, de                          ; *13
     ld      de, FormName
     add     hl, de
-    pop     af
     ret
 
 ; FormFirstEditableSlot: scan FormFields for the first text or password
@@ -9913,9 +10046,10 @@ FormFirstSubmitSlot:
 ; FormGetValuePtr: A = slot. Returns HL -> FormValue[A * (VALUE_MAX + 1)].
 ; VALUE_MAX + 1 = 19. Clobbers HL, DE. Preserves A.
 FormGetValuePtr:
+    ; Same as FormGetNamePtr: A is never written during the math, so it's
+    ; naturally preserved for the caller.
     ld      e, a
     ld      d, 0
-    push    af
     ld      h, d
     ld      l, e                            ; HL = A
     add     hl, hl                          ; *2
@@ -9927,7 +10061,6 @@ FormGetValuePtr:
     add     hl, de                          ; *19
     ld      de, FormValue
     add     hl, de
-    pop     af
     ret
 
 ; Helper: walk a NUL-terminated string at HL, emitting each byte
@@ -13060,6 +13193,9 @@ HtmlInTitle:    db 0                    ; 1 while inside <title>...</title>
 HtmlStyleFlags: db 0                    ; STYLE_BOLD / STYLE_ITALIC / etc.
 HtmlWsPending:  db 0                    ; 1 = emit a space before next non-ws char
 HtmlLineEmpty:  db 1                    ; 1 = cursor at start of a line (trim leading ws)
+HtmlLineHasWidget: db 0                 ; 1 = current line contains a form widget; bumps
+                                        ; next EmitNewline pitch so the widget's 3-px
+                                        ; foot doesn't crash into the next line's head.
 HtmlIsClose:    db 0                    ; scratch: 1 inside a closing tag
 HtmlTitleSeen:  db 0                    ; 1 once <title>..</title> has resolved
 HtmlTitleLen:   db 0                    ; bytes stored in HtmlTitleBuf
