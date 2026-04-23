@@ -59,9 +59,9 @@ except ImportError:
 
 
 IMG_TAG    = re.compile(rb"<img\b[^>]*>", re.I)
-IMG_SRC    = re.compile(rb"""\bsrc\s*=\s*["']?([^"'\s>]+)""", re.I)
-IMG_W      = re.compile(rb"""\bwidth\s*=\s*["']?(\d+)""", re.I)
-IMG_H      = re.compile(rb"""\bheight\s*=\s*["']?(\d+)""", re.I)
+IMG_SRC    = re.compile(rb"""\bsrc\s*=\s*["']?([^"'\s>]+)["']?""", re.I)
+IMG_W      = re.compile(rb"""\bwidth\s*=\s*["']?(\d+)["']?""", re.I)
+IMG_H      = re.compile(rb"""\bheight\s*=\s*["']?(\d+)["']?""", re.I)
 A_HREF_DQ  = re.compile(rb'(<a\b[^>]*\bhref=)"([^"]*)"', re.I)
 A_HREF_SQ  = re.compile(rb"(<a\b[^>]*\bhref=)'([^']*)'", re.I)
 
