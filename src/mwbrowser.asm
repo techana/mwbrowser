@@ -93,15 +93,21 @@ CONTENT_Y0     equ 29
 CONTENT_Y1     equ 211
 
 BTN_Y0         equ 12
-BTN_W          equ 60
+BTN_W          equ 32          ; halved from 60 so the address bar can grow
 BTN_H          equ 15
 ; Toolbar layout (left to right): Back, Forward, Address bar, Refresh.
-; Refresh sits at the far right of the toolbar; Address bar fills the middle.
-BTN1_X         equ 4                    ; Back,    byte col 1
-BTN3_X         equ 68                   ; Forward, byte col 17
-ADDR_X0        equ 132                  ; byte col 33
-ADDR_X1        equ 427                  ; byte col 106 (ADDR width = 296 px)
-BTN2_X         equ 432                  ; Refresh, byte col 108 (ends at x=491)
+; Refresh sits at the far right of the toolbar; Address bar fills the
+; middle. All X values are on 4-px byte-column boundaries.
+BTN1_X         equ 4                    ; Back,    byte col 1 (ends at 35)
+BTN3_X         equ 40                   ; Forward, byte col 10 (ends at 71)
+ADDR_X0        equ 76                   ; byte col 19
+ADDR_X1        equ 455                  ; ADDR width = 380 px (95 byte-cols)
+BTN2_X         equ 460                  ; Refresh, byte col 115 (ends at 491)
+
+; Chars that fit in the address bar's text area. Text starts 4 px in
+; from ADDR_X0 and must stop before the clear-x glyph at ADDR_X1-12.
+; (ADDR_X1 - ADDR_X0 - 4 - 12) / 8 = 45.
+URL_VISIBLE    equ 45
 
 ; Scrollbar is 20 wide (5 bytes) -- 1 byte wider than before. An 8-wide arrow
 ; icon (2 bytes) sits inside 1-byte (4-px) left/right track borders.
@@ -1094,7 +1100,7 @@ PaintToolbar:
 .backFgSet:
     ld      l, COL_LGRAY
     call    SetTextColours
-    ld      de, BTN1_X + 26
+    ld      de, BTN1_X + 12
     ld      c, BTN_Y0 + 4
     ld      hl, CharLess
     call    DrawString
@@ -1117,7 +1123,7 @@ PaintToolbar:
     ld      a, COL_BLACK
     ld      l, COL_LGRAY
     call    SetTextColours
-    ld      de, BTN2_X + 26
+    ld      de, BTN2_X + 12
     ld      c, BTN_Y0 + 4
     ld      hl, CharX
     call    DrawString
@@ -1146,7 +1152,7 @@ PaintToolbar:
 .fwdFgSet:
     ld      l, COL_LGRAY
     call    SetTextColours
-    ld      de, BTN3_X + 26
+    ld      de, BTN3_X + 12
     ld      c, BTN_Y0 + 4
     ld      hl, CharGreater
     call    DrawString
@@ -1267,12 +1273,11 @@ RC_BY: db 0
 SVB_TMP: db 0
 
 ; DrawRefreshGlyph: center the 8x8 right-arrow bitmap inside the refresh
-; button. A = button byte col on entry. The icon is 2 bytes wide and 8 rows
-; tall; we place it at byte col + 7 (button is 15 bytes wide, (15-2)/2 ~= 6,
-; bumped to 7 so it reads centred given the button's left padding) and
-; y = BTN_Y0 + 4 so it sits vertically centred.
+; button. A = button byte col on entry. The icon is 2 bytes wide and 8
+; rows tall; place it at byte col + 3 so the 8-px-wide icon sits
+; centred in the new 32-px (8 byte-col) button. y = BTN_Y0 + 4.
 DrawRefreshGlyph:
-    add     a, 7
+    add     a, 3
     ld      b, a                        ; B = byte column
     ld      c, BTN_Y0 + 4               ; C = top row
     ld      d, 2                        ; D = 2 bytes/row
@@ -1382,35 +1387,54 @@ PaintAddressBar:
     call    DrawRectBorder
 .addrBorderDone:
 
-    ; URL text.
+    ; URL text. If the URL is longer than what fits in the bar, show
+    ; only its last URL_VISIBLE characters so the caret (which always
+    ; tracks the string's end) stays visible. The chars before the
+    ; window scroll off the left -- DrawString is happy to start from
+    ; any offset inside UrlBuf and stops at the existing NUL.
     ld      a, COL_BLACK
     ld      l, COL_WHITE
     call    SetTextColours
+    ld      hl, UrlBuf
+    ld      a, [UrlLen]
+    cp      URL_VISIBLE + 1
+    jr      c, .urlDraw
+    sub     URL_VISIBLE                 ; A = start offset
+    ld      e, a
+    ld      d, 0
+    add     hl, de
+.urlDraw:
     ld      de, ADDR_X0 + 4
     ld      c, BTN_Y0 + 4
-    ld      hl, UrlBuf
     call    DrawString
 
     ; Text caret: a 4-px-wide black column just past the URL when the
-    ; address bar has focus, so it's obvious that typing will land here.
+    ; address bar has focus. Cap visible_len at URL_VISIBLE so the
+    ; caret stays inside the bar once the display starts scrolling.
+    ; Use 16-bit math for the *8 step -- visible_len * 8 can reach
+    ; 45 * 8 = 360 which overflows an 8-bit accumulator.
     ld      a, [ButtonState]
     and     BTN_FOCUSED
     jr      z, .noCaret
     ld      a, [UrlLen]
-    add     a, a
-    add     a, a
-    add     a, a                        ; A = UrlLen * 8 (px offset)
-    ld      e, a
-    ld      d, 0
-    ld      hl, ADDR_X0 + 4
-    add     hl, de                      ; HL = caret pixel X
+    cp      URL_VISIBLE + 1
+    jr      c, .caretLen
+    ld      a, URL_VISIBLE              ; visible-length cap
+.caretLen:
+    ld      l, a
+    ld      h, 0
+    add     hl, hl
+    add     hl, hl
+    add     hl, hl                       ; HL = visible_len * 8
+    ld      de, ADDR_X0 + 4
+    add     hl, de                       ; HL = caret pixel X
     srl     h
     rr      l
     srl     h
-    rr      l                           ; HL = byte col
-    ld      b, l                        ; B = byteCol
+    rr      l                            ; HL = byte col
+    ld      b, l                         ; B = byteCol
     ld      c, BTN_Y0 + 3
-    ld      d, 1                        ; 1 byte wide = 4 px
+    ld      d, 1                         ; 1 byte wide = 4 px
     ld      e, BTN_H - 6
     ld      a, COL_BLACK
     call    FillRect
@@ -9079,8 +9103,13 @@ ClickToolbar:
     ret
 
 .tAddr:
-    ; In address bar. Check if over clear-x glyph (ADDR_X1 - 8..ADDR_X1).
-    ld      de, ADDR_X1 - 8
+    ; In address bar. The clear-x glyph is drawn at ADDR_X1 - 12
+    ; (8-px-wide glyph, so it spans [ADDR_X1-12, ADDR_X1-5]). The old
+    ; hotspot sat at ADDR_X1-8..ADDR_X1, 4 px to the right of the
+    ; glyph -- clicks on the visible X silently fell through to the
+    ; "focus the address bar" branch. Line up the hotspot with the
+    ; glyph (plus a couple of pixels of slack on the right).
+    ld      de, ADDR_X1 - 12
     call    CpHL
     jr      c, .addrMain
     ; Clear-x click
