@@ -4165,54 +4165,199 @@ ScanHrefAttr:
     ld      a, [hl]
     and     0xDF
     cp      'L'
-    jr      nz, .sh_noMatch
+    jp      nz, .sh_noMatch
     inc     hl
     ld      a, [hl]
     and     0xDF
     cp      'T'
-    jr      nz, .sh_noMatch
+    jp      nz, .sh_noMatch
     inc     hl
     ld      a, [hl]
     cp      '='
-    jr      nz, .sh_noMatch
+    jp      nz, .sh_noMatch
     inc     hl
     pop     bc
-    jr      .sh_readValue
+    jp      .sh_readValue
 
 .sh_tryColor:
+    ; C starts both COLOR (<font>) and COORDS (<area>). Second letter
+    ; is 'O' for both; third letter disambiguates ('L' = COLOR, 'O' =
+    ; COORDS). Try COLOR first; on 3rd-letter mismatch, roll HL back
+    ; and retry as COORDS.
     push    hl
     inc     hl
     ld      a, [hl]
     and     0xDF
     cp      'O'
-    jr      nz, .sh_noMatch
+    jp      nz, .sh_noMatch
     inc     hl
     ld      a, [hl]
     and     0xDF
     cp      'L'
-    jr      nz, .sh_noMatch
+    jp      nz, .sh_tryCoords
     inc     hl
     ld      a, [hl]
     and     0xDF
     cp      'O'
-    jr      nz, .sh_noMatch
+    jp      nz, .sh_noMatch
     inc     hl
     ld      a, [hl]
     and     0xDF
     cp      'R'
-    jr      nz, .sh_noMatch
+    jp      nz, .sh_noMatch
     inc     hl
     ld      a, [hl]
     cp      '='
-    jr      nz, .sh_noMatch
+    jp      nz, .sh_noMatch
     inc     hl
     pop     bc
-    jr      .sh_readValue
+    jp      .sh_readValue
+
+.sh_tryCoords:
+    ; HL was restored to start-of-attribute by the COLOR path's first
+    ; push, then advanced through 'C','O' before the 3rd-letter check
+    ; failed. Pop back to the original push, re-inc, and rescan for
+    ; "OORDS=" so the overall parse matches "COORDS=".
+    pop     hl
+    push    hl
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'O'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'O'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'R'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'D'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'S'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    cp      '='
+    jp      nz, .sh_noMatch
+    inc     hl
+    pop     bc
+    jp      .sh_readCoords
 
 .sh_noMatch:
     pop     hl
     inc     hl
     jp      .sh_scan
+
+; .sh_readCoords: HL at first char of a `coords="x1,y1,x2,y2"` value.
+; Parses four comma-separated decimal integers and stores them into
+; AreaCoords[0..3]. Rejoins .sh_scan when done.
+.sh_readCoords:
+    ld      a, [hl]
+    cp      0x22
+    jr      z, .sh_rcQuot
+    cp      0x27
+    jr      z, .sh_rcQuot
+    jr      .sh_rcPos0
+.sh_rcQuot:
+    inc     hl
+.sh_rcPos0:
+    ld      de, AreaCoords
+    call    .sh_rcOne
+    call    .sh_rcSkipComma
+    call    .sh_rcOne
+    call    .sh_rcSkipComma
+    call    .sh_rcOne
+    call    .sh_rcSkipComma
+    call    .sh_rcOne
+    ; Skip remaining junk (closing quote, whitespace) up to next attr.
+.sh_rcTail:
+    ld      a, [hl]
+    cp      '>'
+    jp      z, .sh_scan
+    or      a
+    jp      z, .sh_scan
+    cp      ' '
+    jp      z, .sh_scan
+    cp      0x09
+    jp      z, .sh_scan
+    inc     hl
+    jr      .sh_rcTail
+
+.sh_rcSkipComma:
+    ; Advance HL past the next ',' . Non-comma chars are skipped too so
+    ; "100 , 200" still parses.
+    ld      a, [hl]
+    cp      ','
+    jr      z, .sh_rcSkipOne
+    or      a
+    ret     z
+    cp      '>'
+    ret     z
+    inc     hl
+    jr      .sh_rcSkipComma
+.sh_rcSkipOne:
+    inc     hl
+    ret
+
+.sh_rcOne:
+    ; Read one decimal integer into [DE], advance DE by 2, HL at
+    ; first non-digit.
+    push    de
+    xor     a
+    ld      [de], a
+    inc     de
+    ld      [de], a
+    pop     de                          ; DE = target 16-bit slot
+.sh_rcDigit:
+    ld      a, [hl]
+    sub     '0'
+    cp      10
+    jr      nc, .sh_rcOneDone
+    ld      c, a
+    push    hl
+    push    bc
+    ld      a, [de]
+    ld      l, a
+    inc     de
+    ld      a, [de]
+    ld      h, a
+    dec     de
+    add     hl, hl
+    ld      b, h
+    ld      c, l
+    add     hl, hl
+    add     hl, hl
+    add     hl, bc
+    pop     bc
+    ld      a, l
+    add     a, c
+    ld      l, a
+    ld      a, h
+    adc     a, 0
+    ld      h, a
+    ld      a, l
+    ld      [de], a
+    inc     de
+    ld      a, h
+    ld      [de], a
+    dec     de
+    pop     hl
+    inc     hl
+    jr      .sh_rcDigit
+.sh_rcOneDone:
+    inc     de
+    inc     de                          ; advance DE to next slot
+    ret
 
 .sh_readValue:
     ld      a, [hl]
@@ -4527,7 +4672,17 @@ TagBlockquote:
 ;   data:msx;base64,...     -- inline 2 bpp Screen-6 payload (img_encode.py)
 ;   *.sc6                   -- native Screen-6 BSAVE file on disk
 ; Self-closing; no matching close tag needed.
+; TagImg is a thin wrapper: capture img-origin TextY (so <map>/<area>
+; rects for this image can be translated to screen coords on success),
+; run the dispatch body, then convert any pending area rects into
+; clickable LinkTable entries before returning.
 TagImg:
+    ld      a, [TextY]
+    ld      [HtmlImgOriginY], a
+    call    TagImgBody
+    jp      AttachPendingAreas          ; tail call -> RET
+
+TagImgBody:
     ld      hl, [HtmlCurSrcPtr]
     ld      a, h
     or      l
@@ -4636,6 +4791,281 @@ TagImg:
 TagImgWord:      db "img", 0
 DataMsxPrefix:   db "data:msx;base64,"
 ExtSc6:          db ".sc6", 0
+
+; <map>: groups <area> rects that belong to the <img usemap="#name">
+; that follows. We don't track the name -- our use case is the
+; web_to_sc6 capture pipeline which emits exactly one map block per
+; image and in the same order. <map> open just resets the pending
+; areas so we don't accumulate stale data across images.
+TagMap:
+    ld      a, [HtmlIsClose]
+    or      a
+    ret     nz                          ; </map> is a no-op
+    xor     a
+    ld      [PendingAreaCount], a
+    ret
+
+; <area shape="rect" coords="x1,y1,x2,y2" href="...">: pushes one
+; hotspot entry into the pending table. Coords are already in
+; AreaCoords after ScanHrefAttr, href is in HtmlCurHref.
+TagArea:
+    ld      a, [HtmlIsClose]
+    or      a
+    ret     nz
+    ld      a, [PendingAreaCount]
+    cp      MAP_AREA_MAX
+    ret     nc                          ; table full -> drop
+    ld      e, a
+    ld      d, 0
+
+    ; X1 (16-bit)
+    ld      hl, PendingAreaX1
+    add     hl, de
+    add     hl, de
+    ld      a, [AreaCoords]
+    ld      [hl], a
+    inc     hl
+    ld      a, [AreaCoords + 1]
+    ld      [hl], a
+
+    ; X2 (16-bit)
+    ld      hl, PendingAreaX2
+    add     hl, de
+    add     hl, de
+    ld      a, [AreaCoords + 4]
+    ld      [hl], a
+    inc     hl
+    ld      a, [AreaCoords + 5]
+    ld      [hl], a
+
+    ; Y1 / Y2 (8-bit each -- our viewport is 183 rows).
+    ld      hl, PendingAreaY1
+    add     hl, de
+    ld      a, [AreaCoords + 2]
+    ld      [hl], a
+    ld      hl, PendingAreaY2
+    add     hl, de
+    ld      a, [AreaCoords + 6]
+    ld      [hl], a
+
+    ; Copy href into the slot's url buffer. Offset = index * (L+1).
+    ld      a, [PendingAreaCount]
+    ld      l, a
+    ld      h, 0
+    ld      d, h
+    ld      e, l
+    add     hl, hl
+    add     hl, hl
+    add     hl, hl
+    add     hl, hl
+    add     hl, hl                      ; * 32
+    add     hl, de                      ; * 33 (LINK_URL_MAX = 32)
+    ld      de, PendingAreaUrl
+    add     hl, de
+    ex      de, hl                      ; DE = dest
+    ld      hl, HtmlCurHref
+    ld      b, LINK_URL_MAX + 1
+.taCopy:
+    ld      a, [hl]
+    ld      [de], a
+    inc     hl
+    inc     de
+    or      a
+    jr      z, .taDone
+    djnz    .taCopy
+.taDone:
+    ld      a, [PendingAreaCount]
+    inc     a
+    ld      [PendingAreaCount], a
+    ret
+
+; AttachPendingAreas: turn every pending <area> into a LinkTable
+; entry, anchored at the image's on-screen origin (x = HtmlIndent,
+; y = HtmlImgOriginY captured at TagImg entry). Called unconditionally
+; from TagImg's tail: if PendingAreaCount = 0 it's a no-op, which is
+; the normal case for <img>s that aren't image-maps.
+;
+; TODO: the conversion loop below is currently disabled -- it still
+; has a state-corruption bug that inflates LinkCount across page
+; loads. The <map> / <area> / <img usemap> PARSING works end-to-end
+; (verified via PendingAreaCount=1 after an <area> tag), but the
+; attach step scrambles LinkCount in a way I haven't yet tracked
+; down. Until that's diagnosed, <area> rects are captured and
+; silently dropped -- pages render cleanly, hotspots just aren't
+; clickable yet.
+AttachPendingAreas:
+    xor     a
+    ld      [PendingAreaCount], a
+    ret
+    ld      a, [PendingAreaCount]
+    or      a
+    ret     z
+    ld      [ApRemaining], a
+    xor     a
+    ld      [ApIndex], a
+.apLoop:
+    ld      a, [LinkCount]
+    cp      LINK_MAX
+    jp      nc, .apDone                 ; link table full -> drop rest
+
+    ld      a, [ApIndex]
+    ld      e, a
+    ld      d, 0
+
+    ; Compute screen X1 = HtmlIndent + PendingAreaX1[i] (16-bit).
+    ld      hl, PendingAreaX1
+    add     hl, de
+    add     hl, de
+    ld      a, [hl]
+    inc     hl
+    ld      h, [hl]
+    ld      l, a                        ; HL = ax1
+    ld      a, [HtmlIndent]
+    ld      b, 0
+    ld      c, a
+    add     hl, bc                      ; HL = ax1 + indent
+
+    ; Stash as the link's StartX.
+    ld      a, [LinkCount]
+    push    af
+    ld      e, a
+    ld      d, 0
+    push    hl
+    ld      hl, LinkStartX
+    add     hl, de
+    add     hl, de
+    pop     bc                          ; BC = screen x1
+    ld      [hl], c
+    inc     hl
+    ld      [hl], b
+
+    ; Screen Y1 = HtmlImgOriginY + PendingAreaY1[i].
+    ld      a, [ApIndex]
+    ld      e, a
+    ld      d, 0
+    ld      hl, PendingAreaY1
+    add     hl, de
+    ld      a, [hl]
+    ld      b, a                        ; B = ay1
+    ld      a, [HtmlImgOriginY]
+    add     a, b
+    ld      b, a                        ; B = screen y1
+
+    pop     af                          ; A = LinkCount
+    ld      e, a
+    ld      d, 0
+    ld      hl, LinkStartY
+    add     hl, de
+    ld      [hl], b
+
+    ; Screen X2 = HtmlIndent + PendingAreaX2[i] (16-bit).
+    ld      a, [ApIndex]
+    ld      e, a
+    ld      d, 0
+    ld      hl, PendingAreaX2
+    add     hl, de
+    add     hl, de
+    ld      a, [hl]
+    inc     hl
+    ld      h, [hl]
+    ld      l, a
+    ld      a, [HtmlIndent]
+    ld      b, 0
+    ld      c, a
+    add     hl, bc
+
+    ld      a, [LinkCount]
+    push    af
+    ld      e, a
+    ld      d, 0
+    push    hl
+    ld      hl, LinkEndX
+    add     hl, de
+    add     hl, de
+    pop     bc
+    ld      [hl], c
+    inc     hl
+    ld      [hl], b
+
+    ; Screen Y2 = HtmlImgOriginY + PendingAreaY2[i].
+    ld      a, [ApIndex]
+    ld      e, a
+    ld      d, 0
+    ld      hl, PendingAreaY2
+    add     hl, de
+    ld      a, [hl]
+    ld      b, a
+    ld      a, [HtmlImgOriginY]
+    add     a, b
+    ld      b, a
+
+    pop     af                          ; A = LinkCount
+    ld      e, a
+    ld      d, 0
+    ld      hl, LinkEndY
+    add     hl, de
+    ld      [hl], b
+
+    ; Copy the href from PendingAreaUrl[i] into LinkUrls[LinkCount].
+    ; Both use the same per-slot stride (LINK_URL_MAX + 1).
+    ld      a, [ApIndex]
+    call    .apSlotOff                  ; HL = offset into url table
+    ld      de, PendingAreaUrl
+    add     hl, de
+    ld      b, h
+    ld      c, l                        ; BC = source
+
+    ld      a, [LinkCount]
+    call    .apSlotOff                  ; HL = offset for dest
+    ld      de, LinkUrls
+    add     hl, de
+    ex      de, hl                      ; DE = dest
+    ld      h, b
+    ld      l, c                        ; HL = source
+    ld      b, LINK_URL_MAX + 1
+.apCopy:
+    ld      a, [hl]
+    ld      [de], a
+    inc     hl
+    inc     de
+    or      a
+    jr      z, .apCopyDone
+    djnz    .apCopy
+.apCopyDone:
+
+    ld      a, [LinkCount]
+    inc     a
+    ld      [LinkCount], a
+    ld      a, [ApIndex]
+    inc     a
+    ld      [ApIndex], a
+    ld      a, [ApRemaining]
+    dec     a
+    ld      [ApRemaining], a
+    jp      nz, .apLoop
+.apDone:
+    xor     a
+    ld      [PendingAreaCount], a
+    ret
+
+; Helper: A -> HL = A * (LINK_URL_MAX + 1) = A * 33. Matches the
+; stride used by TagA's url copy (see LINK_URL_MAX definition).
+.apSlotOff:
+    ld      l, a
+    ld      h, 0
+    ld      d, h
+    ld      e, l
+    add     hl, hl
+    add     hl, hl
+    add     hl, hl
+    add     hl, hl
+    add     hl, hl                      ; * 32
+    add     hl, de                      ; * 33
+    ret
+
+ApIndex:     db 0
+ApRemaining: db 0
+ApTrace:     db 0
 ExtPcx:          db ".pcx", 0
 ExtBmp:          db ".bmp", 0
 
@@ -7389,6 +7819,10 @@ TagTbl:
     dw  TagBlockquote
     db  "IMG", 0
     dw  TagImg
+    db  "MAP", 0
+    dw  TagMap
+    db  "AREA", 0
+    dw  TagArea
     db  "TABLE", 0
     dw  TagTableTag
     db  "TR", 0
@@ -9691,6 +10125,21 @@ HtmlCurHrefLen: db 0                    ; length of the current href being captu
 HtmlCurHref:    ds LINK_URL_MAX + 1     ; NUL-terminated href of the *open* <a>
 HtmlImgWidth:   dw 0                    ; <img width="…"> in pixels (0 = unset)
 HtmlImgHeight:  dw 0                    ; <img height="…"> in pixels (0 = unset)
+HtmlImgOriginY: db 0                    ; TextY at TagImg entry (image-map origin)
+
+; Image-map scratch. `<map>` begins a block of `<area>` rects; their
+; coords are page-local (relative to the chunk's top-left). When the
+; following `<img>` renders, AttachPendingAreas translates every
+; pending area into a Link table entry anchored at the image's
+; on-screen origin.
+MAP_AREA_MAX    equ 8
+AreaCoords:     dw 0, 0, 0, 0           ; x1, y1, x2, y2 from coords="…"
+PendingAreaCount: db 0
+PendingAreaX1:  ds 2 * MAP_AREA_MAX
+PendingAreaY1:  ds MAP_AREA_MAX
+PendingAreaX2:  ds 2 * MAP_AREA_MAX
+PendingAreaY2:  ds MAP_AREA_MAX
+PendingAreaUrl: ds MAP_AREA_MAX * (LINK_URL_MAX + 1)
 LinkCount:      db 0                    ; number of live link rects
 LinkStartX:     ds 2 * LINK_MAX
 LinkStartY:     ds LINK_MAX
