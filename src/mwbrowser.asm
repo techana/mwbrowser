@@ -1343,6 +1343,27 @@ DrawBitmapReverse:
     jr      nz, .nextRow
     ret
 
+; DrawWidgetGlyph: paint an 8x8 form-widget cell (text-input edge,
+; checkbox, radio button, ...) into VRAM at (B*4, C). Glyph A is the
+; widget id (WG_BOX_L .. WG_RAD_ON). Looks the bitmap up in
+; WidgetBitmaps and tail-calls DrawBitmap. Clobbers AF, DE, HL.
+DrawWidgetGlyph:
+    ; Widget ids are 1-based, so index = id * 2 lands on the right
+    ; word entry (the table starts with a `dw 0` placeholder for id 0
+    ; so we don't have to subtract 1 first).
+    add     a, a                            ; *2 (table holds words)
+    ld      e, a
+    ld      d, 0
+    ld      hl, WidgetBitmaps
+    add     hl, de
+    ld      a, [hl]
+    inc     hl
+    ld      h, [hl]
+    ld      l, a                            ; HL = bitmap pointer
+    ld      d, 2                            ; 2 bytes/row (8 px wide)
+    ld      e, 8                            ; 8 rows tall
+    jr      DrawBitmap
+
 ; DrawBitmap: blit packed Screen-6 bitmap to VRAM at (B*4, C), D bytes * E rows.
 ;   B = byte column (x/4)
 ;   C = first row
@@ -2023,6 +2044,7 @@ PrintFileContent:
     xor     a
     ld      [HtmlInHead], a
     ld      [HtmlInTitle], a
+    ld      [HtmlSkipBody], a
     ld      [HtmlStyleFlags], a
     ld      [HtmlWsPending], a
     ld      a, 1
@@ -2318,6 +2340,13 @@ EmitListBullet:
 ; (via the Arabic shaper). Must preserve nothing.
 EmitSink:
     ld      b, a
+    ; <select> and <textarea> bodies: their text is part of the
+    ; widget's *value* (the option label / initial textarea
+    ; content), not flowing document text. Drop it on the floor.
+    ld      a, [HtmlSkipBody]
+    or      a
+    ld      a, b
+    ret     nz
     ld      a, [HtmlInTitle]
     or      a
     jr      nz, .toTitle
@@ -3229,8 +3258,13 @@ LineDrawCells:
     ld      a, [LineLen]
     cp      b
     jr      nz, .dDraw
-    ; Loop finished: restore HtmlStyleFlags for the parser (EmitRaw etc.)
-    ; and repoint the LUT at whatever colour HtmlFg currently names.
+    ; Loop finished. Run the box-connector post-pass before restoring
+    ; state so any glyphs sitting between WG_BOX_L .. WG_BOX_R cells
+    ; (e.g. a submit button's label "Search") get a continuous black
+    ; top + bottom border painted on top of them. Per-cell drawing
+    ; can't do this because the label glyphs would overpaint the
+    ; M-cells' own border rows with the font's blank top/bottom.
+    call    PaintBoxConnectors
     ld      a, [SavedStyleFlags]
     ld      [HtmlStyleFlags], a
     ld      a, [HtmlFg]
@@ -3292,7 +3326,19 @@ LineDrawCells:
     call    LGet_Glyph                  ; A = glyph
 
     push    bc
+    ; Widget sentinel cells (WG_BOX_L .. WG_RAD_ON, codes 1..7) bypass
+    ; the font lookup and paint a fixed 8x8 bitmap instead. That keeps
+    ; form widgets sharing the line-buffer slot with normal text so
+    ; wrap, alignment, and BiDi all "just work" on lines that mix both.
+    cp      WG_LAST + 1
+    jr      nc, .ldcText
+    or      a
+    jr      z, .ldcText                 ; NUL never reaches here, paranoia
+    call    DrawWidgetGlyph
+    jr      .ldcDrawn
+.ldcText:
     call    DrawCharFast
+.ldcDrawn:
     pop     bc
 
     ld      a, [LineDrawI]
@@ -3304,6 +3350,85 @@ LineStartCol:   db 0
 LineDrawI:      db 0
 SavedStyleFlags: db 0
 LineRightPx:    dw 0                ; pixel past the right edge of current line
+PbcI:           db 0                ; PaintBoxConnectors loop cursor
+PbcL:           db 0                ; PaintBoxConnectors L-cell index
+
+; PaintBoxConnectors: scan the just-drawn line for WG_BOX_L .. WG_BOX_R
+; pairs and paint a continuous black 1-px row at TextY (top) and TextY+7
+; (bottom) spanning the full L..R cell range. Runs after the per-cell
+; render loop so the connector pixels sit on top of any text glyphs that
+; live inside the box (a submit button's label, a select's option text,
+; etc) -- which would otherwise punch white holes through the M cells'
+; built-in border rows because MSX font glyphs leave row 0 / row 7 blank.
+PaintBoxConnectors:
+    xor     a
+    ld      [PbcI], a
+.pbcLoop:
+    ld      a, [LineLen]
+    ld      c, a
+    ld      a, [PbcI]
+    cp      c
+    ret     z
+    call    LGet_Glyph
+    cp      WG_BOX_L
+    jr      z, .pbcSawL
+    ld      a, [PbcI]
+    inc     a
+    ld      [PbcI], a
+    jr      .pbcLoop
+.pbcSawL:
+    ld      a, [PbcI]
+    ld      [PbcL], a
+    inc     a
+    ld      [PbcI], a
+.pbcFindR:
+    ld      a, [LineLen]
+    ld      c, a
+    ld      a, [PbcI]
+    cp      c
+    ret     z                                ; ran off the end -> stop
+    call    LGet_Glyph
+    cp      WG_BOX_R
+    jr      z, .pbcDraw
+    cp      WG_BOX_L
+    jr      z, .pbcSawL                      ; nested L: re-anchor
+    ld      a, [PbcI]
+    inc     a
+    ld      [PbcI], a
+    jr      .pbcFindR
+.pbcDraw:
+    ; width in cells = PbcI - PbcL + 1; * 2 = byte-cols.
+    ld      a, [PbcI]
+    ld      c, a
+    ld      a, [PbcL]
+    sub     c
+    neg
+    inc     a
+    add     a, a
+    ld      d, a                             ; D = width in byte-cols
+    ld      a, [LineStartCol]
+    ld      c, a
+    ld      a, [PbcL]
+    add     a, a
+    add     a, c
+    ld      b, a                             ; B = start byte-col
+    ld      a, [TextY]
+    ld      c, a                             ; C = top row
+    push    bc
+    push    de
+    ld      a, COL_BLACK
+    call    DrawHLine
+    pop     de
+    pop     bc
+    ld      a, [TextY]
+    add     a, 7
+    ld      c, a                             ; C = bottom row
+    ld      a, COL_BLACK
+    call    DrawHLine
+    ld      a, [PbcI]
+    inc     a
+    ld      [PbcI], a
+    jr      .pbcLoop
 FxLinkI:        db 0                ; link iteration index for FixRtlLinkRectsOnLine
 FxOrigStart:    dw 0
 FxOrigEnd:      dw 0
@@ -3697,7 +3822,7 @@ ParseTag:
 
 .nameStart:
     ld      de, HtmlTagName
-    ld      b, 7
+    ld      b, 11                       ; HtmlTagName ds 12 -> 11 chars + NUL
 .copyName:
     ld      a, [hl]
     ; Stop at whitespace or '>'.
@@ -3760,7 +3885,9 @@ ParseTag:
     ret
 
 ; TagNeedsAttrScan: returns A=1 if the current HtmlTagName is "A", "IMG",
-; or "FONT"; A=0 otherwise. Clobbers HL, DE, BC.
+; "FONT", "INPUT", or "ISINDEX" (the tags whose attribute values feed
+; HtmlCurHref / HtmlInputType / HtmlImg* and therefore need ScanHrefAttr
+; before the tag handler runs). A=0 otherwise. Clobbers HL, DE, BC.
 TagNeedsAttrScan:
     ld      hl, HtmlTagName
     ld      a, [hl]
@@ -3770,6 +3897,12 @@ TagNeedsAttrScan:
     call    TnCompare
     ret     nz
     ld      de, TnFONT
+    call    TnCompare
+    ret     nz
+    ld      de, TnINPUT
+    call    TnCompare
+    ret     nz
+    ld      de, TnISINDEX
     call    TnCompare
     ret     nz
     xor     a
@@ -3814,6 +3947,8 @@ TnCompare:
 
 TnIMG:  db "IMG", 0
 TnFONT: db "FONT", 0
+TnINPUT: db "INPUT", 0
+TnISINDEX: db "ISINDEX", 0
 
 ; ScanBlockAttrs: walks HL from first char after the tag name through '>',
 ; looking for align=<value> and dir=<value> (case-insensitive). Parses
@@ -3954,6 +4089,11 @@ ScanHrefAttr:
     ld      [HtmlImgWidth + 1], a       ; 0 = unset (no explicit size)
     ld      [HtmlImgHeight], a
     ld      [HtmlImgHeight + 1], a
+    ; <input> defaults to type=text when no TYPE= attribute is given.
+    ld      a, 'T'
+    ld      [HtmlInputType], a
+    ld      a, 'X'
+    ld      [HtmlInputType + 1], a
 .sh_scan:
     ld      a, [hl]
     cp      '>'
@@ -3981,6 +4121,14 @@ ScanHrefAttr:
     jp      z, .sh_tryWidth
     cp      'W'
     jp      z, .sh_tryWidth
+    cp      'v'
+    jp      z, .sh_tryValue
+    cp      'V'
+    jp      z, .sh_tryValue
+    cp      't'
+    jp      z, .sh_tryType
+    cp      'T'
+    jp      z, .sh_tryType
     inc     hl
     jp      .sh_scan
 
@@ -4216,6 +4364,112 @@ ScanHrefAttr:
 .sh_rnSkipOne:
     inc     hl
     jr      .sh_rnDone
+
+; VALUE= shares the HtmlCurHref slot with HREF/ALT/COLOR (no tag uses
+; more than one of these at a time -- forms use VALUE; <a> uses HREF;
+; <img> uses ALT; <font> uses COLOR).
+.sh_tryValue:
+    push    hl
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'A'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'L'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'U'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'E'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    cp      '='
+    jp      nz, .sh_noMatch
+    inc     hl
+    pop     bc
+    jp      .sh_readValue
+
+; TYPE= captures the first two letters of the value (uppercased) into
+; HtmlInputType so TagInput's dispatcher can branch on them. The full
+; value isn't kept -- HTML 2 input types are all distinguishable from
+; one or two leading letters ('TE'xt, 'PA'ssword, 'SU'bmit, 'CH'eckbox,
+; 'RA'dio, 'RE'set, 'HI'dden, 'IM'age, 'BU'tton).
+.sh_tryType:
+    push    hl
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'Y'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'P'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'E'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    cp      '='
+    jp      nz, .sh_noMatch
+    inc     hl
+    pop     bc
+
+    ; Optional opening quote.
+    ld      b, 0
+    ld      a, [hl]
+    cp      0x22
+    jr      z, .sh_typeQuoted
+    cp      0x27
+    jr      z, .sh_typeQuoted
+    jr      .sh_typeReadChars
+.sh_typeQuoted:
+    ld      b, a
+    inc     hl
+.sh_typeReadChars:
+    ld      a, [hl]
+    and     0xDF
+    ld      [HtmlInputType], a
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    ld      [HtmlInputType + 1], a
+    ; Skip remaining chars of the value up to the next attribute boundary.
+.sh_typeTail:
+    ld      a, [hl]
+    or      a
+    jp      z, .sh_scan
+    cp      '>'
+    jp      z, .sh_scan
+    ld      a, b
+    or      a
+    jr      z, .sh_typeBareEnd
+    ld      a, [hl]
+    cp      b
+    jr      nz, .sh_typeSkip
+    inc     hl
+    jp      .sh_scan
+.sh_typeBareEnd:
+    ld      a, [hl]
+    cp      ' '
+    jp      z, .sh_scan
+    cp      0x09
+    jp      z, .sh_scan
+.sh_typeSkip:
+    inc     hl
+    jr      .sh_typeTail
 
 .sh_tryAlt:
     push    hl
@@ -7929,6 +8183,219 @@ TagA:
     ld      [LinkCount], a
     ret
 
+; ----------------------------------------------------------------------------
+; Form elements (HTML 2). The browser doesn't yet *interact* with form
+; controls -- typing, focus, submission -- but it parses the tags
+; cleanly and renders each control as an inline ASCII placeholder so
+; the page layout reflects the form's structure. Submit-click handling
+; and per-control focus are TODOs.
+; ----------------------------------------------------------------------------
+
+; <form>: no visible chrome of its own; the inputs nested inside do
+; the rendering. Future work: capture action= + method= so a click on
+; an enclosed type="submit" can build the URL-encoded query string.
+TagForm:
+    ret
+
+; <input>: dispatch on HtmlInputType (first two letters of type=,
+; uppercased). Defaults to text when no TYPE was given. Widgets are
+; built from the WG_* sentinel cells (see WidgetBitmaps); the BiDi /
+; wrap pipeline treats them like any other 8-px-wide glyph cell.
+TagInput:
+    ld      a, [HtmlIsClose]
+    or      a
+    ret     nz                          ; <input> is empty; ignore '/'
+    ld      a, [HtmlInputType]
+    cp      'P'
+    jp      z, .inputText               ; password = same shape as text
+    cp      'S'
+    jp      z, .inputSubmit
+    cp      'B'
+    jp      z, .inputSubmit             ; <button> -> render like submit
+    cp      'C'
+    jp      z, .inputCheckbox
+    cp      'R'
+    jp      z, .inputR                  ; radio or reset?
+    cp      'H'
+    jp      z, .inputHidden
+    cp      'I'
+    jp      z, .inputImage
+    ; fall through: type=text (or anything we don't understand)
+.inputText:
+    ; Visible width: SIZE attribute would belong here once parsed; for
+    ; now use TI_TEXT_DEFAULT_W cells of inner space + 2 for the borders.
+    ; The value text is intentionally NOT echoed inside the box -- once
+    ; focus + typing is wired up the live edit buffer will render it,
+    ; and the parsed value will become its initial contents.
+    ld      a, WG_BOX_L
+    call    EmitSink
+    ld      b, TI_TEXT_DEFAULT_W
+.tiBoxLoop:
+    push    bc
+    ld      a, WG_BOX_M
+    call    EmitSink
+    pop     bc
+    djnz    .tiBoxLoop
+    ld      a, WG_BOX_R
+    jp      EmitSink
+
+.inputSubmit:
+    ; Padded "[ Label ]" rectangle. Label text rides on top of the
+    ; WG_BOX_M fill cells; for ASCII glyphs the font's blank top/bottom
+    ; rows leave the box outline intact.
+    ld      a, WG_BOX_L
+    call    EmitSink
+    ld      a, WG_BOX_M
+    call    EmitSink                    ; left-pad space inside the box
+    ld      hl, HtmlCurHref
+    ld      a, [hl]
+    or      a
+    jr      nz, .tisHaveLabel
+    ld      hl, .tisDefault             ; "OK" if no value= given
+.tisHaveLabel:
+    call    EmitSinkZ
+    ld      a, WG_BOX_M
+    call    EmitSink                    ; right-pad
+    ld      a, WG_BOX_R
+    jp      EmitSink
+.tisDefault:    db "OK", 0
+
+.inputCheckbox:
+    ; Stub: always renders unchecked. CHECKED attr parsing is a follow-up.
+    ld      a, WG_CHK_OFF
+    jp      EmitSink
+
+.inputR:
+    ld      a, [HtmlInputType + 1]
+    cp      'A'
+    jr      z, .inputRadio
+    jp      .inputSubmit                ; reset: same visual as submit
+.inputRadio:
+    ld      a, WG_RAD_OFF
+    jp      EmitSink
+
+.inputHidden:
+    ret                                 ; not visible
+
+.inputImage:
+    jp      TagImg                      ; behaves like an inline <img>
+
+; Default visible width (inner cells, exclusive of the L/R borders) for a
+; text or password input that didn't carry SIZE=. Matches the rough look
+; of a typical HTML 2 search box at our 8 px per char metric.
+TI_TEXT_DEFAULT_W equ 18
+
+.inputHidden:
+    ret                                  ; not visible
+
+.inputImage:
+    ; <input type="image" src="..."> -- behaves like an inline image
+    ; that also acts as a submit hotspot. For now, just render the
+    ; image (or its width/height placeholder) by jumping into TagImg.
+    jp      TagImg
+
+; Helper: walk a NUL-terminated string at HL, emitting each byte
+; through EmitSink. Returns when it hits the NUL.
+EmitSinkZ:
+    ld      a, [hl]
+    or      a
+    ret     z
+    push    hl
+    call    EmitSink
+    pop     hl
+    inc     hl
+    jr      EmitSinkZ
+
+; <select>...</select>: render as a text-input-shaped widget.
+; The currently-selected option's text would normally appear inside;
+; for now we render an empty box of TI_SELECT_W cells. OPTION bodies
+; are silenced via HtmlSkipBody so their labels don't bleed into the
+; surrounding document flow.
+TagSelect:
+    ld      a, [HtmlIsClose]
+    or      a
+    jr      nz, .tsClose
+    ld      a, WG_BOX_L
+    call    EmitSink
+    ld      b, TI_SELECT_W
+.tsBoxLoop:
+    push    bc
+    ld      a, WG_BOX_M
+    call    EmitSink
+    pop     bc
+    djnz    .tsBoxLoop
+    ld      a, WG_BOX_R
+    call    EmitSink
+    ld      a, 1
+    ld      [HtmlSkipBody], a
+    ret
+.tsClose:
+    xor     a
+    ld      [HtmlSkipBody], a
+    ret
+
+; Default visible width of a <select> when no SIZE= was given. Same
+; metric as TI_TEXT_DEFAULT_W; broken out so we can tune the two
+; widgets independently once SIZE parsing lands.
+TI_SELECT_W     equ 12
+
+; <option>...</option>: a no-op -- the surrounding <select> has
+; already turned on HtmlSkipBody, so the option's text is silently
+; dropped on its way through EmitSink.
+TagOption:
+    ret
+
+; <textarea>...</textarea>: render as a single-row text-box widget for
+; now. ROWS / COLS parsing + multi-row visual is a follow-up; the
+; existing single-cell-tall renderer keeps it inline with surrounding
+; text. Body text (the initial value) is suppressed via HtmlSkipBody.
+TagTextarea:
+    ld      a, [HtmlIsClose]
+    or      a
+    jr      nz, .ttaClose
+    ld      a, WG_BOX_L
+    call    EmitSink
+    ld      b, TI_TEXT_DEFAULT_W
+.ttaBoxLoop:
+    push    bc
+    ld      a, WG_BOX_M
+    call    EmitSink
+    pop     bc
+    djnz    .ttaBoxLoop
+    ld      a, WG_BOX_R
+    call    EmitSink
+    ld      a, 1
+    ld      [HtmlSkipBody], a
+    ret
+.ttaClose:
+    xor     a
+    ld      [HtmlSkipBody], a
+    ret
+
+; <isindex prompt="..."> renders as the prompt text + a text-input
+; placeholder. HTML 2's standalone search prompt; rare in modern
+; pages but cheap to support.
+TagIsIndex:
+    ld      hl, HtmlCurHref             ; prompt= captured here
+    ld      a, [hl]
+    or      a
+    jr      z, .tisxNoPrompt
+    call    EmitSinkZ
+    ld      a, ' '
+    call    EmitSink
+.tisxNoPrompt:
+    ld      a, WG_BOX_L
+    call    EmitSink
+    ld      b, TI_TEXT_DEFAULT_W
+.tisxBoxLoop:
+    push    bc
+    ld      a, WG_BOX_M
+    call    EmitSink
+    pop     bc
+    djnz    .tisxBoxLoop
+    ld      a, WG_BOX_R
+    jp      EmitSink
+
 ; Tag dispatch table. Names are already uppercased. Aliases share a handler.
 TagTbl:
     db  "HEAD", 0
@@ -8003,6 +8470,18 @@ TagTbl:
     dw  TagTh
     db  "FONT", 0
     dw  TagFont
+    db  "FORM", 0
+    dw  TagForm
+    db  "INPUT", 0
+    dw  TagInput
+    db  "SELECT", 0
+    dw  TagSelect
+    db  "OPTION", 0
+    dw  TagOption
+    db  "TEXTAREA", 0
+    dw  TagTextarea
+    db  "ISINDEX", 0
+    dw  TagIsIndex
     db  0                               ; end marker
 
 ; ----------------------------------------------------------------------------
@@ -10215,6 +10694,114 @@ IconArrowRight:
     db  0x7D, 0x55      ; row 6: same as row 1
     db  0x75, 0x55      ; row 7: same as row 0
 
+; ---------------------------------------------------------------------------
+; Form-widget cell bitmaps. Each is 8x8 px (2 bytes/row * 8 rows = 16 bytes)
+; so they slot into the line-buffer at one CELL each. LineDrawCells'
+; dispatch picks them up when the glyph code is < 0x10 (those bytes never
+; appear as printable ASCII text). Pixel pairs in MSB-first order:
+;   00 = pal0 (mid-grey/dither), 01 = pal1 (lgrey), 10 = pal2 (white),
+;   11 = pal3 (black). 0xAA fills 4 white px, 0xFF fills 4 black px.
+;
+; WG_BOX_L / _M / _R together form a 1-row text-input outline. The middle
+; cell gives the top + bottom horizontals; the L/R cells add the matching
+; vertical sides. Repeat WG_BOX_M for as many cells as the input is wide.
+;
+; WG_CHK_OFF / _ON are stand-alone single-cell checkboxes; same for
+; WG_RAD_OFF / _ON for radio buttons. Tiny 6x6 inset inside the 8x8 cell
+; with a 1-px white margin so neighbouring text doesn't kiss the border.
+; ---------------------------------------------------------------------------
+WG_BOX_L        equ 0x01
+WG_BOX_M        equ 0x02
+WG_BOX_R        equ 0x03
+WG_CHK_OFF      equ 0x04
+WG_CHK_ON       equ 0x05
+WG_RAD_OFF      equ 0x06
+WG_RAD_ON       equ 0x07
+WG_FIRST        equ 0x01
+WG_LAST         equ 0x07
+
+WidgetBoxL:
+    db  0xFF, 0xFF      ; row 0: top border (8 px black)
+    db  0xEA, 0xAA      ; row 1: K W W W W W W W
+    db  0xEA, 0xAA      ; row 2
+    db  0xEA, 0xAA      ; row 3
+    db  0xEA, 0xAA      ; row 4
+    db  0xEA, 0xAA      ; row 5
+    db  0xEA, 0xAA      ; row 6
+    db  0xFF, 0xFF      ; row 7: bottom border
+
+WidgetBoxM:
+    db  0xFF, 0xFF      ; row 0: top border
+    db  0xAA, 0xAA      ; row 1: white interior
+    db  0xAA, 0xAA      ; row 2
+    db  0xAA, 0xAA      ; row 3
+    db  0xAA, 0xAA      ; row 4
+    db  0xAA, 0xAA      ; row 5
+    db  0xAA, 0xAA      ; row 6
+    db  0xFF, 0xFF      ; row 7: bottom border
+
+WidgetBoxR:
+    db  0xFF, 0xFF      ; row 0: top border
+    db  0xAA, 0xAB      ; row 1: W W W W W W W K
+    db  0xAA, 0xAB      ; row 2
+    db  0xAA, 0xAB      ; row 3
+    db  0xAA, 0xAB      ; row 4
+    db  0xAA, 0xAB      ; row 5
+    db  0xAA, 0xAB      ; row 6
+    db  0xFF, 0xFF      ; row 7: bottom border
+
+WidgetChkOff:
+    db  0xAA, 0xAA      ; row 0: blank (top margin)
+    db  0xBF, 0xFE      ; row 1: . K K K K K K .
+    db  0xBA, 0xAE      ; row 2: . K . . . . K .
+    db  0xBA, 0xAE      ; row 3
+    db  0xBA, 0xAE      ; row 4
+    db  0xBA, 0xAE      ; row 5
+    db  0xBF, 0xFE      ; row 6: . K K K K K K .
+    db  0xAA, 0xAA      ; row 7: blank (bottom margin)
+
+WidgetChkOn:
+    db  0xAA, 0xAA      ; row 0
+    db  0xBF, 0xFE      ; row 1: . K K K K K K .
+    db  0xBA, 0xAE      ; row 2: . K . . . . K .
+    db  0xBB, 0xEE      ; row 3: . K . X X . K .
+    db  0xBB, 0xEE      ; row 4: . K . X X . K .
+    db  0xBA, 0xAE      ; row 5: . K . . . . K .
+    db  0xBF, 0xFE      ; row 6: . K K K K K K .
+    db  0xAA, 0xAA      ; row 7
+
+WidgetRadOff:
+    db  0xAF, 0xFA      ; row 0: . . K K K K . .
+    db  0xBA, 0xAE      ; row 1: . K . . . . K .
+    db  0xEA, 0xAB      ; row 2: K . . . . . . K
+    db  0xEA, 0xAB      ; row 3
+    db  0xEA, 0xAB      ; row 4
+    db  0xEA, 0xAB      ; row 5
+    db  0xBA, 0xAE      ; row 6
+    db  0xAF, 0xFA      ; row 7
+
+WidgetRadOn:
+    db  0xAF, 0xFA      ; row 0: . . K K K K . .
+    db  0xBA, 0xAE      ; row 1
+    db  0xEA, 0xAB      ; row 2
+    db  0xEB, 0xEB      ; row 3: K . . X X . . K  -> centre dot
+    db  0xEB, 0xEB      ; row 4
+    db  0xEA, 0xAB      ; row 5
+    db  0xBA, 0xAE      ; row 6
+    db  0xAF, 0xFA      ; row 7
+
+; Lookup table indexed by widget id (1..7). Each entry = pointer to the
+; 16-byte bitmap above. Index 0 (placeholder) is unused.
+WidgetBitmaps:
+    dw  0
+    dw  WidgetBoxL
+    dw  WidgetBoxM
+    dw  WidgetBoxR
+    dw  WidgetChkOff
+    dw  WidgetChkOn
+    dw  WidgetRadOff
+    dw  WidgetRadOn
+
 ; resources/up.png -> 8x5 MSX pixels. DrawDownArrow reuses this by reading
 ; rows in reverse (DrawBitmapReverse), so no separate down-arrow bitmap.
 IconUpArrow:
@@ -10309,6 +10896,18 @@ HtmlImgWidth:   dw 0                    ; <img width="…"> in pixels (0 = unset
 HtmlImgHeight:  dw 0                    ; <img height="…"> in pixels (0 = unset)
 HtmlImgOriginY: db 0                    ; TextY at TagImg entry (image-map origin)
 
+; Form-element scratch. HtmlInputType holds the first two uppercased
+; chars of the most recent <input type="..."> value; TagInput
+; dispatches on those. 'T' = text (default), 'P' = password,
+; 'S' = submit, 'C' = checkbox, 'RA' = radio, 'RE' = reset,
+; 'H' = hidden, 'I' = image, 'B' = button (rendered as submit).
+HtmlInputType:  db 'T', 'X'             ; default = text
+; HtmlSkipBody is non-zero between <select>...</select> and
+; <textarea>...</textarea>; EmitSink drops everything written while
+; it's set, so OPTION text and TEXTAREA initial content don't bleed
+; into the document flow as plain text.
+HtmlSkipBody:   db 0
+
 ; Image-map scratch. `<map>` begins a block of `<area>` rects; their
 ; coords are page-local (relative to the chunk's top-left). When the
 ; following `<img>` renders, AttachPendingAreas translates every
@@ -10329,7 +10928,7 @@ LinkEndX:       ds 2 * LINK_MAX
 LinkEndY:       ds LINK_MAX
 LinkUrls:       ds (LINK_URL_MAX + 1) * LINK_MAX
 HtmlTitleBuf:   ds TITLE_BUF_MAX + 1    ; NUL-terminated
-HtmlTagName:    ds 8                    ; up to 7 chars + NUL
+HtmlTagName:    ds 12                   ; up to 11 chars + NUL (TEXTAREA = 8)
 HtmlEntityName: ds 6                    ; up to 5 chars + NUL
 FastCgSlot:     db 0                    ; cached CGPNT[0] for ExtractFont
 
