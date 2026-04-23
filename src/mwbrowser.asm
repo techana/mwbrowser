@@ -3892,6 +3892,10 @@ ScanHrefAttr:
     ld      [HtmlCurHref], a            ; default = empty string
     ld      [HtmlCurSrcPtr], a
     ld      [HtmlCurSrcPtr + 1], a      ; SRC pointer starts NULL
+    ld      [HtmlImgWidth], a
+    ld      [HtmlImgWidth + 1], a       ; 0 = unset (no explicit size)
+    ld      [HtmlImgHeight], a
+    ld      [HtmlImgHeight + 1], a
 .sh_scan:
     ld      a, [hl]
     cp      '>'
@@ -3915,6 +3919,10 @@ ScanHrefAttr:
     jp      z, .sh_trySrc
     cp      'S'
     jp      z, .sh_trySrc
+    cp      'w'
+    jp      z, .sh_tryWidth
+    cp      'W'
+    jp      z, .sh_tryWidth
     inc     hl
     jp      .sh_scan
 
@@ -3973,29 +3981,183 @@ ScanHrefAttr:
     jp      .sh_scan
 
 .sh_tryHref:
+    ; H starts both HREF (<a>) and HEIGHT (<img>). Try HREF first;
+    ; on any mismatch roll HL back and retry as HEIGHT before giving up.
     push    hl
     inc     hl
     ld      a, [hl]
     and     0xDF
     cp      'R'
-    jr      nz, .sh_noMatch
+    jp      nz, .sh_tryHeight
     inc     hl
     ld      a, [hl]
     and     0xDF
     cp      'E'
-    jr      nz, .sh_noMatch
+    jp      nz, .sh_tryHeight
     inc     hl
     ld      a, [hl]
     and     0xDF
     cp      'F'
-    jr      nz, .sh_noMatch
+    jp      nz, .sh_tryHeight
     inc     hl
     ld      a, [hl]
     cp      '='
-    jr      nz, .sh_noMatch
+    jp      nz, .sh_tryHeight
     inc     hl
     pop     bc
-    jr      .sh_readValue
+    jp      .sh_readValue
+
+.sh_tryHeight:
+    ; HL was pushed at .sh_tryHref entry; restore it and rescan from
+    ; the H for an "EIGHT=" match. DE = HtmlImgHeight (the 16-bit
+    ; target for .sh_readNumber).
+    pop     hl
+    push    hl
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'E'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'I'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'G'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'H'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'T'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    cp      '='
+    jp      nz, .sh_noMatch
+    inc     hl
+    pop     bc
+    ld      de, HtmlImgHeight
+    jp      .sh_readNumber
+
+.sh_tryWidth:
+    push    hl
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'I'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'D'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'T'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'H'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    cp      '='
+    jp      nz, .sh_noMatch
+    inc     hl
+    pop     bc
+    ld      de, HtmlImgWidth
+    ; fall through to .sh_readNumber
+
+; .sh_readNumber: DE -> 16-bit target, HL at first char of value. Parses
+; a (optionally-quoted) decimal integer, stores it at [DE], then
+; rejoins the main scan so sibling attributes (e.g. ALT=) still get
+; captured. Stops at the first non-digit. Quoted values skip the
+; remaining chars up to the closing quote; bare values stop at
+; whitespace / '>' / '/'.
+.sh_readNumber:
+    ld      b, 0                        ; B = active delimiter (0 = bare)
+    ld      a, [hl]
+    cp      0x22
+    jr      z, .sh_rnQuot
+    cp      0x27
+    jr      z, .sh_rnQuot
+    jr      .sh_rnDigit
+.sh_rnQuot:
+    ld      b, a
+    inc     hl
+.sh_rnDigit:
+    ld      a, [hl]
+    sub     '0'
+    cp      10
+    jr      nc, .sh_rnDone              ; non-digit -> stop
+    ld      c, a                        ; C = digit
+    push    hl
+    push    bc                          ; preserve digit (C) + delim (B)
+    ld      a, [de]
+    ld      l, a
+    inc     de
+    ld      a, [de]
+    ld      h, a
+    dec     de                          ; HL = current value at [DE]
+    add     hl, hl                      ; *2
+    ld      b, h
+    ld      c, l                        ; BC = *2 (scratch, clobbers digit)
+    add     hl, hl                      ; *4
+    add     hl, hl                      ; *8
+    add     hl, bc                      ; *10
+    pop     bc                          ; restore digit in C
+    ld      a, l
+    add     a, c                        ; + digit
+    ld      l, a
+    ld      a, h
+    adc     a, 0
+    ld      h, a
+    ld      a, l
+    ld      [de], a
+    inc     de
+    ld      a, h
+    ld      [de], a
+    dec     de                          ; [DE] := new value
+    pop     hl
+    inc     hl
+    jr      .sh_rnDigit
+.sh_rnDone:
+    ; Skip to next attribute boundary: ws / quote / '>'. Then rejoin
+    ; .sh_scan so HREF= / ALT= / COLOR= on the same tag still get
+    ; captured (width/height don't replace those).
+    ld      a, [hl]
+    cp      '>'
+    jp      z, .sh_scan
+    or      a
+    jp      z, .sh_scan                 ; safety: end-of-buffer
+    ld      c, a
+    ld      a, b
+    or      a
+    jr      z, .sh_rnBareEnd
+    ld      a, c
+    cp      b
+    jr      nz, .sh_rnSkipOne
+    inc     hl                          ; consume closing quote
+    jp      .sh_scan
+.sh_rnBareEnd:
+    ld      a, c
+    cp      ' '
+    jp      z, .sh_scan
+    cp      0x09
+    jp      z, .sh_scan
+.sh_rnSkipOne:
+    inc     hl
+    jr      .sh_rnDone
 
 .sh_tryAlt:
     push    hl
@@ -4431,8 +4593,24 @@ TagImg:
     ret     c
 
     ; No supported format or file couldn't be opened -> placeholder.
+    ; If the tag carried both width=X and height=Y, reserve an empty
+    ; bordered rectangle of that size so the surrounding layout stays
+    ; stable. Otherwise fall through to the text "[alt]" placeholder.
 
 .altFallback:
+    ld      a, [HtmlImgWidth]
+    ld      b, a
+    ld      a, [HtmlImgWidth + 1]
+    or      b
+    jp      z, .altText
+    ld      a, [HtmlImgHeight]
+    ld      b, a
+    ld      a, [HtmlImgHeight + 1]
+    or      b
+    jp      z, .altText
+    jp      RenderMissingImgBox
+
+.altText:
     ld      a, '['
     call    EmitSink
     ld      a, [HtmlCurHref]
@@ -5775,6 +5953,150 @@ RemapByte:
     add     hl, de
     ld      a, [hl]
     ret
+
+; RenderMissingImgBox: draw an empty reserved rectangle of HtmlImgWidth
+; x HtmlImgHeight pixels at the current cursor. Called from TagImg's
+; altFallback when both dimensions were given on the tag -- the goal
+; is to keep page layout stable when an <img> can't be fetched, so
+; the surrounding text doesn't reflow around the hole. Width is
+; clamped to the content area; height is clamped to the remaining
+; viewport so an oversize author value can't run into the scrollbar
+; or below-fold. Bookkeeping mirrors RenderSc6File's fast-path:
+;   - HtmlLineCount gains ceil(height / 8)
+;   - HtmlLineSkip burns image_lines on a scrolled above-fold pass
+;   - TextY advances past the box on a normal pass
+; Always returns CF=1 so TagImg treats the box as a handled image.
+RenderMissingImgBox:
+    ld      hl, [HtmlImgWidth]
+    ld      de, CONTENT_X_END + 1
+    and     a
+    sbc     hl, de
+    jr      c, .rmbWOk
+    ld      hl, CONTENT_X_END + 1
+    ld      [HtmlImgWidth], hl
+.rmbWOk:
+    ; Width px -> byte cols (/4, round up).
+    ld      hl, [HtmlImgWidth]
+    ld      a, l
+    and     3
+    jr      z, .rmbWByteA
+    ld      bc, 4
+    add     hl, bc
+.rmbWByteA:
+    srl     h
+    rr      l
+    srl     h
+    rr      l                           ; HL = width in byte-cols
+    ld      a, l
+    ld      [RmbWBytes], a
+
+    ; Clamp height to remaining viewport.
+    ld      hl, [HtmlImgHeight]
+    ld      a, h
+    or      a
+    jr      nz, .rmbHClamp
+    ld      a, l
+    or      a
+    jp      z, .rmbDone                 ; 0 px height -> nothing to draw
+    ld      c, a
+    jr      .rmbHMaybe
+.rmbHClamp:
+    ld      c, CONTENT_Y1 - CONTENT_Y0 + 1
+.rmbHMaybe:
+    ld      a, [TextY]
+    ld      b, a
+    ld      a, CONTENT_Y1 + 1
+    sub     b
+    jr      c, .rmbHZero
+    cp      c
+    jr      nc, .rmbHOk
+    ld      c, a
+.rmbHOk:
+    ld      a, c
+    ld      [RmbHPixels], a
+
+    ; image_lines = ceil(height / 8) for HtmlLineCount / Skip math.
+    add     a, 7
+    jr      c, .rmbLinesSat
+    srl     a
+    srl     a
+    srl     a
+    jr      .rmbLinesStore
+.rmbLinesSat:
+    ld      a, 255
+.rmbLinesStore:
+    or      a
+    jr      nz, .rmbLinesNonZero
+    ld      a, 1
+.rmbLinesNonZero:
+    ld      [RmbImgLines], a
+
+    call    ArFlush
+    call    LineFlush
+
+    ld      a, [RmbImgLines]
+    ld      c, a
+    ld      b, 0
+    ld      hl, [HtmlLineCount]
+    add     hl, bc
+    jr      nc, .rmbLCStore
+    ld      hl, 0xFFFF
+.rmbLCStore:
+    ld      [HtmlLineCount], hl
+
+    ; Case A: scrolled pass, box entirely above the fold -> skip draw.
+    ld      hl, [HtmlLineSkip]
+    ld      a, h
+    or      l
+    jr      z, .rmbDraw
+    ld      a, [RmbImgLines]
+    ld      c, a
+    ld      b, 0
+    and     a
+    sbc     hl, bc
+    jr      c, .rmbDraw                 ; straddles fold -> draw
+    ld      [HtmlLineSkip], hl
+    jr      .rmbDone
+
+.rmbDraw:
+    ; 1-px black border outline at (x=HtmlIndent/4, y=TextY, w,h).
+    ld      a, [HtmlIndent]
+    srl     a
+    srl     a
+    ld      b, a
+    ld      a, [TextY]
+    ld      c, a
+    ld      a, [RmbWBytes]
+    ld      d, a
+    ld      a, [RmbHPixels]
+    ld      e, a
+    ld      a, 3                        ; palette 3 = black
+    call    DrawRectBorder
+
+    ld      a, [RmbHPixels]
+    ld      b, a
+    ld      a, [TextY]
+    add     a, b
+    jr      c, .rmbTyCap
+    cp      CONTENT_Y1 + 1
+    jr      c, .rmbTyStore
+.rmbTyCap:
+    ld      a, CONTENT_Y1 + 1
+.rmbTyStore:
+    ld      [TextY], a
+
+.rmbDone:
+    scf
+    ret
+
+.rmbHZero:
+    xor     a
+    ld      [RmbHPixels], a
+    jr      .rmbDone
+
+RmbWBytes:      db 0
+RmbHPixels:     db 0
+RmbImgLines:    db 0
 
 ; Minimal "file not found" message drawn directly into the content
 ; area when a local file fails to load. URL loads that fail come back
@@ -9321,6 +9643,8 @@ HtmlFgDepth:    db 0                    ; current <font> nesting depth
 CurrentFontLUT: dw FontLUT              ; pointer to active LUT (updated by <font>)
 HtmlCurHrefLen: db 0                    ; length of the current href being captured
 HtmlCurHref:    ds LINK_URL_MAX + 1     ; NUL-terminated href of the *open* <a>
+HtmlImgWidth:   dw 0                    ; <img width="…"> in pixels (0 = unset)
+HtmlImgHeight:  dw 0                    ; <img height="…"> in pixels (0 = unset)
 LinkCount:      db 0                    ; number of live link rects
 LinkStartX:     ds 2 * LINK_MAX
 LinkStartY:     ds LINK_MAX
