@@ -2623,6 +2623,13 @@ LoadFile:
 
 ; ClearContentArea: white fill of content region (x=0..495, y=29..211).
 ClearContentArea:
+    ; Wiping VRAM invalidates the "image bytes still there" assumption
+    ; TagImgBody makes on in-place re-renders. Drop the flag so the
+    ; next render path actually repaints images. Fresh loads, scroll,
+    ; and history nav all call here before PrintFileContent, so this
+    ; one place covers them all.
+    xor     a
+    ld      [InPlaceRender], a
     ld      b, 0
     ld      c, CONTENT_Y0
     ld      d, (CONTENT_X_END + 1) / 4
@@ -5887,13 +5894,15 @@ TagImg:
     jp      AttachPendingAreas          ; tail call -> RET
 
 TagImgBody:
-    ; Sticky re-render (e.g. Tab changed focus, keystroke repainted
-    ; widgets): the image is already on VRAM from the first render.
-    ; Skip the fetch/decode entirely and just reserve the same layout
-    ; rectangle so TextY / HtmlLineCount / ScrollLine land where the
-    ; original render left them. Requires width+height on the tag,
-    ; which the bridge always rewrites into imNN.pcx handles for us.
-    ld      a, [FormSticky]
+    ; In-place re-render (Tab focus change, keystroke widget repaint):
+    ; VRAM wasn't cleared, so the image bytes are still where the first
+    ; render left them. Skip the fetch/decode and just reserve the
+    ; same layout rectangle so TextY / HtmlLineCount / ScrollLine land
+    ; where they did before. RefreshAfterScroll clears InPlaceRender
+    ; first because ClearContentArea wipes the image -- we need a real
+    ; repaint in that case. Requires width+height on the tag, which the
+    ; bridge always rewrites into imNN.pcx handles for us.
+    ld      a, [InPlaceRender]
     or      a
     jr      z, .tibFresh
     ld      a, [HtmlImgWidth]
@@ -11173,7 +11182,7 @@ HistoryUpdateFlags:
 RefreshAfterScroll:
     call    ComputeThumb
     call    DrawScrollbar
-    call    ClearContentArea
+    call    ClearContentArea            ; also drops InPlaceRender
     jp      PrintFileContent
 
 ; RefreshContentInPlace: re-paint the content area WITHOUT clearing it
@@ -11183,8 +11192,19 @@ RefreshAfterScroll:
 ; produces. The new render's own widget cells overpaint the old pixel
 ; values, including erasing the trailing column when a backspace
 ; shrinks a value (M-cell interior is white).
+;
+; Setting InPlaceRender=1 tells TagImgBody the image bytes are still on
+; VRAM from the previous render, so it can skip the bridge fetch and
+; just reserve layout. RefreshAfterScroll clears this again because the
+; ClearContentArea wipe erases the image.
 RefreshContentInPlace:
+    ld      a, 1
+    ld      [InPlaceRender], a
     jp      PrintFileContent
+
+InPlaceRender:  db 0                    ; 1 = current render can skip redraws
+                                        ; that the previous pass already left on
+                                        ; VRAM (e.g. image bitmaps).
 
 ; ScrollUp: decrement ScrollLine if > 0, refresh.
 ScrollUp:
