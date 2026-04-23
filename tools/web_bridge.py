@@ -82,17 +82,21 @@ def _int_or_none(m):
 def _resize_for_msx(im: "Image.Image",
                     declared_w: "int | None",
                     declared_h: "int | None") -> "Image.Image":
-    """Pick a target size for the PCX we'll ship. The MSX browser
-    renders the PCX at the PCX header's own (xmax, ymax), so the size
-    here is the size the author will see on screen.
+    """Pick a target size for the PCX we'll ship. MSX Screen 6 has a
+    2:1 pixel aspect ratio -- one logical pixel is twice as tall as
+    it is wide -- so to keep the image looking proportional we halve
+    the on-screen row count before encoding. The browser just paints
+    each packed row once and you end up with the right shape.
 
     Priority:
-      1. Honour declared <img width=x height=y> if both given.
-      2. Otherwise keep the source's native size, capped to the
-         MSX content area (492 x 183) with aspect preserved.
+      1. Honour declared <img width=x height=y> if both given
+         (then halve height for the 2:1 correction).
+      2. Otherwise keep the source's native size, capped to the MSX
+         content area (492 logical wide x 2*183 = 366 source rows
+         before the halving), with aspect preserved.
 
-    Width is always rounded up to a multiple of 4 so Screen-6's
-    byte-aligned row stride works out evenly."""
+    Width is rounded up to a multiple of 4 so Screen-6's byte-aligned
+    row stride works out evenly."""
     src_w, src_h = im.size
     MAX_W = 492
     MAX_H = 183
@@ -101,12 +105,19 @@ def _resize_for_msx(im: "Image.Image",
         tgt_w, tgt_h = declared_w, declared_h
     else:
         tgt_w, tgt_h = src_w, src_h
+        # Treat the source as square-pixeled; we'll halve height at the
+        # end, so the "virtual" vertical budget is 2 * MAX_H.
         if tgt_w > MAX_W:
             tgt_h = max(1, round(tgt_h * MAX_W / tgt_w))
             tgt_w = MAX_W
-        if tgt_h > MAX_H:
-            tgt_w = max(1, round(tgt_w * MAX_H / tgt_h))
-            tgt_h = MAX_H
+        vh_budget = MAX_H * 2
+        if tgt_h > vh_budget:
+            tgt_w = max(1, round(tgt_w * vh_budget / tgt_h))
+            tgt_h = vh_budget
+
+    # MSX pixel aspect: halve height so the image is tall-wise
+    # proportional on screen.
+    tgt_h = max(1, tgt_h // 2)
 
     # Cap + 4-px-align the width.
     tgt_w = min(MAX_W, max(4, tgt_w))
