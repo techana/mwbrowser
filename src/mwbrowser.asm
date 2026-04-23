@@ -561,8 +561,13 @@ DftSlot:        db 0
 DoFormClearRadioGroup:
     ld      a, [DftSlot]
     call    FormGetNamePtr
-    ; Stash that name pointer for the inner-loop comparisons.
-    ld      [DfcrNamePtr], hl
+    ; Stash that name pointer for the inner-loop comparisons. Use
+    ; explicit byte stores -- SjASMPlus's `ld [addr], hl` shorthand
+    ; was producing wrong opcodes that scribbled into FormScreenX.
+    ld      a, l
+    ld      [DfcrNamePtr], a
+    ld      a, h
+    ld      [DfcrNamePtr + 1], a
     ld      a, [FormCount]
     or      a
     ret     z
@@ -580,7 +585,10 @@ DoFormClearRadioGroup:
     jr      nz, .dfcrSkip               ; only radios in group
     ld      a, c
     call    FormGetNamePtr              ; HL -> this slot's name
-    ld      de, [DfcrNamePtr]
+    ld      a, [DfcrNamePtr]
+    ld      e, a
+    ld      a, [DfcrNamePtr + 1]
+    ld      d, a
     call    FormStrEq
     or      a
     jr      z, .dfcrSkip                ; different name
@@ -5445,7 +5453,7 @@ TagTitle:
 .close:
     xor     a
     ld      [HtmlInTitle], a
-    ; NUL-terminate captured title and repaint the titlebar.
+    ; NUL-terminate captured title.
     ld      a, [HtmlTitleLen]
     ld      e, a
     ld      d, 0
@@ -5455,6 +5463,13 @@ TagTitle:
     ld      [hl], a
     ld      a, 1
     ld      [HtmlTitleSeen], a
+    ; Re-render of the same page (FormSticky=1) doesn't change the
+    ; title, so skip the chrome repaint -- the previous DrawTitleLabel
+    ; call's pixels are still on screen, and re-drawing them on every
+    ; keystroke produced a visible flash.
+    ld      a, [FormSticky]
+    or      a
+    ret     nz
     jp      DrawTitleLabel
 
 ; <ul>: bullet list. Open indents by 16 px and switches bullet style.
@@ -8808,6 +8823,9 @@ TagInput:
     ; this routine; reading FormCount-1 later would be wrong on sticky
     ; re-renders (FormCount stays at the total, not "slots so far").
     ld      [.tiSlot], a
+    push    af
+    call    nc, FormCaptureRect
+    pop     af
     ; Focus check: is this slot the focused one?
     ld      b, a
     ld      a, [HtmlFormFocus]
@@ -8877,7 +8895,9 @@ TagInput:
     jr      z, .tiEmitR
     ld      a, WG_BOX_RF
 .tiEmitR:
-    jp      EmitSink
+    call    EmitSink
+    ld      a, [.tiSlot]
+    jp      FormFinishRect
 
 .tiFocusFlag:    db 0
 .tiSlot:         db 0
@@ -8888,12 +8908,32 @@ TagInput:
     call    nc, FormStoreFromSlotA
     pop     af
     ld      [.tisSlot], a
-    ; Capture pre-emit rect so click hit-test can find the button.
     call    FormCaptureRect
+    ; Decide focused vs unfocused for L/M/R. Reload slot index from
+    ; .tisSlot because FormCaptureRect doesn't preserve A.
+    ld      a, [.tisSlot]
+    ld      b, a
+    ld      a, [HtmlFormFocus]
+    cp      b
+    ld      a, 0
+    jr      nz, .tisFlagStored
+    ld      a, 1
+.tisFlagStored:
+    ld      [.tisFocusFlag], a
+    ld      a, [.tisFocusFlag]
+    or      a
     ld      a, WG_BOX_L
+    jr      z, .tisEmitL
+    ld      a, WG_BOX_LF
+.tisEmitL:
     call    EmitSink
+    ld      a, [.tisFocusFlag]
+    or      a
     ld      a, WG_BOX_M
-    call    EmitSink                    ; left-pad space inside the box
+    jr      z, .tisEmitMl
+    ld      a, WG_BOX_MF
+.tisEmitMl:
+    call    EmitSink                    ; left-pad
     ld      hl, HtmlCurHref
     ld      a, [hl]
     or      a
@@ -8901,15 +8941,25 @@ TagInput:
     ld      hl, .tisDefault             ; "OK" if no value= given
 .tisHaveLabel:
     call    EmitSinkZ
+    ld      a, [.tisFocusFlag]
+    or      a
     ld      a, WG_BOX_M
+    jr      z, .tisEmitMr
+    ld      a, WG_BOX_MF
+.tisEmitMr:
     call    EmitSink                    ; right-pad
+    ld      a, [.tisFocusFlag]
+    or      a
     ld      a, WG_BOX_R
+    jr      z, .tisEmitR
+    ld      a, WG_BOX_RF
+.tisEmitR:
     call    EmitSink
-    ; All cells emitted -- write final width.
     ld      a, [.tisSlot]
     jp      FormFinishRect
 .tisDefault:    db "OK", 0
 .tisSlot:       db 0
+.tisFocusFlag:  db 0
 
 .inputCheckbox:
     call    FormAllocCurrent
@@ -8917,22 +8967,34 @@ TagInput:
     call    nc, FormStoreFromSlotA
     pop     af
     push    af
-    ; Capture this slot's screen rect so click hit-testing can reach
-    ; the checkbox. Width is finished after EmitSink.
     call    nc, FormCaptureRect
     pop     af
     push    af
-    ; Read the slot's value (empty = off, non-empty = on). Falls back
-    ; to "off" when no slot was allocated.
     jr      c, .icbOff
+    ; Decide ON vs OFF from the slot's value.
     call    FormGetValuePtr
     ld      a, [hl]
     or      a
     jr      z, .icbOff
+    ; ON; check focus to pick focused vs unfocused variant.
+    pop     af
+    push    af
+    ld      b, a                        ; B = slot
+    ld      a, [HtmlFormFocus]
+    cp      b
     ld      a, WG_CHK_ON
+    jr      nz, .icbEmit
+    ld      a, WG_CHK_ONF
     jr      .icbEmit
 .icbOff:
+    pop     af
+    push    af
+    ld      b, a
+    ld      a, [HtmlFormFocus]
+    cp      b
     ld      a, WG_CHK_OFF
+    jr      nz, .icbEmit
+    ld      a, WG_CHK_OFFF
 .icbEmit:
     call    EmitSink
     pop     af
@@ -8958,10 +9020,24 @@ TagInput:
     ld      a, [hl]
     or      a
     jr      z, .irOff
+    pop     af
+    push    af
+    ld      b, a
+    ld      a, [HtmlFormFocus]
+    cp      b
     ld      a, WG_RAD_ON
+    jr      nz, .irEmit
+    ld      a, WG_RAD_ONF
     jr      .irEmit
 .irOff:
+    pop     af
+    push    af
+    ld      b, a
+    ld      a, [HtmlFormFocus]
+    cp      b
     ld      a, WG_RAD_OFF
+    jr      nz, .irEmit
+    ld      a, WG_RAD_OFFF
 .irEmit:
     call    EmitSink
     pop     af
@@ -12027,8 +12103,12 @@ WG_SEL_ARROW    equ 0x08                    ; down-pointing dropdown indicator
 WG_BOX_LF       equ 0x09                    ; focused-input variants: black
 WG_BOX_MF       equ 0x0A                    ; border instead of dgray
 WG_BOX_RF       equ 0x0B
+WG_CHK_OFFF     equ 0x0C                    ; focused checkbox variants
+WG_CHK_ONF      equ 0x0D
+WG_RAD_OFFF     equ 0x0E                    ; focused radio variants
+WG_RAD_ONF      equ 0x0F
 WG_FIRST        equ 0x01
-WG_LAST         equ 0x0B
+WG_LAST         equ 0x0F
 
 WG_HEIGHT       equ 14
 WG_Y_RAISE      equ 3                       ; widget top sits this many px above TextY
@@ -12222,6 +12302,74 @@ WidgetBoxRF:
     db  0xAA, 0xAB      ; row 12
     db  0xFF, 0xFF      ; row 13
 
+; Focused-checkbox / focused-radio variants -- same shapes as the
+; unfocused ones, but border / outline colour is black (3) instead of
+; dgray (0). Tab focus then highlights the active widget without needing
+; a separate post-pass to draw an outline.
+WidgetChkOffF:
+    db  0xAA, 0xAA      ; row 0
+    db  0xBF, 0xFE      ; row 1:  W K K K K K K W  (top border)
+    db  0xBA, 0xAE      ; row 2:  W K W W W W K W  (vertical sides)
+    db  0xBA, 0xAE      ; row 3
+    db  0xBA, 0xAE      ; row 4
+    db  0xBA, 0xAE      ; row 5
+    db  0xBA, 0xAE      ; row 6
+    db  0xBA, 0xAE      ; row 7
+    db  0xBA, 0xAE      ; row 8
+    db  0xBA, 0xAE      ; row 9
+    db  0xBA, 0xAE      ; row 10
+    db  0xBA, 0xAE      ; row 11
+    db  0xBF, 0xFE      ; row 12: bottom border
+    db  0xAA, 0xAA      ; row 13
+
+WidgetChkOnF:
+    db  0xAA, 0xAA      ; row 0
+    db  0xBF, 0xFE      ; row 1:  top border
+    db  0xBA, 0xAE      ; row 2:  sides only
+    db  0xBB, 0xEE      ; row 3:  W K W K K W K W  (sides + inner bar)
+    db  0xBB, 0xEE      ; row 4
+    db  0xBB, 0xEE      ; row 5
+    db  0xBB, 0xEE      ; row 6
+    db  0xBB, 0xEE      ; row 7
+    db  0xBB, 0xEE      ; row 8
+    db  0xBB, 0xEE      ; row 9
+    db  0xBB, 0xEE      ; row 10
+    db  0xBA, 0xAE      ; row 11
+    db  0xBF, 0xFE      ; row 12
+    db  0xAA, 0xAA      ; row 13
+
+WidgetRadOffF:
+    db  0xAA, 0xAA      ; row 0
+    db  0xAF, 0xFA      ; row 1:  W W K K K K W W  (top arc)
+    db  0xAE, 0xBA      ; row 2:  W W K W W K W W
+    db  0xBA, 0xAE      ; row 3:  W K W W W W K W
+    db  0xBA, 0xAE      ; row 4
+    db  0xBA, 0xAE      ; row 5
+    db  0xBA, 0xAE      ; row 6
+    db  0xBA, 0xAE      ; row 7
+    db  0xBA, 0xAE      ; row 8
+    db  0xBA, 0xAE      ; row 9
+    db  0xBA, 0xAE      ; row 10
+    db  0xAE, 0xBA      ; row 11
+    db  0xAF, 0xFA      ; row 12
+    db  0xAA, 0xAA      ; row 13
+
+WidgetRadOnF:
+    db  0xAA, 0xAA      ; row 0
+    db  0xAF, 0xFA      ; row 1
+    db  0xAE, 0xBA      ; row 2
+    db  0xBA, 0xAE      ; row 3
+    db  0xBA, 0xAE      ; row 4
+    db  0xBF, 0xFE      ; row 5:  W K K K K K K W  (blob top)
+    db  0xBF, 0xFE      ; row 6
+    db  0xBF, 0xFE      ; row 7
+    db  0xBF, 0xFE      ; row 8
+    db  0xBF, 0xFE      ; row 9:  blob bottom
+    db  0xBA, 0xAE      ; row 10
+    db  0xAE, 0xBA      ; row 11
+    db  0xAF, 0xFA      ; row 12
+    db  0xAA, 0xAA      ; row 13
+
 ; Down-pointing arrow used as the dropdown indicator on the right edge
 ; of <select>. Carries the M-cell top + bottom border rows so the box's
 ; outline stays continuous if PaintBoxConnectors is ever skipped; the
@@ -12257,6 +12405,10 @@ WidgetBitmaps:
     dw  WidgetBoxLF
     dw  WidgetBoxMF
     dw  WidgetBoxRF
+    dw  WidgetChkOffF
+    dw  WidgetChkOnF
+    dw  WidgetRadOffF
+    dw  WidgetRadOnF
 
 ; resources/up.png -> 8x5 MSX pixels. DrawDownArrow reuses this by reading
 ; rows in reverse (DrawBitmapReverse), so no separate down-arrow bitmap.
