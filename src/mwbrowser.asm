@@ -640,7 +640,14 @@ DoFormBackspace:
     ld      a, [DftLen]
     dec     a
     ld      [DftLen], a
-    ld      a, WG_BOX_M
+    ; The freed cell needs the focused-variant M (black border) when
+    ; the slot is focused, else plain dgray M -- without this the
+    ; black focus frame gets a gray gap exactly where the char used
+    ; to be.
+    ld      a, WG_BOX_MF                 ; focused (text/pass ALWAYS focused here:
+                                         ; Backspace only reaches DoFormBackspace via
+                                         ; OnContent's typing dispatch, which only
+                                         ; fires when HtmlFormFocus points at our slot).
     call    FormPaintCharAtEnd
     jp      MainLoop
 
@@ -11464,6 +11471,18 @@ ClickContent:
     ; otherwise focus the content area so scroll keys work.
     call    TryFormClick                ; returns/jumps away on hit
     call    TryLinkClick                ; navigates + returns if hit
+    ; No widget / link under the cursor: this is a "click empty space"
+    ; gesture. Drop the form-focus so Space / arrows go back to page
+    ; scrolling instead of typing into whatever field Tab last
+    ; parked on. Re-render so the previously-focused widget drops its
+    ; black border.
+    ld      a, [HtmlFormFocus]
+    cp      0xFF
+    jr      z, .ccNoFormToDrop
+    ld      a, 0xFF
+    ld      [HtmlFormFocus], a
+    call    RefreshContentInPlace
+.ccNoFormToDrop:
     ld      a, FOC_CONTENT
     ld      [Focus], a
     jp      PaintToolbar
