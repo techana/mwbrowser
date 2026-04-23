@@ -33,11 +33,30 @@ BDOS_CONOUT equ 0x02                ; E = char
 BDOS_DIRIO  equ 0x06                ; E = 0xFF: read kb (no-wait), else write E
 BDOS_EXIT   equ 0x00
 
-            .MSXDOS                     ; asMSX: produce .COM output
-            .bios                       ;   (matches src/mwbrowser.asm's header)
-            org 0x0100
+EOT_BYTE    equ 0x04                ; end-of-transmission marker; host sends
+                                    ; this at the end of a payload, MSX
+                                    ; prints a "[EOT: N bytes]" status line.
+
+            DEVICE NOSLOT64K        ; SjASMPlus: full 64 KB address space
+            ORG 0x0100              ; MSX-DOS 1 .COM
 
 Start:
+            ; Explicit 8251 init so the RxEN bit is set regardless of
+            ; what the cartridge ROM did at boot. Three dummy writes
+            ; flush any pending mode-byte expectation, then IR (internal
+            ; reset), then mode (8-N-1 /16), then command (RxEN | TxEN
+            ; | DTR | RTS | ErrRst).
+            xor     a
+            out     (UART_STA), a
+            out     (UART_STA), a
+            out     (UART_STA), a
+            ld      a, 0x40
+            out     (UART_STA), a       ; IR: internal reset
+            ld      a, 0x4E
+            out     (UART_STA), a       ; mode: 8 data, no parity, 1 stop, /16
+            ld      a, 0x37
+            out     (UART_STA), a       ; cmd: RTS | ErrRst | RxEN | DTR | TxEN
+
             ; Banner to the MSX screen so the user sees we're alive.
             ld      hl, MsgStart
             call    PrintZ
@@ -45,6 +64,11 @@ Start:
             ; Banner over the UART to the host.
             ld      hl, MsgUart
             call    UartSendZ
+
+            ; Byte counter for the "[EOT: N bytes]" status line.
+            xor     a
+            ld      [RxCount], a
+            ld      [RxCount + 1], a
 
 Loop:
             ; Keyboard: Esc returns to DOS. DIRIO with E=0xFF is a
@@ -63,20 +87,43 @@ Loop:
 
             ; UART: poll for an incoming byte (non-blocking so the
             ; keyboard stays responsive).
-            in      a, [UART_STA]
+            in      a, (UART_STA)
             and     ST_RXRDY
             jr      z, Loop
-            in      a, [UART_DAT]
+            in      a, (UART_DAT)
 
-            ; Show the byte on the MSX screen.
+            ; EOT marker: print "[EOT: N bytes]\r\n" to the screen, do
+            ; NOT echo back, reset the counter. Lets the host confirm
+            ; each transmission landed intact.
+            cp      EOT_BYTE
+            jr      z, HandleEot
+
+            ; Normal byte: show on screen, increment counter, echo back.
             ld      e, a
             push    af
             ld      c, BDOS_CONOUT
             call    BDOS
             pop     af
 
-            ; Echo it back to the host so we can see the round trip.
+            push    af
+            ld      hl, [RxCount]
+            inc     hl
+            ld      [RxCount], hl
+            pop     af
+
             call    UartSendByte
+            jr      Loop
+
+HandleEot:
+            ld      hl, MsgEotLead
+            call    PrintZ
+            ld      hl, [RxCount]
+            call    PrintDecHL
+            ld      hl, MsgEotTail
+            call    PrintZ
+            xor     a
+            ld      [RxCount], a
+            ld      [RxCount + 1], a
             jr      Loop
 
 Exit:
@@ -88,12 +135,76 @@ Exit:
 ; UartSendByte: block until TxRDY, then write A to the UART. Preserves A.
 UartSendByte:
             push    af
-.wait:      in      a, [UART_STA]
+.wait:      in      a, (UART_STA)
             and     ST_TXRDY
             jr      z, .wait
             pop     af
-            out     [UART_DAT], a
+            out     (UART_DAT), a
             ret
+
+; PrintDecHL: print HL as a 1..5 digit decimal via BDOS CONOUT.
+; Leading zeros are suppressed except for the ones digit, so 0 -> "0"
+; but 42 -> "42" (not "00042"). Uses HasDigit as sticky state across
+; the place-value loops; reset on entry.
+PrintDecHL:
+            xor     a
+            ld      [HasDigit], a
+            ld      de, 10000
+            call    .pdDigit
+            ld      de, 1000
+            call    .pdDigit
+            ld      de, 100
+            call    .pdDigit
+            ld      de, 10
+            call    .pdDigit
+            ; Ones digit always prints (so HL=0 emits "0").
+            ld      a, l
+            add     a, '0'
+            push    hl
+            ld      e, a
+            ld      c, BDOS_CONOUT
+            call    BDOS
+            pop     hl
+            ret
+.pdDigit:
+            ; Count how many times DE fits into HL; emit that many as
+            ; an ASCII digit (or skip if leading zero and nothing
+            ; non-zero has been emitted yet).
+            ld      b, 0                 ; B = digit count (0..9)
+.pdSub:
+            push    bc
+            push    de
+            and     a
+            sbc     hl, de
+            pop     de
+            pop     bc
+            jr      c, .pdOver
+            inc     b
+            jr      .pdSub
+.pdOver:    add     hl, de               ; undo the over-subtraction
+            ld      a, b
+            or      a
+            jr      nz, .pdEmit
+            ld      a, [HasDigit]
+            or      a
+            ret     z                    ; leading-zero suppression
+            xor     a
+            jr      .pdEmitA
+.pdEmit:
+            ld      a, 1
+            ld      [HasDigit], a
+            ld      a, b
+.pdEmitA:
+            add     a, '0'
+            push    hl
+            ld      e, a
+            ld      c, BDOS_CONOUT
+            call    BDOS
+            pop     hl
+            ret
+
+HasDigit:   db 0
+RxCount:    dw 0                         ; bytes received since last EOT
 
 ; UartSendZ: HL -> NUL-terminated string; writes each char through the UART.
 UartSendZ:
@@ -122,3 +233,8 @@ PrintZ:
 MsgStart:   db "Serial POC ready. Type to send; Esc to quit.", 0x0D, 0x0A, 0
 MsgUart:    db "MSX serial POC", 0x0D, 0x0A, 0
 MsgExit:    db 0x0D, 0x0A, "bye.", 0x0D, 0x0A, 0
+; Framing for the EOT-arrived status line.
+MsgEotLead: db 0x0D, 0x0A, "[EOT: ", 0
+MsgEotTail: db " bytes]", 0x0D, 0x0A, 0
+
+            SAVEBIN "dist/serpoc.com", 0x0100, $-0x0100
