@@ -136,7 +136,15 @@ KEY_F1         equ 0xF1        ; MSX F1 key (opens About popup)
 
 ; ---- URL / file state ----
 URL_MAX        equ 96
-FILE_BUF_SIZE  equ 0x9000      ; 36 KB — fits image-heavy pages from the bridge
+FILE_BUF_SIZE  equ 0x4000      ; 16 KB -- MSX-DOS 1 BDOS lives around 0x9800
+                               ; on our target machines (Sony HB-F1XD and
+                               ; AX-370), so everything we host in the TPA
+                               ; (FileBuf + FontBuf + ImgBuf) has to end
+                               ; below 0x9800 or we overwrite BDOS and the
+                               ; next command after Esc can't read the disk.
+                               ; 16 KB is comfortable for HTM bodies;
+                               ; images come in as streamed PCX chunks via
+                               ; ImgBuf / ImgStreamByte instead.
 FONT_BUF_SIZE  equ 2048        ; 256 glyphs * 8 rows
 CONTENT_X_END  equ 491         ; scrollbar now starts at x=492
 TEXT_LINE_H    equ 8           ; MSX font row height
@@ -423,6 +431,20 @@ Shutdown:
     ld      a, 0x80 | 7
     out     (VDP_CMD), a
     ei
+
+    ; Hand the disk state back to DOS cleanly before TERM. Close the
+    ; FCB we loaded files through (ignore the result; we don't care if
+    ; it wasn't open) and reset DMA to the default command-tail area
+    ; at 0x0080 so the next .COM CCP loads doesn't read into our old
+    ; FileBuf. Without this, a subsequent `MWBRO` from the prompt hits
+    ; "Disk error reading drive A" because DOS's internal record
+    ; pointer was left pointing at stale state from our last read.
+    ld      c, DOS_CLOSE
+    ld      de, Fcb
+    call    BDOS_ENTRY
+    ld      c, DOS_SETDMA
+    ld      de, 0x0080
+    call    BDOS_ENTRY
 
     ld      c, DOS_TERM
     jp      BDOS_ENTRY
@@ -6437,7 +6459,7 @@ RenderMissingImgBox:
     ld      b, a
     ld      a, CONTENT_Y1 + 1
     sub     b
-    jr      c, .rmbHZero
+    jp      c, .rmbHZero
     cp      c
     jr      nc, .rmbHOk
     ld      c, a
@@ -6489,7 +6511,10 @@ RenderMissingImgBox:
     jr      .rmbDone
 
 .rmbDraw:
-    ; 1-px black border outline at (x=HtmlIndent/4, y=TextY, w,h).
+    ; Light-gray border outline at (x=HtmlIndent/4, y=TextY, w, h).
+    ; DrawRectBorder paints INSIDE the declared w*h bounds (1-px top
+    ; and bottom, 1 byte-column = 4 px on the vertical edges since
+    ; Screen 6 is byte-addressable in X).
     ld      a, [HtmlIndent]
     srl     a
     srl     a
@@ -6500,9 +6525,22 @@ RenderMissingImgBox:
     ld      d, a
     ld      a, [RmbHPixels]
     ld      e, a
-    ld      a, 3                        ; palette 3 = black
+    ld      a, COL_LGRAY
     call    DrawRectBorder
 
+    ; Label the box with the alt text (falling back to the src
+    ; filename) when it's big enough for the label to be legible.
+    ; Skip quietly for small boxes so we don't smear over their
+    ; outline.
+    ld      a, [RmbWBytes]
+    cp      6                            ; need >= 24 px wide
+    jp      c, .rmbAdvance
+    ld      a, [RmbHPixels]
+    cp      12                           ; need >= 12 px tall
+    jp      c, .rmbAdvance
+    call    RmbDrawLabel
+
+.rmbAdvance:
     ld      a, [RmbHPixels]
     ld      b, a
     ld      a, [TextY]
@@ -6527,8 +6565,104 @@ RenderMissingImgBox:
 RmbWBytes:      db 0
 RmbHPixels:     db 0
 RmbImgLines:    db 0
+RmbLabelLen:    db 0
+; Scratch for the centred label -- we truncate HtmlCurHref/ImgNameBuf
+; into this buffer + NUL so GRPPRT's draw-until-NUL loop stops at the
+; fit width. Max 30 glyphs = 240 px (wider than our 492-px canvas
+; would ever host for a reasonable image).
+RmbLabelBuf:    ds 31
 
-; Minimal "file not found" message drawn directly into the content
+; RmbDrawLabel: draw alt (or src filename) centred inside the box at
+; (HtmlIndent, TextY, RmbWBytes*4, RmbHPixels). Called only when the
+; box is wide and tall enough to host at least a few glyphs. On
+; entry RmbWBytes / RmbHPixels / HtmlIndent / TextY are all current.
+RmbDrawLabel:
+    ; Pick the label source: HtmlCurHref (alt=) if non-empty, else
+    ; ImgNameBuf (src= filename).
+    ld      hl, HtmlCurHref
+    ld      a, [hl]
+    or      a
+    jr      nz, .rdlHaveSrc
+    ld      hl, ImgNameBuf
+    ld      a, [hl]
+    or      a
+    ret     z                           ; nothing to draw
+
+.rdlHaveSrc:
+    ; Compute max chars that fit: (RmbWBytes * 4 - 8) / 8 = RmbWBytes/2 - 1
+    ; (drop 8 px for visual padding inside the border).
+    ld      a, [RmbWBytes]
+    srl     a
+    dec     a
+    cp      30
+    jr      c, .rdlCapOk
+    ld      a, 30                       ; buffer ceiling
+.rdlCapOk:
+    ld      b, a                        ; B = max chars
+
+    ; Copy up to B chars from HL into RmbLabelBuf, stopping at NUL.
+    ld      de, RmbLabelBuf
+    ld      c, 0                        ; C = actual chars copied
+.rdlCopy:
+    ld      a, b
+    or      a
+    jr      z, .rdlCopyDone
+    ld      a, [hl]
+    or      a
+    jr      z, .rdlCopyDone
+    ld      [de], a
+    inc     hl
+    inc     de
+    inc     c
+    dec     b
+    jr      .rdlCopy
+.rdlCopyDone:
+    xor     a
+    ld      [de], a                     ; NUL terminate
+    ld      a, c
+    or      a
+    ret     z                           ; zero-length label
+    ld      [RmbLabelLen], a
+
+    ; X pixel = HtmlIndent + (RmbWBytes*4 - C*8) / 2.
+    ld      a, [RmbWBytes]
+    add     a, a
+    add     a, a                        ; A = box width in pixels
+    ld      b, a
+    ld      a, c
+    add     a, a
+    add     a, a
+    add     a, a                        ; A = label width in pixels
+    ld      c, a                        ; save label_w
+    ld      a, b
+    sub     c                           ; A = box_w - label_w (>= 0)
+    srl     a                           ; /2
+    ld      c, a                        ; C = left margin px
+    ld      a, [HtmlIndent]
+    add     a, c
+    ld      e, a
+    ld      d, 0                        ; DE = X pixel
+
+    ; Y pixel = TextY + (RmbHPixels - 8) / 2 (BIOS font is 8 px tall).
+    ld      a, [RmbHPixels]
+    sub     8
+    srl     a
+    ld      c, a
+    ld      a, [TextY]
+    add     a, c
+    ld      c, a                        ; C = Y pixel
+
+    ; Set black-on-white colours so the label pops against the white
+    ; content area, then paint via BIOS GRPPRT (through DrawString).
+    push    bc
+    push    de
+    ld      a, COL_BLACK
+    ld      l, COL_WHITE
+    call    SetTextColours
+    pop     de
+    pop     bc
+    ld      hl, RmbLabelBuf
+    jp      DrawString                  ; tail-call returns to caller
 ; area when a local file fails to load. URL loads that fail come back
 ; from the serial bridge as ERR and are handled the same way.
 NotFoundMsg:    db "404 File Not Found", 0
