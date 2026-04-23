@@ -261,7 +261,7 @@ MainLoop:
     jr      nz, .tabAdv
     xor     a                           ; first Tab -> link 0
     ld      [HtmlFocusLink], a
-    call    RefreshAfterScroll
+    call    RefreshContentInPlace
     jp      MainLoop
 .tabAdv:
     ld      b, a
@@ -273,32 +273,34 @@ MainLoop:
     inc     b
     ld      a, b
     ld      [HtmlFocusLink], a
-    call    RefreshAfterScroll
+    call    RefreshContentInPlace
     jp      MainLoop
 .tabLinksDone:
     ; Past the last link. Drop link focus and try forms.
     ld      a, 0xFF
     ld      [HtmlFocusLink], a
 .tabTryFormStart:
-    ; If we have any text/password slots, focus the first one.
-    call    FormFirstEditableSlot       ; A = slot index, or 0xFF
+    ; Focus the first interactive form widget (text/pass/checkbox/
+    ; radio/submit/reset). Tab walks the whole table now -- not just
+    ; editable slots -- so users can reach Submit / Reset / toggles
+    ; without the mouse.
+    call    FormFirstFocusableSlot      ; A = slot index, or 0xFF
     cp      0xFF
     jr      z, .tabFormDone
     ld      [HtmlFormFocus], a
-    call    RefreshAfterScroll
+    call    RefreshContentInPlace
     jp      MainLoop
 .tabFormAdv:
-    ; Already on a form field. Advance to the next text/pass slot.
-    call    FormNextEditableSlot        ; A = next slot, or 0xFF
+    call    FormNextFocusableSlot       ; A = next slot, or 0xFF
     cp      0xFF
     jr      z, .tabFormDone
     ld      [HtmlFormFocus], a
-    call    RefreshAfterScroll
+    call    RefreshContentInPlace
     jp      MainLoop
 .tabFormDone:
     ld      a, 0xFF
     ld      [HtmlFormFocus], a
-    call    RefreshAfterScroll
+    call    RefreshContentInPlace
 .tabCycle:
     call    CycleFocus
     call    PaintToolbar
@@ -379,24 +381,54 @@ NotCls:
     jp      MainLoop
 
 OnContent:
-    ; Form-field typing path: when a text/password slot is focused,
-    ; printable ASCII appends to its value, BS pops, ENTER triggers
-    ; submit. Any other key falls through to the normal navigation
-    ; handlers below (so Esc / arrows / vim keys still work without a
-    ; field focused).
+    ; Form-field interaction: routing depends on the focused slot's
+    ; type. Text/pass: BS pops, Enter submits, printable ASCII appends.
+    ; Checkbox/radio: Space toggles. Submit/reset/button: Space or
+    ; Enter triggers submit. Anything not handled here falls through
+    ; to the normal scroll / nav handlers below.
     ld      a, [HtmlFormFocus]
     cp      0xFF
     jr      z, .ocNoForm
+    call    FormGetTypePtr              ; HL -> FormType[HtmlFormFocus]
+    ld      a, [hl]
+    cp      'T'
+    jr      z, .ocText
+    cp      'P'
+    jr      z, .ocText
+    cp      'C'
+    jr      z, .ocToggle
+    cp      'R'
+    jr      z, .ocToggle
+    cp      'S'
+    jr      z, .ocFireBtn
+    cp      'B'
+    jr      z, .ocFireBtn
+    jr      .ocNoForm
+.ocText:
     ld      a, b
     cp      KEY_BACKSPACE
     jp      z, DoFormBackspace
     cp      KEY_ENTER
     jp      z, DoFormSubmit
-    cp      ' '                         ; printable ASCII range
+    cp      ' '
     jr      c, .ocNoForm
     cp      0x7F
     jr      nc, .ocNoForm
     jp      DoFormType
+.ocToggle:
+    ld      a, b
+    cp      ' '
+    jp      z, DoFormToggle
+    cp      KEY_ENTER
+    jp      z, DoFormSubmit
+    jr      .ocNoForm
+.ocFireBtn:
+    ld      a, b
+    cp      KEY_ENTER
+    jp      z, DoFormSubmit
+    cp      ' '
+    jp      z, DoFormSubmit
+    jr      .ocNoForm
 .ocNoForm:
     ld      a, b
     cp      KEY_ENTER
@@ -469,10 +501,125 @@ DoFormType:
     inc     hl
     xor     a
     ld      [hl], a
-    call    RefreshAfterScroll
+    call    RefreshContentInPlace
     jp      MainLoop
 
 DftLen:         db 0
+
+; DoFormToggle: flip the checked state of the currently-focused
+; checkbox/radio. The state lives in the slot's value buffer: an empty
+; value = unchecked, "1" = checked. When the slot is a radio button,
+; first clear every sibling slot whose NAME matches (radio group
+; semantics); then set this one.
+DoFormToggle:
+    ld      a, [HtmlFormFocus]
+    cp      0xFF
+    jp      z, MainLoop
+    ld      [DftSlot], a
+    call    FormGetTypePtr
+    ld      a, [hl]
+    cp      'R'
+    jr      nz, .dftIsCheck
+    ; Radio: clear group-mates first.
+    call    DoFormClearRadioGroup
+.dftIsCheck:
+    ; Toggle the focused slot's value.
+    ld      a, [DftSlot]
+    call    FormGetValuePtr
+    ld      a, [hl]
+    or      a
+    jr      z, .dftSet                  ; was empty -> set to "1"
+    ; Already non-empty (checked or other) -> clear, but only for
+    ; checkboxes; for radios clicking a checked button keeps it on.
+    ld      a, [DftSlot]
+    call    FormGetTypePtr
+    ld      a, [hl]
+    cp      'R'
+    jr      z, .dftDone                 ; radio: stays on
+    ld      a, [DftSlot]
+    call    FormGetValuePtr
+    xor     a
+    ld      [hl], a                     ; checkbox -> off
+    jr      .dftDone
+.dftSet:
+    ld      a, [DftSlot]
+    call    FormGetValuePtr
+    ld      a, '1'
+    ld      [hl], a
+    inc     hl
+    xor     a
+    ld      [hl], a
+.dftDone:
+    call    RefreshContentInPlace
+    jp      MainLoop
+
+DftSlot:        db 0
+
+; DoFormClearRadioGroup: empty the value buffer of every slot whose
+; NAME matches the focused slot's NAME (excluding the focused slot
+; itself). HtmlFormFocus + DftSlot must be set on entry. Clobbers all.
+DoFormClearRadioGroup:
+    ld      a, [DftSlot]
+    call    FormGetNamePtr
+    ; Stash that name pointer for the inner-loop comparisons.
+    ld      [DfcrNamePtr], hl
+    ld      a, [FormCount]
+    or      a
+    ret     z
+    ld      b, a
+    ld      c, 0
+.dfcrLoop:
+    push    bc
+    ld      a, [DftSlot]
+    cp      c
+    jr      z, .dfcrSkip                ; don't clear self
+    ld      a, c
+    call    FormGetTypePtr
+    ld      a, [hl]
+    cp      'R'
+    jr      nz, .dfcrSkip               ; only radios in group
+    ld      a, c
+    call    FormGetNamePtr              ; HL -> this slot's name
+    ld      de, [DfcrNamePtr]
+    call    FormStrEq
+    or      a
+    jr      z, .dfcrSkip                ; different name
+    ; Same group -> clear value.
+    ld      a, c
+    call    FormGetValuePtr
+    xor     a
+    ld      [hl], a
+.dfcrSkip:
+    pop     bc
+    inc     c
+    djnz    .dfcrLoop
+    ret
+
+DfcrNamePtr:    dw 0
+
+; FormStrEq: HL and DE point to NUL-terminated strings (max
+; FORM_NAME_MAX + 1 chars). Returns A=1 (NZ) on equal, A=0 (Z) on
+; mismatch. Clobbers BC, HL, DE.
+FormStrEq:
+    ld      b, FORM_NAME_MAX + 1
+.fseLoop:
+    ld      a, [de]
+    ld      c, a
+    ld      a, [hl]
+    cp      c
+    jr      nz, .fseNo
+    or      a
+    jr      z, .fseYes
+    inc     hl
+    inc     de
+    djnz    .fseLoop
+.fseYes:
+    ld      a, 1
+    or      a
+    ret
+.fseNo:
+    xor     a
+    ret
 
 ; DoFormBackspace: drop the last char from the focused field's value.
 DoFormBackspace:
@@ -496,7 +643,7 @@ DoFormBackspace:
     dec     hl
     xor     a
     ld      [hl], a
-    call    RefreshAfterScroll
+    call    RefreshContentInPlace
     jp      MainLoop
 
 ; DoFormSubmit: triggered when Enter is pressed on a focused form field
@@ -8766,14 +8913,31 @@ TagInput:
 
 .inputCheckbox:
     call    FormAllocCurrent
+    push    af
     call    nc, FormStoreFromSlotA
-    ld      a, [HtmlChecked]
+    pop     af
+    push    af
+    ; Capture this slot's screen rect so click hit-testing can reach
+    ; the checkbox. Width is finished after EmitSink.
+    call    nc, FormCaptureRect
+    pop     af
+    push    af
+    ; Read the slot's value (empty = off, non-empty = on). Falls back
+    ; to "off" when no slot was allocated.
+    jr      c, .icbOff
+    call    FormGetValuePtr
+    ld      a, [hl]
     or      a
-    ld      a, WG_CHK_OFF
-    jr      z, .inputCheckEmit
+    jr      z, .icbOff
     ld      a, WG_CHK_ON
-.inputCheckEmit:
-    jp      EmitSink
+    jr      .icbEmit
+.icbOff:
+    ld      a, WG_CHK_OFF
+.icbEmit:
+    call    EmitSink
+    pop     af
+    ret     c
+    jp      FormFinishRect
 
 .inputR:
     ld      a, [HtmlInputType + 1]
@@ -8782,14 +8946,27 @@ TagInput:
     jp      .inputSubmit                ; reset: same visual as submit
 .inputRadio:
     call    FormAllocCurrent
+    push    af
     call    nc, FormStoreFromSlotA
-    ld      a, [HtmlChecked]
+    pop     af
+    push    af
+    call    nc, FormCaptureRect
+    pop     af
+    push    af
+    jr      c, .irOff
+    call    FormGetValuePtr
+    ld      a, [hl]
     or      a
-    ld      a, WG_RAD_OFF
-    jr      z, .inputRadioEmit
+    jr      z, .irOff
     ld      a, WG_RAD_ON
-.inputRadioEmit:
-    jp      EmitSink
+    jr      .irEmit
+.irOff:
+    ld      a, WG_RAD_OFF
+.irEmit:
+    call    EmitSink
+    pop     af
+    ret     c
+    jp      FormFinishRect
 
 .inputHidden:
     call    FormAllocCurrent
@@ -8988,11 +9165,37 @@ FormStoreFromSlotA:
     ldir
     ; --- value ---
     pop     af
-    call    FormGetValuePtr
-    ex      de, hl
+    push    af
+    call    FormGetValuePtr             ; HL -> dest
+    ex      de, hl                      ; DE = dest
+    pop     af
+    ; For checkbox / radio the value buffer holds toggle state
+    ; ("" = off, "1" = on); seed from HtmlChecked. For other types
+    ; (text/pass/submit/...), seed from HtmlCurHref like before.
+    push    af
+    ld      hl, HtmlInputType
+    ld      a, [hl]
+    cp      'C'
+    jr      z, .fsfTogState
+    cp      'R'
+    jr      z, .fsfTogState
     ld      hl, HtmlCurHref
     ld      bc, FORM_VALUE_MAX + 1
     ldir
+    pop     af
+    ret
+.fsfTogState:
+    ld      a, [HtmlChecked]
+    or      a
+    ld      a, '1'
+    jr      nz, .fsfWrite
+    xor     a
+.fsfWrite:
+    ld      [de], a
+    inc     de
+    xor     a
+    ld      [de], a
+    pop     af
     ret
 .fsfSticky:
     pop     af
@@ -9081,6 +9284,83 @@ FormNextEditableSlot:
 .fneHit:
     ld      a, c
     or      a
+    ret
+
+; FormFirstFocusableSlot: scan FormFields for the first slot whose type
+; is interactive (text, pass, checkbox, radio, submit, reset/button).
+; Hidden ('H') and image ('I') slots are skipped. Returns A = slot
+; index, or 0xFF if none. Clobbers BC, HL.
+FormFirstFocusableSlot:
+    ld      a, [FormCount]
+    or      a
+    jr      z, .ffsNone
+    ld      b, a
+    ld      hl, FormType
+    ld      c, 0
+.ffsLoop:
+    ld      a, [hl]
+    call    FormTypeIsFocusable
+    jr      nz, .ffsHit
+    inc     hl
+    inc     c
+    dec     b
+    jr      nz, .ffsLoop
+.ffsNone:
+    ld      a, 0xFF
+    ret
+.ffsHit:
+    ld      a, c
+    ret
+
+; FormNextFocusableSlot: advance HtmlFormFocus to the next focusable
+; slot after the current one. Returns A = next slot, or 0xFF.
+FormNextFocusableSlot:
+    ld      a, [HtmlFormFocus]
+    inc     a
+    ld      c, a
+.fnsCheck:
+    ld      a, [FormCount]
+    cp      c
+    jr      z, .fnsNone
+    jr      c, .fnsNone
+    ld      a, c
+    ld      e, a
+    ld      d, 0
+    ld      hl, FormType
+    add     hl, de
+    ld      a, [hl]
+    call    FormTypeIsFocusable
+    jr      nz, .fnsHit
+    inc     c
+    jr      .fnsCheck
+.fnsNone:
+    ld      a, 0xFF
+    ret
+.fnsHit:
+    ld      a, c
+    ret
+
+; FormTypeIsFocusable: A = type byte. Returns NZ if focusable
+; (text/pass/check/radio/submit/reset/button), Z otherwise. A is
+; clobbered.
+FormTypeIsFocusable:
+    cp      'T'
+    jr      z, .ftfYes
+    cp      'P'
+    jr      z, .ftfYes
+    cp      'C'
+    jr      z, .ftfYes
+    cp      'R'
+    jr      z, .ftfYes
+    cp      'S'
+    jr      z, .ftfYes
+    cp      'B'
+    jr      z, .ftfYes
+    xor     a                                ; not focusable: Z set
+    ret
+.ftfYes:
+    ld      a, 1
+    or      a                                ; focusable: NZ
     ret
 
 ; FormFirstSubmitSlot: find the first slot with type 'S' or 'B' (submit
@@ -10110,6 +10390,16 @@ RefreshAfterScroll:
     call    ComputeThumb
     call    DrawScrollbar
     call    ClearContentArea
+    jp      PrintFileContent
+
+; RefreshContentInPlace: re-paint the content area WITHOUT clearing it
+; first. Used by typing / form-state edits where the layout doesn't
+; change -- only a handful of cells flip (e.g. the just-typed char).
+; Skipping the clear avoids the full-screen flash that ClearContentArea
+; produces. The new render's own widget cells overpaint the old pixel
+; values, including erasing the trailing column when a backspace
+; shrinks a value (M-cell interior is white).
+RefreshContentInPlace:
     jp      PrintFileContent
 
 ; ScrollUp: decrement ScrollLine if > 0, refresh.
@@ -11281,12 +11571,26 @@ SerialInit:
     out     (UART_STATUS), a
     ret
 
-SerialWrite:    ; send byte in A; blocks until TxRDY.
+SerialWrite:    ; send byte in A; bounded poll for TxRDY so a stuck
+                ; UART (no cartridge / dead bridge) drops the byte
+                ; instead of locking the browser. Roughly a quarter
+                ; second of wall time before giving up.
     push    af
+    push    bc
+    ld      bc, 0x4000
 .sw:
     in      a, (UART_STATUS)
     rrca
-    jr      nc, .sw                     ; bit 0 = TxRDY
+    jr      c, .swReady
+    dec     bc
+    ld      a, b
+    or      c
+    jr      nz, .sw
+    pop     bc
+    pop     af
+    ret                                 ; timeout -> drop byte
+.swReady:
+    pop     bc
     pop     af
     out     (UART_DATA), a
     ret
