@@ -8439,13 +8439,17 @@ TagSelect:
     ld      [HtmlSelectFound], a            ; no option seen yet
     ret
 .tsClose:
+    ; Clear SkipBody FIRST -- the previous </option> left it on so any
+    ; trailing OPTION text would stay suppressed, but the closing M + R
+    ; cells we emit here still need to flow through EmitSink. Without
+    ; this the box's right edge silently vanishes and the next text on
+    ; the line floats outside an "open" rectangle.
+    xor     a
+    ld      [HtmlSkipBody], a
     ld      a, WG_BOX_M
     call    EmitSink                        ; right pad cell
     ld      a, WG_BOX_R
-    call    EmitSink
-    xor     a
-    ld      [HtmlSkipBody], a
-    ret
+    jp      EmitSink
 
 ; <option>...</option>: routes the label text into the parent <select>'s
 ; box. The first OPTION inside a SELECT clears HtmlSkipBody so its
@@ -10936,22 +10940,24 @@ WidgetChkOff:
     db  0x80, 0x02      ; row 12: bottom border
     db  0xAA, 0xAA      ; row 13: blank
 
-; Checked = the same outline filled solid dark-grey across cols 1..6.
-; A simple flood is more legible at 1.25x screenshot scale than the
-; "outline + tiny inner X" that earlier attempts went for.
+; Checked = the same outline plus a slim dark-grey indicator bar at
+; cols 3..4 rows 3..10. Two columns is the widest inset that still
+; leaves visible white space between the bar and the cell's left/right
+; verticals; without that gap the indicator vanishes into the outline
+; at small render scales.
 WidgetChkOn:
     db  0xAA, 0xAA      ; row 0:  blank
     db  0x80, 0x02      ; row 1:  W G G G G G G W  (top border)
-    db  0x80, 0x02      ; row 2:  filled body
-    db  0x80, 0x02      ; row 3
-    db  0x80, 0x02      ; row 4
-    db  0x80, 0x02      ; row 5
-    db  0x80, 0x02      ; row 6
-    db  0x80, 0x02      ; row 7
-    db  0x80, 0x02      ; row 8
-    db  0x80, 0x02      ; row 9
-    db  0x80, 0x02      ; row 10
-    db  0x80, 0x02      ; row 11
+    db  0x8A, 0xA2      ; row 2:  W G W W W W G W  (sides only)
+    db  0x88, 0x22      ; row 3:  W G W G G W G W  (sides + inset top)
+    db  0x88, 0x22      ; row 4
+    db  0x88, 0x22      ; row 5
+    db  0x88, 0x22      ; row 6
+    db  0x88, 0x22      ; row 7
+    db  0x88, 0x22      ; row 8
+    db  0x88, 0x22      ; row 9
+    db  0x88, 0x22      ; row 10: sides + inset bottom
+    db  0x8A, 0xA2      ; row 11
     db  0x80, 0x02      ; row 12: bottom border
     db  0xAA, 0xAA      ; row 13: blank
 
