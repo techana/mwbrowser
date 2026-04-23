@@ -101,15 +101,20 @@ BTN_H          equ 15
 BTN1_X         equ 4                    ; Back,    byte col 1 (ends at 35)
 BTN3_X         equ 40                   ; Forward, byte col 10 (ends at 71)
 ADDR_X0        equ 76                   ; byte col 19
-ADDR_X1        equ 451                  ; ADDR width = 376 px (94 byte-cols)
-BTN2_X         equ 456                  ; Refresh, byte col 114 (ends at 487)
-                                        ; right-edge gap = 4 px == left-edge gap
+ADDR_X1        equ 471                  ; ADDR width = 396 px (99 byte-cols)
+BTN2_X         equ 476                  ; Refresh, byte col 119 (ends at 507);
+                                        ; right-edge gap = 4 px to screen pixel
+                                        ; 511, matching Back's 4-px left margin.
+                                        ; The toolbar background paints across
+                                        ; the full 512-px width (the scrollbar
+                                        ; only starts at content row Y=29), so
+                                        ; the button can sit past pixel 491.
 
 ; Chars that fit in the address bar's text area. Text starts 5 px in
 ; from ADDR_X0 (1-px gap after the 4-px border) and must stop before
 ; the clear-x glyph at ADDR_X1-12.
-; ((ADDR_X1-12) - (ADDR_X0+5)) / 8 = 358 / 8 = 44 (integer floor).
-URL_VISIBLE    equ 44
+; ((ADDR_X1-12) - (ADDR_X0+5)) / 8 = 378 / 8 = 47 (integer floor).
+URL_VISIBLE    equ 47
 
 ; Scrollbar is 20 wide (5 bytes) -- 1 byte wider than before. An 8-wide arrow
 ; icon (2 bytes) sits inside 1-byte (4-px) left/right track borders.
