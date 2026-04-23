@@ -242,8 +242,14 @@ MainLoop:
     cp      KEY_TAB
     jr      nz, NotTab
     ; Tab in Content sub-cycles through (a) visible links and (b) form
-    ; text/password fields before rolling back to the toolbar via
-    ; CycleFocus. Order: links 0..N-1 -> form fields 0..M-1 -> toolbar.
+    ; widgets before rolling back to the toolbar via CycleFocus. Order:
+    ; links 0..N-1 -> form fields 0..M-1 -> toolbar. Shift+Tab walks
+    ; the same chain backwards.
+    call    IsShiftDown
+    jr      nz, .tabForward
+    call    TabReverse
+    jp      MainLoop
+.tabForward:
     ld      a, [Focus]
     cp      FOC_CONTENT
     jr      nz, .tabCycle
@@ -467,6 +473,89 @@ DoScrollDn:
 DoScrollUp:
     call    ScrollUp
     jp      MainLoop
+
+; IsShiftDown: return Z set (CF=0 + Z=1) when the Shift key is
+; pressed, NZ otherwise. Reads MSX keyboard matrix row 6 bit 0 via
+; the PPI at port 0xAA. Briefly disables interrupts so the BIOS
+; keyboard ISR doesn't fight the row-select. Preserves BC, DE, HL.
+IsShiftDown:
+    di
+    in      a, (0xAA)
+    ld      c, a                            ; save PPI C
+    and     0xF0
+    or      6                               ; select row 6
+    out     (0xAA), a
+    in      a, (0xA9)                       ; read row 6
+    ld      b, a
+    ld      a, c
+    out     (0xAA), a                       ; restore PPI C
+    ei
+    ld      a, b
+    and     0x01                            ; bit 0 = Shift (0 = pressed)
+    ret
+
+; TabReverse: walk the Content-area focus chain backwards. Current
+; forward order is links -> form slots -> toolbar; reverse is the
+; opposite. Called from MainLoop's Tab handler when Shift is down.
+TabReverse:
+    ld      a, [Focus]
+    cp      FOC_CONTENT
+    jp      nz, CycleFocusBack
+    ; --- form slot focused: go to previous form slot, else last link,
+    ;     else drop focus (and CycleFocusBack next time). ---
+    ld      a, [HtmlFormFocus]
+    cp      0xFF
+    jr      z, .trLinkBack
+    call    FormPrevFocusableSlot           ; A = prev or 0xFF
+    cp      0xFF
+    jr      z, .trFormToLink
+    ld      [HtmlFormFocus], a
+    call    RefreshContentInPlace
+    ret
+.trFormToLink:
+    ; Past the first form slot. Clear form focus; go to last link if any.
+    ld      a, 0xFF
+    ld      [HtmlFormFocus], a
+    ld      a, [LinkCount]
+    or      a
+    jr      z, .trDropAll
+    dec     a
+    ld      [HtmlFocusLink], a
+    call    RefreshContentInPlace
+    ret
+.trLinkBack:
+    ld      a, [HtmlFocusLink]
+    cp      0xFF
+    jr      z, .trDropAll
+    or      a
+    jr      z, .trDropLink
+    dec     a
+    ld      [HtmlFocusLink], a
+    call    RefreshContentInPlace
+    ret
+.trDropLink:
+    ld      a, 0xFF
+    ld      [HtmlFocusLink], a
+    call    RefreshContentInPlace
+.trDropAll:
+    ; No link / form to focus -- hand off to the toolbar cycle.
+    call    CycleFocusBack
+    call    PaintToolbar
+    ret
+
+; CycleFocusBack: rotate Focus one step backward through the toolbar
+; states (inverse of CycleFocus). Wraps at FOC_BACK.
+CycleFocusBack:
+    ld      a, [Focus]
+    or      a
+    jr      z, .cfbWrap
+    dec     a
+    ld      [Focus], a
+    ret
+.cfbWrap:
+    ld      a, FOC_COUNT - 1
+    ld      [Focus], a
+    ret
 
 ; DoFormType: append the printable ASCII char in B to the focused
 ; text/password slot's value buffer (capped at FORM_VALUE_MAX), then
@@ -738,8 +827,13 @@ DoFormSubmit:
     ld      [hl], a
     ; Hand off to the existing navigation path -- RemoteGet sends the
     ; request, parses "OK HTM <len>", reads the body into FileBuf,
-    ; PrintFileContent renders it.
-    jp      NavigateAndFocusContent
+    ; PrintFileContent renders it. Must `call` + `jp MainLoop`: the
+    ; navigation chain ends in PaintToolbar's ret, so a naive
+    ; `jp NavigateAndFocusContent` would return to whatever random
+    ; address the stack happens to hold (we reached DoFormSubmit via
+    ; jp from OnContent, so there's no caller frame up there).
+    call    NavigateAndFocusContent
+    jp      MainLoop
 .dfsPrefix:     db "http:/submit?"
 .dfsPrefixEnd:
 
@@ -8815,16 +8909,17 @@ TagA:
     ret
 
 ; ----------------------------------------------------------------------------
-; Form elements (HTML 2). The browser doesn't yet *interact* with form
-; controls -- typing, focus, submission -- but it parses the tags
-; cleanly and renders each control as an inline ASCII placeholder so
-; the page layout reflects the form's structure. Submit-click handling
-; and per-control focus are TODOs.
+; Form elements (HTML 2). Tags parse into the FormFields slot table
+; (see FormAllocCurrent); text / password / checkbox / radio render as
+; graphical widgets that can be focused, typed into, toggled, and
+; submitted. A submit click or Enter on a focused Send button builds a
+; GET query string in UrlBuf and hands off to NavigateAndFocusContent
+; -- the same pipeline a regular URL load uses.
 ; ----------------------------------------------------------------------------
 
 ; <form>: no visible chrome of its own; the inputs nested inside do
-; the rendering. Future work: capture action= + method= so a click on
-; an enclosed type="submit" can build the URL-encoded query string.
+; the rendering. action= / method= are still ignored -- DoFormSubmit
+; hard-codes a "/submit?..." path for the bridge.
 TagForm:
     ret
 
@@ -9490,6 +9585,44 @@ FormTypeIsFocusable:
 .ftfYes:
     ld      a, 1
     or      a                                ; focusable: NZ
+    ret
+
+; FormPrevFocusableSlot: walk BACKWARD from HtmlFormFocus-1 looking
+; for the previous focusable slot. Returns A = slot index, or 0xFF if
+; no focusable slot exists at a lower index. Clobbers BC, HL, DE.
+FormPrevFocusableSlot:
+    ld      a, [HtmlFormFocus]
+    or      a
+    jr      z, .fpsNone                     ; focus already at slot 0
+    cp      0xFF
+    jr      z, .fpsFromEnd                  ; no current focus -> start at last slot
+    dec     a
+    ld      c, a
+    jr      .fpsCheck
+.fpsFromEnd:
+    ld      a, [FormCount]
+    or      a
+    jr      z, .fpsNone
+    dec     a
+    ld      c, a
+.fpsCheck:
+    ld      e, c
+    ld      d, 0
+    ld      hl, FormType
+    add     hl, de
+    ld      a, [hl]
+    call    FormTypeIsFocusable
+    jr      nz, .fpsHit
+    ld      a, c
+    or      a
+    jr      z, .fpsNone
+    dec     c
+    jr      .fpsCheck
+.fpsNone:
+    ld      a, 0xFF
+    ret
+.fpsHit:
+    ld      a, c
     ret
 
 ; FormFirstSubmitSlot: find the first slot with type 'S' or 'B' (submit
