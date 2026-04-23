@@ -58,8 +58,10 @@ except ImportError:
     sys.exit("Pillow required: pip install Pillow")
 
 
-IMG_SRC_DQ = re.compile(rb'(<img\b[^>]*\bsrc=)"([^"]*)"', re.I)
-IMG_SRC_SQ = re.compile(rb"(<img\b[^>]*\bsrc=)'([^']*)'", re.I)
+IMG_TAG    = re.compile(rb"<img\b[^>]*>", re.I)
+IMG_SRC    = re.compile(rb"""\bsrc\s*=\s*["']?([^"'\s>]+)""", re.I)
+IMG_W      = re.compile(rb"""\bwidth\s*=\s*["']?(\d+)""", re.I)
+IMG_H      = re.compile(rb"""\bheight\s*=\s*["']?(\d+)""", re.I)
 A_HREF_DQ  = re.compile(rb'(<a\b[^>]*\bhref=)"([^"]*)"', re.I)
 A_HREF_SQ  = re.compile(rb"(<a\b[^>]*\bhref=)'([^']*)'", re.I)
 
@@ -71,6 +73,81 @@ def _html_escape(s: str) -> str:
     return (s.replace("&", "&amp;")
              .replace("<", "&lt;")
              .replace(">", "&gt;"))
+
+
+def _int_or_none(m):
+    return int(m.group(1)) if m else None
+
+
+def _resize_for_msx(im: "Image.Image",
+                    declared_w: "int | None",
+                    declared_h: "int | None") -> "Image.Image":
+    """Pick a target size for the PCX we'll ship. The MSX browser
+    renders the PCX at the PCX header's own (xmax, ymax), so the size
+    here is the size the author will see on screen.
+
+    Priority:
+      1. Honour declared <img width=x height=y> if both given.
+      2. Otherwise keep the source's native size, capped to the
+         MSX content area (492 x 183) with aspect preserved.
+
+    Width is always rounded up to a multiple of 4 so Screen-6's
+    byte-aligned row stride works out evenly."""
+    src_w, src_h = im.size
+    MAX_W = 492
+    MAX_H = 183
+
+    if declared_w and declared_h:
+        tgt_w, tgt_h = declared_w, declared_h
+    else:
+        tgt_w, tgt_h = src_w, src_h
+        if tgt_w > MAX_W:
+            tgt_h = max(1, round(tgt_h * MAX_W / tgt_w))
+            tgt_w = MAX_W
+        if tgt_h > MAX_H:
+            tgt_w = max(1, round(tgt_w * MAX_H / tgt_h))
+            tgt_h = MAX_H
+
+    # Cap + 4-px-align the width.
+    tgt_w = min(MAX_W, max(4, tgt_w))
+    tgt_w = (tgt_w + 3) & ~3
+    tgt_h = min(MAX_H, max(1, tgt_h))
+
+    if (tgt_w, tgt_h) != (src_w, src_h):
+        im = im.resize((tgt_w, tgt_h), Image.BOX)
+    return im
+
+
+def _pack_2bpp(im: "Image.Image") -> bytes:
+    """Quantise to the MSX Screen-6 4-colour palette and pack 4 pixels
+    per byte (MSB-first). Uses a simple luminance bucketing since the
+    content-image pipeline doesn't need the full dither-to-pair logic
+    the full-page screenshot pipeline had."""
+    if im.mode != "L":
+        im = im.convert("L")
+    w, h = im.size
+    row_bytes = w // 4
+    px = im.tobytes()
+    out = bytearray(h * row_bytes)
+    for y in range(h):
+        row_start = y * w
+        for xb in range(row_bytes):
+            b = 0
+            for i in range(4):
+                v = px[row_start + xb * 4 + i]
+                # Four buckets: black(3) / dgray(0) / lgray(1) / white(2).
+                # Map luminance -> a pair-friendly nybble.
+                if v < 64:
+                    p = 3
+                elif v < 128:
+                    p = 0
+                elif v < 192:
+                    p = 1
+                else:
+                    p = 2
+                b |= (p & 3) << (6 - i * 2)
+            out[y * row_bytes + xb] = b
+    return bytes(out)
 
 
 # ----------------------------------------------------------------------------
@@ -98,10 +175,11 @@ class BridgeSession:
 
         # Image handle produced by our own HTML rewriter: imNN.pcx.
         if re.fullmatch(r"im\d+\.pcx", target, flags=re.I):
-            url = self._img_cache.get(target.lower())
-            if not url:
+            entry = self._img_cache.get(target.lower())
+            if not entry:
                 return ("404", None)
-            return self._fetch_image(url)
+            url, dw, dh = entry
+            return self._fetch_image(url, dw, dh)
 
         # Real URL? Fetch and passthrough.
         if target.lower().startswith(("http://", "https://")):
@@ -146,10 +224,18 @@ class BridgeSession:
         self._img_counter = 0
 
         def img_repl(m: re.Match) -> bytes:
-            prefix = m.group(1)
-            src = m.group(2).decode("latin-1", "replace").strip()
-            handle = self._register_image(src)
-            return prefix + b'"' + handle.encode("ascii") + b'"'
+            tag = m.group(0)
+            src_m = IMG_SRC.search(tag)
+            if not src_m:
+                return tag
+            src = src_m.group(1).decode("latin-1", "replace").strip()
+            w = _int_or_none(IMG_W.search(tag))
+            h = _int_or_none(IMG_H.search(tag))
+            handle = self._register_image(src, w, h)
+            # Replace the src= value with our short handle but leave the
+            # rest of the attributes alone (width / height / alt).
+            new_src = b'src="' + handle.encode("ascii") + b'"'
+            return tag[:src_m.start()] + new_src + tag[src_m.end():]
 
         def href_repl(m: re.Match) -> bytes:
             prefix = m.group(1)
@@ -161,8 +247,7 @@ class BridgeSession:
             absolute = urllib.parse.urljoin(self._current_base or "", href)
             return prefix + b'"' + absolute.encode("latin-1", "replace") + b'"'
 
-        body = IMG_SRC_DQ.sub(img_repl, body)
-        body = IMG_SRC_SQ.sub(img_repl, body)
+        body = IMG_TAG.sub(img_repl, body)
         body = A_HREF_DQ.sub(href_repl, body)
         body = A_HREF_SQ.sub(href_repl, body)
 
@@ -175,58 +260,68 @@ class BridgeSession:
             text = body.decode("latin-1", "replace")
         return text.encode("latin-1", "replace")
 
-    def _register_image(self, src: str) -> str:
-        """Absolutise + mint a short imNN.pcx handle for `src`."""
+    def _register_image(self, src: str,
+                        declared_w: int | None,
+                        declared_h: int | None) -> str:
+        """Absolutise + mint a short imNN.pcx handle for `src`. The
+        declared width/height on the <img> tag (if any) are remembered
+        so the PCX we produce on demand matches the author's size --
+        otherwise a 174x80 logo ends up 492 px wide."""
         absolute = urllib.parse.urljoin(self._current_base or "", src)
-        # Re-use existing handles so two <img>s to the same URL share a fetch.
-        for handle, url in self._img_cache.items():
-            if url == absolute:
+        entry = (absolute, declared_w, declared_h)
+        for handle, v in self._img_cache.items():
+            if v == entry:
                 return handle
         self._img_counter += 1
         handle = f"im{self._img_counter:02d}.pcx"
-        self._img_cache[handle] = absolute
+        self._img_cache[handle] = entry
         return handle
 
     # -- Image conversion -------------------------------------------------
 
-    def _fetch_image(self, url: str):
+    def _fetch_image(self, url: str,
+                     declared_w: int | None = None,
+                     declared_h: int | None = None):
         try:
             raw, _final, ctype = _fetch(url)
         except Exception as exc:
             self._log(f"img fetch failed: {exc}")
             return ("404", None)
-        return self._convert_image_bytes(raw)
+        return self._convert_image_bytes(raw, declared_w, declared_h)
 
-    def _convert_image_bytes(self, raw: bytes):
+    def _convert_image_bytes(self, raw: bytes,
+                             declared_w: int | None = None,
+                             declared_h: int | None = None):
         try:
             im = Image.open(io.BytesIO(raw))
             im.load()
         except Exception as exc:
             self._log(f"image decode failed: {exc}")
             return ("404", None)
-        im = w2s._resize_to_msx(im, Image.BOX)
+        im = _resize_for_msx(im, declared_w, declared_h)
         pcx = self._to_pcx(im)
-        self._log(f"PCX {len(pcx)} B")
+        self._log(f"PCX {len(pcx)} B ({im.size[0]}x{im.size[1]})")
         return ("PCX", pcx)
 
     @staticmethod
     def _to_pcx(im: Image.Image) -> bytes:
-        raw = w2s._pack_sc6_chunk(im)
-        rows = len(raw) // w2s.SC6_ROW_BYTES
-        width_px = w2s.MSX_VIEWPORT_W
+        width_px = im.size[0]
+        rows = im.size[1]
+        row_bytes = width_px // 4
+        raw = _pack_2bpp(im)
         hdr = bytearray(128)
         hdr[0] = 0x0A
         hdr[1] = 5
-        hdr[2] = 1
-        hdr[3] = 2
+        hdr[2] = 1                              # RLE on
+        hdr[3] = 2                              # 2 bpp
         struct.pack_into("<HHHH", hdr, 4, 0, 0, width_px - 1, rows - 1)
         struct.pack_into("<HH",   hdr, 12, 75, 75)
         hdr[65] = 1
-        struct.pack_into("<H", hdr, 66, w2s.SC6_ROW_BYTES)
+        struct.pack_into("<H", hdr, 66, row_bytes)
         hdr[68] = 1
         out = bytearray(hdr)
         for y in range(rows):
-            row = raw[y * w2s.SC6_ROW_BYTES : (y + 1) * w2s.SC6_ROW_BYTES]
+            row = raw[y * row_bytes : (y + 1) * row_bytes]
             x = 0
             while x < len(row):
                 v = row[x]
@@ -306,14 +401,29 @@ def _readline(conn: socket.socket) -> bytes:
 
 
 def _send_response(conn: socket.socket, kind: str, body):
+    """Responses land in openMSX's rs232-net TCP socket and trickle out
+    the emulated 8251 UART at ~9600 baud. The MSX-side SerialRead polls
+    byte-at-a-time but has a ~0.8 s inter-byte timeout; a burst of a few
+    hundred bytes in a single sendall() can overrun the 1-byte 8251 FIFO
+    before the poll loop picks them up. Chunk the body into small
+    writes with a tiny sleep between them -- same trick tools/
+    serial_host.py uses for the echo tester."""
     if kind in ("HTM", "PCX"):
         header = f"OK {kind} {len(body)}\r\n".encode("ascii")
         conn.sendall(header)
-        conn.sendall(body)
+        _slow_send(conn, body)
     elif kind == "404":
         conn.sendall(b"ERR 404\r\n")
     else:
         conn.sendall(b"ERR 500\r\n")
+
+
+def _slow_send(conn: socket.socket, body: bytes, chunk: int = 64,
+               gap: float = 0.005) -> None:
+    import time
+    for i in range(0, len(body), chunk):
+        conn.sendall(body[i:i + chunk])
+        time.sleep(gap)
 
 
 def serve_forever(host: str, port: int, verbose: bool) -> None:
