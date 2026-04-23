@@ -134,8 +134,12 @@ class BridgeSession:
     def handle_get(self, target: str) -> tuple[str, bytes] | tuple[str, None]:
         """Returns ("HTM", body) / ("PCX", body) / ("404", None)."""
         self._log(f"GET {target!r}")
-        if target.startswith("/submit?") or target.startswith("/submit"):
-            return self._handle_submit(target)
+        # Form submit lands here as "http:/submit?..." (the `http:`
+        # prefix is what makes LoadFile route to the remote bridge).
+        # Strip it before dispatching.
+        if target.startswith("http:/submit") or target.startswith("/submit"):
+            stripped = target[5:] if target.startswith("http:") else target
+            return self._handle_submit(stripped)
         if _looks_like_url(target):
             return self._fetch_url(target)
         # Bare filename -> try the current page's chunk cache.
