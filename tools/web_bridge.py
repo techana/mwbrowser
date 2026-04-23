@@ -61,6 +61,12 @@ def _looks_like_url(s: str) -> bool:
     return s.lower().startswith(("http://", "https://"))
 
 
+def _html_escape(s: str) -> str:
+    return (s.replace("&", "&amp;")
+             .replace("<", "&lt;")
+             .replace(">", "&gt;"))
+
+
 def _is_image_url(url: str) -> bool:
     path = urllib.parse.urlparse(url).path.lower()
     return path.endswith(IMG_EXTS)
@@ -128,6 +134,8 @@ class BridgeSession:
     def handle_get(self, target: str) -> tuple[str, bytes] | tuple[str, None]:
         """Returns ("HTM", body) / ("PCX", body) / ("404", None)."""
         self._log(f"GET {target!r}")
+        if target.startswith("/submit?") or target.startswith("/submit"):
+            return self._handle_submit(target)
         if _looks_like_url(target):
             return self._fetch_url(target)
         # Bare filename -> try the current page's chunk cache.
@@ -135,6 +143,37 @@ class BridgeSession:
         if blob is None:
             return ("404", None)
         return ("PCX", blob)
+
+    def _handle_submit(self, target: str) -> tuple[str, bytes]:
+        """Echo-render a form submission. The browser builds
+        "/submit?a=1&b=2" and lands it here via the same RemoteGet path
+        regular URL loads use; we answer with a small HTML page that
+        shows each received field so the operator can verify the
+        round-trip on the MSX screen."""
+        q = ""
+        if "?" in target:
+            q = target.split("?", 1)[1]
+        pairs = []
+        if q:
+            for pair in q.split("&"):
+                if "=" in pair:
+                    k, v = pair.split("=", 1)
+                else:
+                    k, v = pair, ""
+                pairs.append((urllib.parse.unquote(k),
+                              urllib.parse.unquote(v)))
+        self._log(f"submit: {pairs}")
+        rows = "".join(
+            f"<tr><td>{_html_escape(k)}</td><td>{_html_escape(v)}</td></tr>"
+            for k, v in pairs
+        )
+        body = (
+            "<html><head><title>Form echo</title></head><body>"
+            "<h2>Form received</h2>"
+            f"<table>{rows}</table>"
+            "</body></html>"
+        )
+        return ("HTM", body.encode("iso-8859-6", "replace"))
 
     # -- implementation --------------------------------------------------
 

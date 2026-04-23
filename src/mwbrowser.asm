@@ -662,9 +662,22 @@ DoFormBackspace:
 ; is expected to echo something back so the operator can verify the
 ; round trip. Skips slots with empty NAME or hidden TYPE so the wire
 ; format matches what a real form post would carry.
+; DoFormSubmit: turn the current form state into a URL of the form
+;   /submit?name1=value1&name2=value2
+; and navigate to it. This reuses the existing RemoteGet pipeline
+; (which already works for regular URL loads) -- the bridge echoes
+; back an HTML page showing the received fields, and the browser
+; renders it as the new content just like any other navigation. No
+; extra wire format, no extra UART hang paths to worry about.
 DoFormSubmit:
-    ld      hl, .dfsHeader
-    call    SerialWriteZ
+    ; Build into UrlBuf: "/submit?" + name=value pairs joined by '&'.
+    ld      hl, .dfsPrefix
+    ld      de, UrlBuf
+    ld      bc, .dfsPrefixEnd - .dfsPrefix
+    ldir
+    ; UrlLen = prefix length so far.
+    ld      a, .dfsPrefixEnd - .dfsPrefix
+    ld      [UrlLen], a
     xor     a
     ld      [DfsAmpPending], a
     ld      [DfsIdx], a
@@ -675,55 +688,93 @@ DoFormSubmit:
     cp      b
     jp      z, .dfsDone
     ld      a, b
-    call    FormGetTypePtr              ; HL -> FormType[idx]
+    call    FormGetTypePtr
     ld      a, [hl]
-    cp      'H'
-    jr      z, .dfsSkipBuiltin          ; hidden -- still sent (matches HTML)
     cp      'S'
     jr      z, .dfsSkip                 ; submit/button: don't include
     cp      'B'
     jr      z, .dfsSkip
     cp      'I'
     jr      z, .dfsSkip                 ; image: skip for now
-.dfsSkipBuiltin:
-    ; Field type is text/pass/check/radio/hidden. Need NAME to be
-    ; non-empty to include it in the query string.
+    ; text/pass/check/radio/hidden all get sent. NAME must be non-empty
+    ; or there's nothing to key the value under.
     ld      a, [DfsIdx]
     call    FormGetNamePtr
     ld      a, [hl]
     or      a
-    jr      z, .dfsSkip                 ; no name -> skip
-    ; Emit '&' if anything came before us.
+    jr      z, .dfsSkip
+    ; '&' separator for all pairs after the first.
     ld      a, [DfsAmpPending]
     or      a
     jr      z, .dfsNoAmp
     ld      a, '&'
-    call    SerialWrite
+    call    UrlAppendA
 .dfsNoAmp:
     ld      a, 1
     ld      [DfsAmpPending], a
     ; name=
     ld      a, [DfsIdx]
     call    FormGetNamePtr
-    call    SerialWriteZ
+    call    UrlAppendZ
     ld      a, '='
-    call    SerialWrite
+    call    UrlAppendA
     ; value
     ld      a, [DfsIdx]
     call    FormGetValuePtr
-    call    SerialWriteZ
+    call    UrlAppendZ
 .dfsSkip:
     ld      a, [DfsIdx]
     inc     a
     ld      [DfsIdx], a
     jp      .dfsLoop
 .dfsDone:
-    ld      hl, .dfsTail
-    call    SerialWriteZ
-    jp      MainLoop
-.dfsHeader:     db "FORM "
-                db 0
-.dfsTail:       db 0x0D, 0x0A, 0
+    ; NUL-terminate.
+    ld      a, [UrlLen]
+    ld      e, a
+    ld      d, 0
+    ld      hl, UrlBuf
+    add     hl, de
+    xor     a
+    ld      [hl], a
+    ; Hand off to the existing navigation path -- RemoteGet sends the
+    ; request, parses "OK HTM <len>", reads the body into FileBuf,
+    ; PrintFileContent renders it.
+    jp      NavigateAndFocusContent
+.dfsPrefix:     db "http:/submit?"
+.dfsPrefixEnd:
+
+; UrlAppendA: append the single byte in A to UrlBuf (if room). Updates
+; UrlLen. Clobbers HL, DE.
+UrlAppendA:
+    push    af
+    ld      a, [UrlLen]
+    cp      URL_MAX
+    jr      nc, .uaaFull
+    ld      e, a
+    ld      d, 0
+    ld      hl, UrlBuf
+    add     hl, de
+    pop     af
+    ld      [hl], a
+    ld      a, [UrlLen]
+    inc     a
+    ld      [UrlLen], a
+    ret
+.uaaFull:
+    pop     af
+    ret
+
+; UrlAppendZ: HL -> NUL-terminated string; append each char to UrlBuf
+; (stops at NUL or URL_MAX).
+UrlAppendZ:
+    ld      a, [hl]
+    or      a
+    ret     z
+    push    hl
+    call    UrlAppendA
+    pop     hl
+    inc     hl
+    jr      UrlAppendZ
 
 DfsIdx:         db 0
 DfsAmpPending:  db 0

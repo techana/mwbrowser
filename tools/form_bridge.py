@@ -1,27 +1,23 @@
 #!/usr/bin/env python3
-"""Form-submission echo bridge for MSX WBrowser.
+"""Minimal form-echo bridge for MSX WBrowser.
 
-The browser sends a form submission over the rs232-net cartridge (TCP
-2323) when the user clicks a submit button or hits Enter on a focused
-text field. The wire format matches an HTTP query string with a small
-prefix so we can find the boundaries:
+The browser submits a form by building `/submit?name=value&...` into
+UrlBuf and calling NavigateAndFocusContent -- exactly the same code
+path it uses to fetch regular URLs. That means the wire protocol is
+the same one RemoteGet already understands:
 
-    FORM name1=value1&name2=value2\r\n
+    MSX -> bridge:  GET /submit?a=1&b=2\\r\\n
+    bridge -> MSX:  OK HTM <len>\\r\\n<body>
 
-This script:
-  1. Listens on TCP 2323 (so openMSX's rs232-net connects to us).
-  2. Reads bytes until it sees the trailing CRLF.
-  3. Parses the "FORM " line, prints what was received in a friendly
-     way, then echoes the same line back to the MSX prefixed with
-     "OK " so the operator can verify the round-trip.
+Running this script instead of tools/web_bridge.py gives you a tiny
+Playwright-free echo server that just renders the received fields as
+a <table>. Useful for exercising the form-submit path without spinning
+up a full web-fetching bridge.
 
-Pair with tools/plug_rs232.tcl (which gets passed to openMSX -script),
-then launch the browser with run.sh.
-
-    $ python3 tools/form_bridge.py            # start listener
-    $ ./tools/run.sh -i                       # in another terminal
-    A> MWBRO
-    (... fill in test12.htm form, click Send ...)
+    $ python3 -u tools/form_bridge.py
+    $ ./tools/run.sh -i -ext rs232 -script tools/plug_rs232.tcl
+      (in MSX) A> MWBRO
+      (fill the form, click Send)
 """
 
 from __future__ import annotations
@@ -33,12 +29,88 @@ import time
 from urllib.parse import unquote
 
 
+def html_escape(s: str) -> str:
+    return (s.replace("&", "&amp;")
+             .replace("<", "&lt;")
+             .replace(">", "&gt;"))
+
+
+def render_echo(pairs: list[tuple[str, str]]) -> bytes:
+    rows = "".join(
+        f"<tr><td>{html_escape(k)}</td><td>{html_escape(v)}</td></tr>"
+        for k, v in pairs
+    )
+    body = (
+        "<html><head><title>Form echo</title></head><body>"
+        "<h2>Form received</h2>"
+        f"<table>{rows}</table>"
+        "</body></html>"
+    )
+    return body.encode("iso-8859-6", "replace")
+
+
+def parse_query(q: str) -> list[tuple[str, str]]:
+    out = []
+    if not q:
+        return out
+    for pair in q.split("&"):
+        if "=" in pair:
+            k, v = pair.split("=", 1)
+        else:
+            k, v = pair, ""
+        out.append((unquote(k), unquote(v)))
+    return out
+
+
+def handle_request(conn: socket.socket, line: str) -> None:
+    ts = time.strftime("%H:%M:%S")
+    print(f"\n{ts} -> {line!r}")
+    # Expect "GET <target>". Everything else is an error.
+    if not line.startswith("GET "):
+        conn.sendall(b"ERR 400\r\n")
+        return
+    target = line[4:]
+    # Browser uses "http:/submit?..." so the scheme check in LoadFile
+    # routes it to RemoteGet. Strip the scheme here.
+    if target.startswith("http:/submit") or target.startswith("/submit"):
+        if target.startswith("http:"):
+            target = target[5:]              # drop "http:" keep "/submit?..."
+        q = target.split("?", 1)[1] if "?" in target else ""
+        pairs = parse_query(q)
+        for k, v in pairs:
+            print(f"    {k!r:<14} = {v!r}")
+        body = render_echo(pairs)
+        hdr = f"OK HTM {len(body)}\r\n".encode("ascii")
+        conn.sendall(hdr + body)
+        print(f"    -> HTM {len(body)} B")
+    else:
+        conn.sendall(b"ERR 404\r\n")
+        print(f"    -> 404")
+
+
+def handle_session(conn: socket.socket) -> None:
+    """Requests are line-terminated (CRLF). Read into a buffer and
+    dispatch one at a time; the same TCP connection can carry many
+    requests."""
+    buf = bytearray()
+    conn.setblocking(True)
+    while True:
+        chunk = conn.recv(256)
+        if not chunk:
+            return
+        buf.extend(chunk)
+        while b"\r\n" in buf:
+            line, _, rest = buf.partition(b"\r\n")
+            buf[:] = rest
+            handle_request(conn, line.decode("ascii", "replace"))
+
+
 def serve(host: str, port: int) -> int:
     srv = socket.socket()
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((host, port))
     srv.listen(1)
-    print(f"form_bridge: listening on {host}:{port} -- start MSX + MWBRO now")
+    print(f"form_bridge: listening on {host}:{port}")
 
     while True:
         conn, addr = srv.accept()
@@ -50,66 +122,6 @@ def serve(host: str, port: int) -> int:
         finally:
             conn.close()
             print("[disconnected]")
-
-
-def handle_session(conn: socket.socket) -> None:
-    """Stream lines forever -- one TCP connect can carry many submits.
-
-    The MSX sends a CRLF-terminated `FORM ...` line per submission. We
-    print + echo each one as it lands, so the operator can submit
-    multiple times without restarting either side."""
-    buf = bytearray()
-    conn.setblocking(True)
-    while True:
-        chunk = conn.recv(256)
-        if not chunk:
-            return
-        buf.extend(chunk)
-        while b"\r\n" in buf:
-            line, _, rest = buf.partition(b"\r\n")
-            buf[:] = rest
-            handle_line(conn, line.decode("ascii", "replace"))
-
-
-def handle_line(conn: socket.socket, line: str) -> None:
-    """Print the submission as a parsed dict + echo the literal line
-    back to the MSX prefixed with 'OK '. The browser doesn't read the
-    echo for now (no UI surface for it), but the operator sees it land
-    in the openMSX window and can correlate."""
-    ts = time.strftime("%H:%M:%S")
-    print(f"\n--- {ts} -- raw: {line!r}")
-
-    if line.startswith("FORM "):
-        body = line[5:]
-        fields = parse_query(body)
-        print(f"    parsed:")
-        for k, v in fields:
-            print(f"      {k!r:<14} = {v!r}")
-    else:
-        print("    (not a FORM line)")
-
-    reply = ("OK " + line + "\r\n").encode("ascii", "replace")
-    try:
-        conn.sendall(reply)
-        print(f"    echoed back: {reply!r}")
-    except OSError as e:
-        print(f"    echo failed: {e}")
-
-
-def parse_query(body: str) -> list[tuple[str, str]]:
-    """Split "a=1&b=2" into [(a, 1), (b, 2)]; URL-decode each piece so
-    a future version that escapes '&' or '=' inside a value still
-    round-trips legibly here."""
-    out = []
-    if not body:
-        return out
-    for pair in body.split("&"):
-        if "=" in pair:
-            k, v = pair.split("=", 1)
-        else:
-            k, v = pair, ""
-        out.append((unquote(k), unquote(v)))
-    return out
 
 
 def main() -> int:
