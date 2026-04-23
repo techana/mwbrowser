@@ -8419,43 +8419,56 @@ EmitSinkZ:
     inc     hl
     jr      EmitSinkZ
 
-; <select>...</select>: render as a text-input-shaped widget.
-; The currently-selected option's text would normally appear inside;
-; for now we render an empty box of TI_SELECT_W cells. OPTION bodies
-; are silenced via HtmlSkipBody so their labels don't bleed into the
-; surrounding document flow.
+; <select>...</select>: render as a text-input-shaped widget. The first
+; <option>'s label flows into the box (via HtmlSelectFound + the OPTION
+; handler); subsequent options stay suppressed. The box opens with the
+; left edge + one pad cell, and closes with one pad cell + the right
+; edge -- so the visible width is `1 + len(option) + 1` cells, hugging
+; the label.
 TagSelect:
     ld      a, [HtmlIsClose]
     or      a
     jr      nz, .tsClose
     ld      a, WG_BOX_L
     call    EmitSink
-    ld      b, TI_SELECT_W
-.tsBoxLoop:
-    push    bc
     ld      a, WG_BOX_M
-    call    EmitSink
-    pop     bc
-    djnz    .tsBoxLoop
-    ld      a, WG_BOX_R
-    call    EmitSink
+    call    EmitSink                        ; left pad cell
     ld      a, 1
     ld      [HtmlSkipBody], a
+    xor     a
+    ld      [HtmlSelectFound], a            ; no option seen yet
     ret
 .tsClose:
+    ld      a, WG_BOX_M
+    call    EmitSink                        ; right pad cell
+    ld      a, WG_BOX_R
+    call    EmitSink
     xor     a
     ld      [HtmlSkipBody], a
     ret
 
-; Default visible width of a <select> when no SIZE= was given. Same
-; metric as TI_TEXT_DEFAULT_W; broken out so we can tune the two
-; widgets independently once SIZE parsing lands.
-TI_SELECT_W     equ 12
-
-; <option>...</option>: a no-op -- the surrounding <select> has
-; already turned on HtmlSkipBody, so the option's text is silently
-; dropped on its way through EmitSink.
+; <option>...</option>: routes the label text into the parent <select>'s
+; box. The first OPTION inside a SELECT clears HtmlSkipBody so its
+; text is emitted; the closing tag turns suppression back on. Any
+; later OPTIONs see HtmlSelectFound set and stay quiet.
 TagOption:
+    ld      a, [HtmlIsClose]
+    or      a
+    jr      nz, .toClose
+    ld      a, [HtmlSelectFound]
+    or      a
+    ret     nz                              ; already shown one
+    ld      a, 1
+    ld      [HtmlSelectFound], a
+    xor     a
+    ld      [HtmlSkipBody], a               ; let this option's text flow
+    ret
+.toClose:
+    ld      a, [HtmlSelectFound]
+    or      a
+    ret     z
+    ld      a, 1
+    ld      [HtmlSkipBody], a               ; suppress siblings again
     ret
 
 ; <textarea>...</textarea>: render as a single-row text-box widget for
@@ -10902,75 +10915,82 @@ WidgetBoxR:
     db  0xAA, 0xA8      ; row 12
     db  0x00, 0x00      ; row 13: bottom border
 
+; Checkbox + radio share a 1-px-wide white margin on each side of the
+; cell (cols 0 and 7 are always blank), so they don't kiss the labels
+; sitting either side of them. The actual ring/box lives in cols 1..6
+; -- 6 px wide.
+
 WidgetChkOff:
-    db  0xAA, 0xAA      ; row 0: blank
-    db  0x00, 0x00      ; row 1: top border (8 px dgray)
-    db  0x2A, 0xA8      ; row 2: G W W W W W W G
-    db  0x2A, 0xA8      ; row 3
-    db  0x2A, 0xA8      ; row 4
-    db  0x2A, 0xA8      ; row 5
-    db  0x2A, 0xA8      ; row 6
-    db  0x2A, 0xA8      ; row 7
-    db  0x2A, 0xA8      ; row 8
-    db  0x2A, 0xA8      ; row 9
-    db  0x2A, 0xA8      ; row 10
-    db  0x2A, 0xA8      ; row 11
-    db  0x00, 0x00      ; row 12: bottom border
+    db  0xAA, 0xAA      ; row 0:  blank
+    db  0x80, 0x02      ; row 1:  W G G G G G G W  (top border)
+    db  0x8A, 0xA2      ; row 2:  W G W W W W G W  (left + right verticals)
+    db  0x8A, 0xA2      ; row 3
+    db  0x8A, 0xA2      ; row 4
+    db  0x8A, 0xA2      ; row 5
+    db  0x8A, 0xA2      ; row 6
+    db  0x8A, 0xA2      ; row 7
+    db  0x8A, 0xA2      ; row 8
+    db  0x8A, 0xA2      ; row 9
+    db  0x8A, 0xA2      ; row 10
+    db  0x8A, 0xA2      ; row 11
+    db  0x80, 0x02      ; row 12: bottom border
     db  0xAA, 0xAA      ; row 13: blank
 
-; Checked = the empty box plus an inner filled-square indicator (rows 3..10
-; cols 2..5). Filled rectangle is much easier to read at this size than a
-; 6-px X cross.
+; Checked = the same outline filled solid dark-grey across cols 1..6.
+; A simple flood is more legible at 1.25x screenshot scale than the
+; "outline + tiny inner X" that earlier attempts went for.
 WidgetChkOn:
     db  0xAA, 0xAA      ; row 0:  blank
-    db  0x00, 0x00      ; row 1:  top border
-    db  0x2A, 0xA8      ; row 2:  G W W W W W W G
-    db  0x20, 0x08      ; row 3:  G W G G G G W G  (top of fill)
-    db  0x20, 0x08      ; row 4
-    db  0x20, 0x08      ; row 5
-    db  0x20, 0x08      ; row 6
-    db  0x20, 0x08      ; row 7
-    db  0x20, 0x08      ; row 8
-    db  0x20, 0x08      ; row 9
-    db  0x20, 0x08      ; row 10: bottom of fill
-    db  0x2A, 0xA8      ; row 11
-    db  0x00, 0x00      ; row 12: bottom border
+    db  0x80, 0x02      ; row 1:  W G G G G G G W  (top border)
+    db  0x80, 0x02      ; row 2:  filled body
+    db  0x80, 0x02      ; row 3
+    db  0x80, 0x02      ; row 4
+    db  0x80, 0x02      ; row 5
+    db  0x80, 0x02      ; row 6
+    db  0x80, 0x02      ; row 7
+    db  0x80, 0x02      ; row 8
+    db  0x80, 0x02      ; row 9
+    db  0x80, 0x02      ; row 10
+    db  0x80, 0x02      ; row 11
+    db  0x80, 0x02      ; row 12: bottom border
     db  0xAA, 0xAA      ; row 13: blank
 
+; 6 px-wide oval radio living in cols 1..6. Top + bottom caps step in
+; one column at a time so the curve looks rounded rather than rectangular.
 WidgetRadOff:
     db  0xAA, 0xAA      ; row 0:  blank
-    db  0xA0, 0x0A      ; row 1:  W W G G G G W W  (top arc)
+    db  0xA8, 0x2A      ; row 1:  W W W G G W W W  (top cap)
     db  0xA2, 0x8A      ; row 2:  W W G W W G W W
     db  0x8A, 0xA2      ; row 3:  W G W W W W G W
-    db  0x2A, 0xA8      ; row 4:  G W W W W W W G
-    db  0x2A, 0xA8      ; row 5
-    db  0x2A, 0xA8      ; row 6
-    db  0x2A, 0xA8      ; row 7
-    db  0x2A, 0xA8      ; row 8
-    db  0x2A, 0xA8      ; row 9
-    db  0x8A, 0xA2      ; row 10: W G W W W W G W
+    db  0x8A, 0xA2      ; row 4
+    db  0x8A, 0xA2      ; row 5
+    db  0x8A, 0xA2      ; row 6
+    db  0x8A, 0xA2      ; row 7
+    db  0x8A, 0xA2      ; row 8
+    db  0x8A, 0xA2      ; row 9
+    db  0x8A, 0xA2      ; row 10
     db  0xA2, 0x8A      ; row 11: W W G W W G W W
-    db  0xA0, 0x0A      ; row 12: W W G G G G W W
+    db  0xA8, 0x2A      ; row 12: W W W G G W W W  (bottom cap)
     db  0xAA, 0xAA      ; row 13: blank
 
-; Filled-circle "checked" radio: a 6 px-wide x 6 px-tall dark-grey blob
-; (rows 4..9, cols 1..6) inside the outer ring. Big enough to read at
-; the openMSX 1.25x screenshot scale; small enough to leave one row of
-; white margin between the dot and the ring's left/right verticals.
+; Filled radio: same outer ring; the "selected" indicator is a 6-px-wide
+; x 4-px-tall dark-grey blob at cols 1..6, rows 5..8 -- a chunky
+; horizontal bar through the centre that reads cleanly even at
+; small render scales.
 WidgetRadOn:
-    db  0xAA, 0xAA      ; row 0
-    db  0xA0, 0x0A      ; row 1:  outer top arc
+    db  0xAA, 0xAA      ; row 0:  blank
+    db  0xA8, 0x2A      ; row 1:  top cap
     db  0xA2, 0x8A      ; row 2
     db  0x8A, 0xA2      ; row 3
-    db  0x00, 0x00      ; row 4:  G G G G G G G G  (dot top)
-    db  0x00, 0x00      ; row 5
-    db  0x00, 0x00      ; row 6
-    db  0x00, 0x00      ; row 7
-    db  0x00, 0x00      ; row 8
-    db  0x00, 0x00      ; row 9:  (dot bottom)
+    db  0x8A, 0xA2      ; row 4
+    db  0x80, 0x02      ; row 5:  W G G G G G G W  (blob top)
+    db  0x80, 0x02      ; row 6
+    db  0x80, 0x02      ; row 7
+    db  0x80, 0x02      ; row 8:  blob bottom
+    db  0x8A, 0xA2      ; row 9
     db  0x8A, 0xA2      ; row 10
     db  0xA2, 0x8A      ; row 11
-    db  0xA0, 0x0A      ; row 12: outer bottom arc
+    db  0xA8, 0x2A      ; row 12: bottom cap
     db  0xAA, 0xAA      ; row 13
 
 ; Lookup table indexed by widget id (0..7). Index 0 is a NULL placeholder
@@ -11094,6 +11114,14 @@ HtmlSkipBody:   db 0
 ; CHECKED attribute on the current tag. TagInput's checkbox / radio
 ; branches read it to pick WG_CHK_ON / WG_RAD_ON over the _OFF variant.
 HtmlChecked:    db 0
+; HtmlSelectFound is reset by TagSelect at open and set by the first
+; <option> seen inside the select. While the flag is 0 the next OPTION
+; tag opens with HtmlSkipBody=0 so its label flows through into the
+; select's box; once set, all later options stay suppressed. This is a
+; pragmatic stand-in for honouring <option selected> properly (we'd
+; need a 2-pass scan to do that without rolling back already-emitted
+; cells). For now: first option = the visible one.
+HtmlSelectFound: db 0
 
 ; Image-map scratch. `<map>` begins a block of `<area>` rects; their
 ; coords are page-local (relative to the chunk's top-left). When the
