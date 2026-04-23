@@ -10356,9 +10356,12 @@ TryFormClick:
     jp      z, .tfcToggle
     cp      'L'
     jp      z, .tfcCycle
-    ; Text / password (or anything else focusable): just refresh.
+    ; Text / password (or anything else focusable): refresh so the
+    ; focus border shows, then jp MainLoop -- must NOT return normally
+    ; into ClickContent's fall-through, which would immediately clear
+    ; HtmlFormFocus as an "empty area" click.
     call    RefreshContentInPlace
-    ret
+    jp      MainLoop
 .tfcFire:
     ld      a, c
     call    FormFlashSlot
