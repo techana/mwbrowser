@@ -8737,10 +8737,12 @@ TagInput:
 
 .inputSubmit:
     call    FormAllocCurrent
+    push    af
     call    nc, FormStoreFromSlotA
-    ; Padded "[ Label ]" rectangle. Label text rides on top of the
-    ; WG_BOX_M fill cells; for ASCII glyphs the font's blank top/bottom
-    ; rows leave the box outline intact.
+    pop     af
+    ld      [.tisSlot], a
+    ; Capture pre-emit rect so click hit-test can find the button.
+    call    FormCaptureRect
     ld      a, WG_BOX_L
     call    EmitSink
     ld      a, WG_BOX_M
@@ -8755,8 +8757,12 @@ TagInput:
     ld      a, WG_BOX_M
     call    EmitSink                    ; right-pad
     ld      a, WG_BOX_R
-    jp      EmitSink
+    call    EmitSink
+    ; All cells emitted -- write final width.
+    ld      a, [.tisSlot]
+    jp      FormFinishRect
 .tisDefault:    db "OK", 0
+.tisSlot:       db 0
 
 .inputCheckbox:
     call    FormAllocCurrent
@@ -8840,6 +8846,78 @@ FormEndRender:
 
 FormSticky:     db 0
 FormParseCursor: db 0
+
+; Per-slot screen rectangle, captured by TagInput at render time. Used
+; by TryFormClick to map mouse coords to a slot. X is 16-bit pixel,
+; Y is 8-bit row, W is pixel width.
+FormScreenX:    ds FORM_MAX * 2
+FormScreenY:    ds FORM_MAX
+FormScreenW:    ds FORM_MAX * 2
+
+; FormCaptureRect: A = slot. Stores (TextX, TextY, width=0) for the
+; current widget into FormScreen[X|Y|W][A]. Width is computed later by
+; FormFinishRect once the widget's cells have been emitted. Clobbers
+; A, BC, DE, HL.
+FormCaptureRect:
+    ld      e, a
+    ld      d, 0
+    push    de
+    ; X (16-bit)
+    pop     de
+    push    de
+    ld      hl, FormScreenX
+    add     hl, de
+    add     hl, de
+    ld      a, [TextX]
+    ld      [hl], a
+    inc     hl
+    ld      a, [TextX + 1]
+    ld      [hl], a
+    ; Y (8-bit)
+    pop     de
+    push    de
+    ld      hl, FormScreenY
+    add     hl, de
+    ld      a, [TextY]
+    ld      [hl], a
+    ; W = 0
+    pop     de
+    ld      hl, FormScreenW
+    add     hl, de
+    add     hl, de
+    xor     a
+    ld      [hl], a
+    inc     hl
+    ld      [hl], a
+    ret
+
+; FormFinishRect: A = slot. Compute width = TextX - FormScreenX[A].
+; Stores into FormScreenW[A] (16-bit). Clobbers A, BC, DE, HL.
+FormFinishRect:
+    ld      e, a
+    ld      d, 0
+    ld      hl, FormScreenX
+    add     hl, de
+    add     hl, de
+    ld      c, [hl]
+    inc     hl
+    ld      b, [hl]                         ; BC = startX
+    ld      hl, [TextX]
+    and     a
+    sbc     hl, bc                          ; HL = end - start
+    ; Store HL into FormScreenW[A].
+    ld      a, e
+    ld      e, a
+    ld      d, 0
+    push    hl
+    ld      hl, FormScreenW
+    add     hl, de
+    add     hl, de
+    pop     bc                              ; BC = width
+    ld      [hl], c
+    inc     hl
+    ld      [hl], b
+    ret
 
 ; FormAllocCurrent: reserve the parse cursor's current slot and return
 ; its index in A. CF=0 on success, CF=1 if FormParseCursor reached
@@ -9421,6 +9499,143 @@ EntityTable:
     db  "APOS", 0, 0x27                 ; apostrophe
     db  "NBSP", 0, 0x20                 ; space
     db  0                               ; end marker
+
+; TryFormClick: walk FormFields looking for a submit/button slot whose
+; rect contains the current mouse position. On hit: flash the button
+; (paint its interior dgray briefly), trigger DoFormSubmit. Returns
+; normally on miss so the caller can fall through to TryLinkClick.
+TryFormClick:
+    ld      a, [FormCount]
+    or      a
+    ret     z
+    ld      b, a
+    ld      c, 0
+.tfcLoop:
+    push    bc
+    ld      a, c
+    call    FormGetTypePtr
+    ld      a, [hl]
+    cp      'S'
+    jr      z, .tfcSubmitLike
+    cp      'B'
+    jr      z, .tfcSubmitLike
+    pop     bc
+    inc     c
+    djnz    .tfcLoop
+    ret
+.tfcSubmitLike:
+    pop     bc
+    push    bc
+    ld      a, c
+    call    FormHitTest                     ; CF=0 if hit
+    pop     bc
+    jr      c, .tfcMiss
+    ld      a, c
+    call    FormFlashSlot
+    jp      DoFormSubmit
+.tfcMiss:
+    inc     c
+    djnz    .tfcLoop
+    ret
+
+; FormHitTest: A = slot. CF=0 on hit, CF=1 on miss.
+FormHitTest:
+    ld      e, a
+    ld      d, 0
+    ; Y check
+    ld      hl, FormScreenY
+    add     hl, de
+    ld      a, [hl]
+    ld      b, a                            ; B = SY
+    ld      a, [MouseY]
+    ld      c, a                            ; C = mouseY
+    ld      a, b
+    sub     WG_Y_RAISE                      ; top row
+    cp      c
+    jr      z, .fhtYAtTop
+    jr      nc, .fhtMiss                    ; mouseY < top
+.fhtYAtTop:
+    ld      a, b
+    add     a, WG_HEIGHT - WG_Y_RAISE
+    cp      c
+    jr      c, .fhtMiss                     ; mouseY >= bot
+    ; X check
+    ld      hl, FormScreenX
+    add     hl, de
+    add     hl, de
+    ld      c, [hl]
+    inc     hl
+    ld      b, [hl]                         ; BC = SX
+    ld      hl, [MouseX]
+    and     a
+    sbc     hl, bc                          ; HL = mouseX - SX
+    jr      c, .fhtMiss
+    ; Compare HL against W.
+    push    hl
+    ld      hl, FormScreenW
+    add     hl, de
+    add     hl, de
+    ld      c, [hl]
+    inc     hl
+    ld      b, [hl]                         ; BC = W
+    pop     hl
+    and     a
+    sbc     hl, bc
+    jr      nc, .fhtMiss                    ; rel >= W
+    or      a                                ; CF=0
+    ret
+.fhtMiss:
+    scf
+    ret
+
+; FormFlashSlot: A = slot. Paint the slot's rect dgray briefly. The
+; subsequent DoFormSubmit -> bridge round-trip (and any later
+; RefreshAfterScroll) restores the box artwork.
+FormFlashSlot:
+    ld      e, a
+    ld      d, 0
+    push    de
+    ; B = byte-col = SX / 4
+    ld      hl, FormScreenX
+    add     hl, de
+    add     hl, de
+    ld      a, [hl]
+    inc     hl
+    ld      h, [hl]
+    ld      l, a
+    srl     h
+    rr      l
+    srl     h
+    rr      l
+    ld      b, l
+    pop     de
+    push    de
+    ; C = top row = SY - WG_Y_RAISE
+    ld      hl, FormScreenY
+    add     hl, de
+    ld      a, [hl]
+    sub     WG_Y_RAISE
+    ld      c, a
+    pop     de
+    ; D = width in byte cols = W / 4 (low byte)
+    ld      hl, FormScreenW
+    add     hl, de
+    add     hl, de
+    ld      a, [hl]
+    srl     a
+    srl     a
+    ld      d, a
+    ld      e, WG_HEIGHT
+    ld      a, COL_DGRAY
+    call    FillRect
+    ; Brief busy-wait so the flash is perceptible.
+    ld      hl, 0
+.flashWait:
+    inc     hl
+    ld      a, h
+    cp      0x20
+    jr      c, .flashWait
+    ret
 
 ; TryLinkClick: if MouseX/MouseY sits on any link rect recorded in
 ; LinkTable, copy its URL into UrlBuf and tail-jump into navigation
@@ -10403,8 +10618,10 @@ ClickContent:
     ld      de, SCROLL_X0
     call    CpHL
     jr      nc, .cScroll                ; x >= 496 -> scrollbar
-    ; Click inside the text. First check for a link hit, otherwise focus
-    ; the content area so scroll keys work.
+    ; Click inside the text. First check for a form submit-button hit
+    ; (we own the line: flash + dispatch + re-render); then a link hit;
+    ; otherwise focus the content area so scroll keys work.
+    call    TryFormClick                ; returns/jumps away on hit
     call    TryLinkClick                ; navigates + returns if hit
     ld      a, FOC_CONTENT
     ld      [Focus], a
