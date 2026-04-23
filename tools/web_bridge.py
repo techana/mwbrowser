@@ -79,6 +79,20 @@ def _int_or_none(m):
     return int(m.group(1)) if m else None
 
 
+def _predict_msx_size(declared_w: int, declared_h: int) -> "tuple[int, int]":
+    """Mirror the declared-dimensions branch of _resize_for_msx() so the
+    HTML rewriter can update width/height attrs to what the PCX will
+    actually be. Keeps the "halve height + round-up width to /4" steps in
+    one place; if _resize_for_msx changes its math, update this too."""
+    tgt_w = declared_w
+    tgt_h = max(1, declared_h // 2)
+    MAX_W, MAX_H = 492, 183
+    tgt_w = min(MAX_W, max(4, tgt_w))
+    tgt_w = (tgt_w + 3) & ~3
+    tgt_h = min(MAX_H, max(1, tgt_h))
+    return tgt_w, tgt_h
+
+
 def _resize_for_msx(im: "Image.Image",
                     declared_w: "int | None",
                     declared_h: "int | None") -> "Image.Image":
@@ -243,10 +257,25 @@ class BridgeSession:
             w = _int_or_none(IMG_W.search(tag))
             h = _int_or_none(IMG_H.search(tag))
             handle = self._register_image(src, w, h)
-            # Replace the src= value with our short handle but leave the
-            # rest of the attributes alone (width / height / alt).
             new_src = b'src="' + handle.encode("ascii") + b'"'
-            return tag[:src_m.start()] + new_src + tag[src_m.end():]
+            new_tag = tag[:src_m.start()] + new_src + tag[src_m.end():]
+            # Rewrite width / height to match the dimensions the PCX will
+            # actually have after _resize_for_msx(). The browser's sticky
+            # re-render path (ReserveImgLayout) reads these attributes to
+            # reserve the layout rectangle without re-fetching -- if they
+            # disagree with the rendered PCX, content below the image
+            # shifts on every Tab. Applies only when the author gave
+            # both dimensions; _resize_for_msx() halves height for MSX
+            # 2:1 pixel aspect in that path.
+            if w and h:
+                tgt_w, tgt_h = _predict_msx_size(w, h)
+                new_tag = IMG_W.sub(
+                    lambda _m, v=tgt_w: b'width="' + str(v).encode() + b'"',
+                    new_tag, count=1)
+                new_tag = IMG_H.sub(
+                    lambda _m, v=tgt_h: b'height="' + str(v).encode() + b'"',
+                    new_tag, count=1)
+            return new_tag
 
         def href_repl(m: re.Match) -> bytes:
             prefix = m.group(1)
