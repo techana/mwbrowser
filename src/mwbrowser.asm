@@ -2211,6 +2211,17 @@ PrintFileContent:
     push    hl
     call    ArFlush
     pop     hl
+    ; Flush a pending whitespace BEFORE the tag handler runs. EmitText
+    ; collapses runs of whitespace into a single ' ' that gets emitted
+    ; on the next non-WS text char -- but inline-widget tags (<input>,
+    ; <select>, ...) emit cells directly via EmitSink, bypassing that
+    ; flush. Without this, "A <input checkbox>" rendered with the
+    ; trailing space silently dropped, so the label kissed the next
+    ; widget. Run the flush here so every tag boundary inherits the
+    ; same flow as a normal text char.
+    push    hl
+    call    FlushPendingWs
+    pop     hl
     call    ParseTag
     jr      .loop
 
@@ -2297,6 +2308,21 @@ EmitText:
     ld      a, 1
     ld      [HtmlWsPending], a
     ret
+
+; FlushPendingWs: if HtmlWsPending is set, emit one ' ' through EmitSink
+; and clear the flag. Called at the parser's tag boundary so a trailing
+; space in front of an inline widget tag (e.g. "A <input>") still lands
+; before the widget cells -- otherwise the space would only be flushed
+; on the next plain-text char, which never arrives until the widget
+; emits are already in place. Preserves no registers.
+FlushPendingWs:
+    ld      a, [HtmlWsPending]
+    or      a
+    ret     z
+    xor     a
+    ld      [HtmlWsPending], a
+    ld      a, ' '
+    jp      EmitSink
 
 ; EmitListBullet: print "* " for <ul> / "N. " for <ol>, then the caller
 ; continues with the item's own text. Consumes HtmlOlCounter for ordered
@@ -8440,14 +8466,16 @@ TagSelect:
     ret
 .tsClose:
     ; Clear SkipBody FIRST -- the previous </option> left it on so any
-    ; trailing OPTION text would stay suppressed, but the closing M + R
-    ; cells we emit here still need to flow through EmitSink. Without
-    ; this the box's right edge silently vanishes and the next text on
-    ; the line floats outside an "open" rectangle.
+    ; trailing OPTION text would stay suppressed, but the closing cells
+    ; we emit here still need to flow through EmitSink. Without this
+    ; the box's right edge silently vanishes and the next text on the
+    ; line floats outside an "open" rectangle.
     xor     a
     ld      [HtmlSkipBody], a
     ld      a, WG_BOX_M
     call    EmitSink                        ; right pad cell
+    ld      a, WG_SEL_ARROW
+    call    EmitSink                        ; dropdown indicator
     ld      a, WG_BOX_R
     jp      EmitSink
 
@@ -10855,8 +10883,9 @@ WG_CHK_OFF      equ 0x04
 WG_CHK_ON       equ 0x05
 WG_RAD_OFF      equ 0x06
 WG_RAD_ON       equ 0x07
+WG_SEL_ARROW    equ 0x08                    ; down-pointing dropdown indicator
 WG_FIRST        equ 0x01
-WG_LAST         equ 0x07
+WG_LAST         equ 0x08
 
 WG_HEIGHT       equ 14
 WG_Y_RAISE      equ 3                       ; widget top sits this many px above TextY
@@ -10999,7 +11028,27 @@ WidgetRadOn:
     db  0xA8, 0x2A      ; row 12: bottom cap
     db  0xAA, 0xAA      ; row 13
 
-; Lookup table indexed by widget id (0..7). Index 0 is a NULL placeholder
+; Down-pointing arrow used as the dropdown indicator on the right edge
+; of <select>. Carries the M-cell top + bottom border rows so the box's
+; outline stays continuous if PaintBoxConnectors is ever skipped; the
+; arrow itself is a 6-2-2 stepped triangle in cols 1..6, rows 6..8.
+WidgetSelArrow:
+    db  0x00, 0x00      ; row 0:  top border
+    db  0xAA, 0xAA      ; row 1
+    db  0xAA, 0xAA      ; row 2
+    db  0xAA, 0xAA      ; row 3
+    db  0xAA, 0xAA      ; row 4
+    db  0xAA, 0xAA      ; row 5
+    db  0x80, 0x02      ; row 6:  W G G G G G G W  (arrow top)
+    db  0xA0, 0x0A      ; row 7:  W W G G G G W W  (narrowing)
+    db  0xA8, 0x2A      ; row 8:  W W W G G W W W  (point)
+    db  0xAA, 0xAA      ; row 9
+    db  0xAA, 0xAA      ; row 10
+    db  0xAA, 0xAA      ; row 11
+    db  0xAA, 0xAA      ; row 12
+    db  0x00, 0x00      ; row 13: bottom border
+
+; Lookup table indexed by widget id (0..8). Index 0 is a NULL placeholder
 ; so DrawWidgetGlyph can use `id * 2` to index without subtracting 1.
 WidgetBitmaps:
     dw  0
@@ -11010,6 +11059,7 @@ WidgetBitmaps:
     dw  WidgetChkOn
     dw  WidgetRadOff
     dw  WidgetRadOn
+    dw  WidgetSelArrow
 
 ; resources/up.png -> 8x5 MSX pixels. DrawDownArrow reuses this by reading
 ; rows in reverse (DrawBitmapReverse), so no separate down-arrow bitmap.
