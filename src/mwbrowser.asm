@@ -75,7 +75,9 @@ CGPNT          equ 0xF91F      ; slot (1B) + address (2B, LE) of font table
 ; are BLACK (value 3) for pure black. Separator, thumb, and unfocused
 ; borders use DGRAY (value 0), which dithers pal 0+pal 2 into a mid-gray
 ; visibly darker than LGRAY.
-COL_DGRAY      equ 0       ; pair (pal 0 dgray + pal 2 white) -> dither
+COL_DGRAY      equ 0       ; solid pal 0 = dark gray (~RGB 73,73,73);
+                            ; in a pair-paletted byte alongside pal 2 it
+                            ; dithers to mid-grey (used by the chrome).
 COL_LGRAY      equ 1       ; solid pal 1 = light gray
 COL_WHITE      equ 2       ; solid pal 2 = white
 COL_BLACK      equ 3       ; solid pal 3 = black
@@ -1360,8 +1362,23 @@ DrawWidgetGlyph:
     inc     hl
     ld      h, [hl]
     ld      l, a                            ; HL = bitmap pointer
+    ; Paint WG_HEIGHT rows starting WG_Y_RAISE px above TextY so the
+    ; widget straddles the 8-px text baseline (3 px headroom + 8 px text
+    ; + 3 px footroom = 14 px). Clamp at the top of the content area so
+    ; the very first text row in a paragraph doesn't paint into the
+    ; chrome titlebar.
+    ld      a, c
+    sub     WG_Y_RAISE
+    jr      nc, .dwgYOk
+    xor     a
+.dwgYOk:
+    cp      CONTENT_Y0
+    jr      nc, .dwgYStore
+    ld      a, CONTENT_Y0
+.dwgYStore:
+    ld      c, a
     ld      d, 2                            ; 2 bytes/row (8 px wide)
-    ld      e, 8                            ; 8 rows tall
+    ld      e, WG_HEIGHT
     jr      DrawBitmap
 
 ; DrawBitmap: blit packed Screen-6 bitmap to VRAM at (B*4, C), D bytes * E rows.
@@ -3412,23 +3429,35 @@ PaintBoxConnectors:
     add     a, a
     add     a, c
     ld      b, a                             ; B = start byte-col
+    ; Top connector: WG_Y_RAISE px above TextY. Clamp to CONTENT_Y0 so
+    ; a first-line widget doesn't paint into the chrome row.
     ld      a, [TextY]
+    sub     WG_Y_RAISE
+    jr      nc, .pbcTopOk
+    xor     a
+.pbcTopOk:
+    cp      CONTENT_Y0
+    jr      nc, .pbcTopStore
+    ld      a, CONTENT_Y0
+.pbcTopStore:
     ld      c, a                             ; C = top row
     push    bc
     push    de
-    ld      a, COL_BLACK
+    ld      a, COL_DGRAY
     call    DrawHLine
     pop     de
     pop     bc
+    ; Bottom connector: matches widget bitmap row 13 -> TextY + (WG_HEIGHT
+    ; - 1 - WG_Y_RAISE) = TextY + 10.
     ld      a, [TextY]
-    add     a, 7
+    add     a, WG_HEIGHT - 1 - WG_Y_RAISE
     ld      c, a                             ; C = bottom row
-    ld      a, COL_BLACK
+    ld      a, COL_DGRAY
     call    DrawHLine
     ld      a, [PbcI]
     inc     a
     ld      [PbcI], a
-    jr      .pbcLoop
+    jp      .pbcLoop
 FxLinkI:        db 0                ; link iteration index for FixRtlLinkRectsOnLine
 FxOrigStart:    dw 0
 FxOrigEnd:      dw 0
@@ -4094,6 +4123,8 @@ ScanHrefAttr:
     ld      [HtmlInputType], a
     ld      a, 'X'
     ld      [HtmlInputType + 1], a
+    xor     a
+    ld      [HtmlChecked], a                ; CHECKED defaults to false
 .sh_scan:
     ld      a, [hl]
     cp      '>'
@@ -4492,14 +4523,15 @@ ScanHrefAttr:
     jp      .sh_readValue
 
 .sh_tryColor:
-    ; C starts both COLOR (<font>) and COORDS (<area>). Second letter
-    ; is 'O' for both; third letter disambiguates ('L' = COLOR, 'O' =
-    ; COORDS). Try COLOR first; on 3rd-letter mismatch, roll HL back
-    ; and retry as COORDS.
+    ; C starts COLOR (<font>), COORDS (<area>), and CHECKED (<input>).
+    ; Branch on the second letter: 'O' -> COLOR / COORDS chain (third
+    ; letter disambiguates), 'H' -> CHECKED. Anything else -> miss.
     push    hl
     inc     hl
     ld      a, [hl]
     and     0xDF
+    cp      'H'
+    jp      z, .sh_tryChecked
     cp      'O'
     jp      nz, .sh_noMatch
     inc     hl
@@ -4524,6 +4556,78 @@ ScanHrefAttr:
     inc     hl
     pop     bc
     jp      .sh_readValue
+
+.sh_tryChecked:
+    ; CHECKED is a value-less HTML 2 attribute on <input type="checkbox">
+    ; and <input type="radio">. Match the literal "HECKED" continuation
+    ; (we already consumed C+H above). On match, set HtmlChecked = 1.
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'E'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'C'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'K'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'E'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'D'
+    jp      nz, .sh_noMatch
+    inc     hl
+    pop     bc
+    ld      a, 1
+    ld      [HtmlChecked], a
+    ; Skip an optional ="..." value -- HTML allows `checked`, `checked=""`,
+    ; `checked="checked"`, etc. The presence of the attribute is what
+    ; matters; we just walk forward to the next attribute boundary.
+    ld      a, [hl]
+    cp      '='
+    jp      nz, .sh_scan                    ; bare attribute -> next
+    inc     hl
+    ld      a, [hl]
+    cp      0x22
+    jr      z, .sh_chkQuoted
+    cp      0x27
+    jr      z, .sh_chkQuoted
+.sh_chkBare:
+    ld      a, [hl]
+    or      a
+    jp      z, .sh_scan
+    cp      '>'
+    jp      z, .sh_scan
+    cp      ' '
+    jp      z, .sh_scan
+    cp      0x09
+    jp      z, .sh_scan
+    inc     hl
+    jr      .sh_chkBare
+.sh_chkQuoted:
+    ld      b, a
+    inc     hl
+.sh_chkQuotedLoop:
+    ld      a, [hl]
+    or      a
+    jp      z, .sh_scan
+    cp      b
+    jr      nz, .sh_chkQuotedNext
+    inc     hl
+    jp      .sh_scan
+.sh_chkQuotedNext:
+    inc     hl
+    jr      .sh_chkQuotedLoop
 
 .sh_tryCoords:
     ; HL was restored to start-of-attribute by the COLOR path's first
@@ -4722,13 +4826,13 @@ ScanHrefAttr:
 .sh_doneValueNoInc:
     xor     a
     ld      [de], a                     ; NUL-terminate
-    ; Skip remaining attrs to '>'.
-.sh_tailSkip:
-    ld      a, [hl]
-    inc     hl
-    cp      '>'
-    jr      nz, .sh_tailSkip
-    ret
+    ; Hand control back to the main attribute scan so any sibling
+    ; attributes (CHECKED, ALT, COLOR, ...) on the same tag still get
+    ; processed. The previous "skip-to-'>'" behaviour was harmless for
+    ; <a href> / <font color> (those tags rarely carry meaningful
+    ; siblings) but caused <input value="..." checked> to silently
+    ; lose the CHECKED flag.
+    jp      .sh_scan
 
 .sh_consumeEnd:
     inc     hl                          ; skip '>'
@@ -8261,8 +8365,12 @@ TagInput:
 .tisDefault:    db "OK", 0
 
 .inputCheckbox:
-    ; Stub: always renders unchecked. CHECKED attr parsing is a follow-up.
+    ld      a, [HtmlChecked]
+    or      a
     ld      a, WG_CHK_OFF
+    jr      z, .inputCheckEmit
+    ld      a, WG_CHK_ON
+.inputCheckEmit:
     jp      EmitSink
 
 .inputR:
@@ -8271,7 +8379,12 @@ TagInput:
     jr      z, .inputRadio
     jp      .inputSubmit                ; reset: same visual as submit
 .inputRadio:
+    ld      a, [HtmlChecked]
+    or      a
     ld      a, WG_RAD_OFF
+    jr      z, .inputRadioEmit
+    ld      a, WG_RAD_ON
+.inputRadioEmit:
     jp      EmitSink
 
 .inputHidden:
@@ -10695,20 +10808,28 @@ IconArrowRight:
     db  0x75, 0x55      ; row 7: same as row 0
 
 ; ---------------------------------------------------------------------------
-; Form-widget cell bitmaps. Each is 8x8 px (2 bytes/row * 8 rows = 16 bytes)
-; so they slot into the line-buffer at one CELL each. LineDrawCells'
-; dispatch picks them up when the glyph code is < 0x10 (those bytes never
-; appear as printable ASCII text). Pixel pairs in MSB-first order:
-;   00 = pal0 (mid-grey/dither), 01 = pal1 (lgrey), 10 = pal2 (white),
-;   11 = pal3 (black). 0xAA fills 4 white px, 0xFF fills 4 black px.
+; Form-widget cell bitmaps. Each is 8 px wide x WG_HEIGHT (14) rows tall =
+; 28 bytes (2 bytes/row). Cells slot into the line-buffer at one CELL
+; each; LineDrawCells' dispatch picks them up when the glyph code is < 0x10
+; (those bytes never appear as printable ASCII text). Pixel pairs are
+; MSB-first: 00 = pal0 (DGRAY), 01 = pal1 (lgrey), 10 = pal2 (white),
+; 11 = pal3 (black). 0xAA = 4 white px; 0x00 = 4 dgray px (the default
+; widget border colour -- black is reserved for the focus state).
 ;
-; WG_BOX_L / _M / _R together form a 1-row text-input outline. The middle
-; cell gives the top + bottom horizontals; the L/R cells add the matching
-; vertical sides. Repeat WG_BOX_M for as many cells as the input is wide.
+; The 14-row paint extends the widget 3 px above and 3 px below the
+; 8-row text baseline (DrawWidgetGlyph subtracts 3 from C). That yields
+; ~2 rows of empty padding above + below an inner glyph -- enough to read
+; "[ Send ]" without the label kissing the border.
+;
+; WG_BOX_L / _M / _R together form a text-input / button outline. The
+; M cell carries top + bottom horizontals only; the L / R cells add the
+; matching vertical sides. PaintBoxConnectors stretches the top + bottom
+; borders across any non-widget cells (label glyphs) sitting between an
+; L / R pair so the outline stays continuous.
 ;
 ; WG_CHK_OFF / _ON are stand-alone single-cell checkboxes; same for
-; WG_RAD_OFF / _ON for radio buttons. Tiny 6x6 inset inside the 8x8 cell
-; with a 1-px white margin so neighbouring text doesn't kiss the border.
+; WG_RAD_OFF / _ON for radio buttons. Sized roughly 8 x 12 -- as big as
+; the cell allows without spilling into the next byte column.
 ; ---------------------------------------------------------------------------
 WG_BOX_L        equ 0x01
 WG_BOX_M        equ 0x02
@@ -10720,78 +10841,140 @@ WG_RAD_ON       equ 0x07
 WG_FIRST        equ 0x01
 WG_LAST         equ 0x07
 
+WG_HEIGHT       equ 14
+WG_Y_RAISE      equ 3                       ; widget top sits this many px above TextY
+
+; Pixel pair encoding cheat sheet (MSB pixel first within each byte; each
+; pair is 2 bits: 00=G/dgray, 01=L/lgrey, 10=W/white, 11=K/black). The
+; cell is 8 px wide so each row is exactly 2 bytes (left half = pixels
+; 0-3, right half = pixels 4-7).
+;     0x00 = G G G G        0x0A = G G W W        0xA0 = W W G G
+;     0xAA = W W W W        0x22 = G W G W        0x88 = W G W G
+;     0x2A = G W W W        0xA8 = W W W G        0x28 = G W W G
+;     0x82 = W G G W        0x8A = W G W W        0xA2 = W W G W
+;     0x20 = G W G G        0x08 = G G W G
+
 WidgetBoxL:
-    db  0xFF, 0xFF      ; row 0: top border (8 px black)
-    db  0xEA, 0xAA      ; row 1: K W W W W W W W
-    db  0xEA, 0xAA      ; row 2
-    db  0xEA, 0xAA      ; row 3
-    db  0xEA, 0xAA      ; row 4
-    db  0xEA, 0xAA      ; row 5
-    db  0xEA, 0xAA      ; row 6
-    db  0xFF, 0xFF      ; row 7: bottom border
+    db  0x00, 0x00      ; row 0:  top border (8 px dgray)
+    db  0x2A, 0xAA      ; row 1:  G W W W W W W W
+    db  0x2A, 0xAA      ; row 2
+    db  0x2A, 0xAA      ; row 3
+    db  0x2A, 0xAA      ; row 4
+    db  0x2A, 0xAA      ; row 5
+    db  0x2A, 0xAA      ; row 6
+    db  0x2A, 0xAA      ; row 7
+    db  0x2A, 0xAA      ; row 8
+    db  0x2A, 0xAA      ; row 9
+    db  0x2A, 0xAA      ; row 10
+    db  0x2A, 0xAA      ; row 11
+    db  0x2A, 0xAA      ; row 12
+    db  0x00, 0x00      ; row 13: bottom border
 
 WidgetBoxM:
-    db  0xFF, 0xFF      ; row 0: top border
-    db  0xAA, 0xAA      ; row 1: white interior
+    db  0x00, 0x00      ; row 0:  top border
+    db  0xAA, 0xAA      ; row 1:  white interior
     db  0xAA, 0xAA      ; row 2
     db  0xAA, 0xAA      ; row 3
     db  0xAA, 0xAA      ; row 4
     db  0xAA, 0xAA      ; row 5
     db  0xAA, 0xAA      ; row 6
-    db  0xFF, 0xFF      ; row 7: bottom border
+    db  0xAA, 0xAA      ; row 7
+    db  0xAA, 0xAA      ; row 8
+    db  0xAA, 0xAA      ; row 9
+    db  0xAA, 0xAA      ; row 10
+    db  0xAA, 0xAA      ; row 11
+    db  0xAA, 0xAA      ; row 12
+    db  0x00, 0x00      ; row 13: bottom border
 
 WidgetBoxR:
-    db  0xFF, 0xFF      ; row 0: top border
-    db  0xAA, 0xAB      ; row 1: W W W W W W W K
-    db  0xAA, 0xAB      ; row 2
-    db  0xAA, 0xAB      ; row 3
-    db  0xAA, 0xAB      ; row 4
-    db  0xAA, 0xAB      ; row 5
-    db  0xAA, 0xAB      ; row 6
-    db  0xFF, 0xFF      ; row 7: bottom border
+    db  0x00, 0x00      ; row 0:  top border
+    db  0xAA, 0xA8      ; row 1:  W W W W W W W G
+    db  0xAA, 0xA8      ; row 2
+    db  0xAA, 0xA8      ; row 3
+    db  0xAA, 0xA8      ; row 4
+    db  0xAA, 0xA8      ; row 5
+    db  0xAA, 0xA8      ; row 6
+    db  0xAA, 0xA8      ; row 7
+    db  0xAA, 0xA8      ; row 8
+    db  0xAA, 0xA8      ; row 9
+    db  0xAA, 0xA8      ; row 10
+    db  0xAA, 0xA8      ; row 11
+    db  0xAA, 0xA8      ; row 12
+    db  0x00, 0x00      ; row 13: bottom border
 
 WidgetChkOff:
-    db  0xAA, 0xAA      ; row 0: blank (top margin)
-    db  0xBF, 0xFE      ; row 1: . K K K K K K .
-    db  0xBA, 0xAE      ; row 2: . K . . . . K .
-    db  0xBA, 0xAE      ; row 3
-    db  0xBA, 0xAE      ; row 4
-    db  0xBA, 0xAE      ; row 5
-    db  0xBF, 0xFE      ; row 6: . K K K K K K .
-    db  0xAA, 0xAA      ; row 7: blank (bottom margin)
+    db  0xAA, 0xAA      ; row 0: blank
+    db  0x00, 0x00      ; row 1: top border (8 px dgray)
+    db  0x2A, 0xA8      ; row 2: G W W W W W W G
+    db  0x2A, 0xA8      ; row 3
+    db  0x2A, 0xA8      ; row 4
+    db  0x2A, 0xA8      ; row 5
+    db  0x2A, 0xA8      ; row 6
+    db  0x2A, 0xA8      ; row 7
+    db  0x2A, 0xA8      ; row 8
+    db  0x2A, 0xA8      ; row 9
+    db  0x2A, 0xA8      ; row 10
+    db  0x2A, 0xA8      ; row 11
+    db  0x00, 0x00      ; row 12: bottom border
+    db  0xAA, 0xAA      ; row 13: blank
 
+; Checked = the empty box plus an inner filled-square indicator (rows 3..10
+; cols 2..5). Filled rectangle is much easier to read at this size than a
+; 6-px X cross.
 WidgetChkOn:
-    db  0xAA, 0xAA      ; row 0
-    db  0xBF, 0xFE      ; row 1: . K K K K K K .
-    db  0xBA, 0xAE      ; row 2: . K . . . . K .
-    db  0xBB, 0xEE      ; row 3: . K . X X . K .
-    db  0xBB, 0xEE      ; row 4: . K . X X . K .
-    db  0xBA, 0xAE      ; row 5: . K . . . . K .
-    db  0xBF, 0xFE      ; row 6: . K K K K K K .
-    db  0xAA, 0xAA      ; row 7
+    db  0xAA, 0xAA      ; row 0:  blank
+    db  0x00, 0x00      ; row 1:  top border
+    db  0x2A, 0xA8      ; row 2:  G W W W W W W G
+    db  0x20, 0x08      ; row 3:  G W G G G G W G  (top of fill)
+    db  0x20, 0x08      ; row 4
+    db  0x20, 0x08      ; row 5
+    db  0x20, 0x08      ; row 6
+    db  0x20, 0x08      ; row 7
+    db  0x20, 0x08      ; row 8
+    db  0x20, 0x08      ; row 9
+    db  0x20, 0x08      ; row 10: bottom of fill
+    db  0x2A, 0xA8      ; row 11
+    db  0x00, 0x00      ; row 12: bottom border
+    db  0xAA, 0xAA      ; row 13: blank
 
 WidgetRadOff:
-    db  0xAF, 0xFA      ; row 0: . . K K K K . .
-    db  0xBA, 0xAE      ; row 1: . K . . . . K .
-    db  0xEA, 0xAB      ; row 2: K . . . . . . K
-    db  0xEA, 0xAB      ; row 3
-    db  0xEA, 0xAB      ; row 4
-    db  0xEA, 0xAB      ; row 5
-    db  0xBA, 0xAE      ; row 6
-    db  0xAF, 0xFA      ; row 7
+    db  0xAA, 0xAA      ; row 0:  blank
+    db  0xA0, 0x0A      ; row 1:  W W G G G G W W  (top arc)
+    db  0xA2, 0x8A      ; row 2:  W W G W W G W W
+    db  0x8A, 0xA2      ; row 3:  W G W W W W G W
+    db  0x2A, 0xA8      ; row 4:  G W W W W W W G
+    db  0x2A, 0xA8      ; row 5
+    db  0x2A, 0xA8      ; row 6
+    db  0x2A, 0xA8      ; row 7
+    db  0x2A, 0xA8      ; row 8
+    db  0x2A, 0xA8      ; row 9
+    db  0x8A, 0xA2      ; row 10: W G W W W W G W
+    db  0xA2, 0x8A      ; row 11: W W G W W G W W
+    db  0xA0, 0x0A      ; row 12: W W G G G G W W
+    db  0xAA, 0xAA      ; row 13: blank
 
+; Filled-circle "checked" radio: a 6 px-wide x 6 px-tall dark-grey blob
+; (rows 4..9, cols 1..6) inside the outer ring. Big enough to read at
+; the openMSX 1.25x screenshot scale; small enough to leave one row of
+; white margin between the dot and the ring's left/right verticals.
 WidgetRadOn:
-    db  0xAF, 0xFA      ; row 0: . . K K K K . .
-    db  0xBA, 0xAE      ; row 1
-    db  0xEA, 0xAB      ; row 2
-    db  0xEB, 0xEB      ; row 3: K . . X X . . K  -> centre dot
-    db  0xEB, 0xEB      ; row 4
-    db  0xEA, 0xAB      ; row 5
-    db  0xBA, 0xAE      ; row 6
-    db  0xAF, 0xFA      ; row 7
+    db  0xAA, 0xAA      ; row 0
+    db  0xA0, 0x0A      ; row 1:  outer top arc
+    db  0xA2, 0x8A      ; row 2
+    db  0x8A, 0xA2      ; row 3
+    db  0x00, 0x00      ; row 4:  G G G G G G G G  (dot top)
+    db  0x00, 0x00      ; row 5
+    db  0x00, 0x00      ; row 6
+    db  0x00, 0x00      ; row 7
+    db  0x00, 0x00      ; row 8
+    db  0x00, 0x00      ; row 9:  (dot bottom)
+    db  0x8A, 0xA2      ; row 10
+    db  0xA2, 0x8A      ; row 11
+    db  0xA0, 0x0A      ; row 12: outer bottom arc
+    db  0xAA, 0xAA      ; row 13
 
-; Lookup table indexed by widget id (1..7). Each entry = pointer to the
-; 16-byte bitmap above. Index 0 (placeholder) is unused.
+; Lookup table indexed by widget id (0..7). Index 0 is a NULL placeholder
+; so DrawWidgetGlyph can use `id * 2` to index without subtracting 1.
 WidgetBitmaps:
     dw  0
     dw  WidgetBoxL
@@ -10907,6 +11090,10 @@ HtmlInputType:  db 'T', 'X'             ; default = text
 ; it's set, so OPTION text and TEXTAREA initial content don't bleed
 ; into the document flow as plain text.
 HtmlSkipBody:   db 0
+; HtmlChecked is set by ScanHrefAttr when it sees a value-less
+; CHECKED attribute on the current tag. TagInput's checkbox / radio
+; branches read it to pick WG_CHK_ON / WG_RAD_ON over the _OFF variant.
+HtmlChecked:    db 0
 
 ; Image-map scratch. `<map>` begins a block of `<area>` rects; their
 ; coords are page-local (relative to the chunk's top-left). When the
