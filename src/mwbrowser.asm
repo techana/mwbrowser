@@ -253,23 +253,48 @@ MainLoop:
     ld      a, [Focus]
     cp      FOC_CONTENT
     jr      nz, .tabCycle
-    ; --- Try advancing the form-field focus first if it's already on
-    ;     a form field (or about to be -- after the last link).
+    ; Tab order inside the content area: form widgets first, then
+    ; links, then roll over to the toolbar via CycleFocus. Forms before
+    ; links is the right priority for search-box-style pages like
+    ; frogfind (where the only links live in the footer below the
+    ; search box); a strict document-order walk would be nicer but
+    ; requires a unified interactive list the parser doesn't build.
     ld      a, [HtmlFormFocus]
     cp      0xFF
     jr      nz, .tabFormAdv
-    ; Form focus is empty. Try the link path next.
+    ; No form focus yet. Try starting there first.
+    call    FormFirstFocusableSlot      ; A = slot index, or 0xFF
+    cp      0xFF
+    jr      nz, .tabFormStart
+    ; No focusable form slot -- fall through to link walk.
+    jr      .tabTryLinkStart
+.tabFormStart:
+    ld      [HtmlFormFocus], a
+    call    RefreshContentInPlace
+    jp      MainLoop
+.tabFormAdv:
+    call    FormNextFocusableSlot       ; A = next slot, or 0xFF
+    cp      0xFF
+    jr      z, .tabFormsDone
+    ld      [HtmlFormFocus], a
+    call    RefreshContentInPlace
+    jp      MainLoop
+.tabFormsDone:
+    ; Past the last form slot. Drop form focus and walk links next.
+    ld      a, 0xFF
+    ld      [HtmlFormFocus], a
+.tabTryLinkStart:
     ld      a, [LinkCount]
     or      a
-    jr      z, .tabTryFormStart         ; no links -> try forms first
+    jr      z, .tabDone                 ; no links either -> toolbar
     ld      a, [HtmlFocusLink]
     cp      0xFF
-    jr      nz, .tabAdv
-    xor     a                           ; first Tab -> link 0
+    jr      nz, .tabLinkAdv
+    xor     a                           ; first link
     ld      [HtmlFocusLink], a
     call    RefreshContentInPlace
     jp      MainLoop
-.tabAdv:
+.tabLinkAdv:
     ld      b, a
     ld      a, [LinkCount]
     dec     a
@@ -282,30 +307,9 @@ MainLoop:
     call    RefreshContentInPlace
     jp      MainLoop
 .tabLinksDone:
-    ; Past the last link. Drop link focus and try forms.
     ld      a, 0xFF
     ld      [HtmlFocusLink], a
-.tabTryFormStart:
-    ; Focus the first interactive form widget (text/pass/checkbox/
-    ; radio/submit/reset). Tab walks the whole table now -- not just
-    ; editable slots -- so users can reach Submit / Reset / toggles
-    ; without the mouse.
-    call    FormFirstFocusableSlot      ; A = slot index, or 0xFF
-    cp      0xFF
-    jr      z, .tabFormDone
-    ld      [HtmlFormFocus], a
-    call    RefreshContentInPlace
-    jp      MainLoop
-.tabFormAdv:
-    call    FormNextFocusableSlot       ; A = next slot, or 0xFF
-    cp      0xFF
-    jr      z, .tabFormDone
-    ld      [HtmlFormFocus], a
-    call    RefreshContentInPlace
-    jp      MainLoop
-.tabFormDone:
-    ld      a, 0xFF
-    ld      [HtmlFormFocus], a
+.tabDone:
     call    RefreshContentInPlace
 .tabCycle:
     call    CycleFocus
@@ -9911,7 +9915,11 @@ FormApplyLineOffset:
     ld      hl, FaloLineY
     cp      [hl]
     jr      nz, .faloAdvance
-    ; Match: FormScreenX[slot] += FaloDelta (sign-extended).
+    ; Match: FormScreenX[slot] += FaloDelta. Delta = LineStartCol*4 -
+    ; HtmlIndent is always >= 0 (center/right alignment pushes the line
+    ; start further right than a bare indent); treating it as signed
+    ; 8-bit would sign-extend a legitimate 128..200 px offset into
+    ; 0xFFxx and corrupt the high byte. Add unsigned with carry.
     ld      a, [FaloSlot]
     ld      e, a
     ld      d, 0
@@ -9920,17 +9928,12 @@ FormApplyLineOffset:
     add     hl, de                       ; HL -> FormScreenX[slot] low byte
     ld      a, [FaloDelta]
     ld      b, a
-    ld      c, 0                          ; C = sign extension byte
-    bit     7, b
-    jr      z, .faloSignOk
-    dec     c                             ; C = 0xFF (negative)
-.faloSignOk:
     ld      a, [hl]
     add     a, b
     ld      [hl], a
     inc     hl
     ld      a, [hl]
-    adc     a, c
+    adc     a, 0                         ; propagate carry only
     ld      [hl], a
 .faloAdvance:
     ld      a, [FaloSlot]
