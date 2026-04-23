@@ -1,64 +1,70 @@
 #!/usr/bin/env python3
-"""Serial web bridge for the MSX WBrowser.
+"""Serial web bridge for MSX WBrowser -- HTML passthrough mode.
 
 Listens on a TCP port (openMSX's rs232-net pluggable dials out to us)
-and answers a tiny line-oriented protocol:
+and speaks the same line-oriented protocol RemoteGet expects:
 
     MSX -> bridge:  GET <target>\\r\\n
     bridge -> MSX:  OK HTM <length>\\r\\n<body>
                     OK PCX <length>\\r\\n<body>
                     ERR 404\\r\\n
-                    ERR 500\\r\\n
 
-Behaviour per request:
-  - "GET http://..."  -- fetch + render. For image URLs the response
-    is a single PCX. For HTML, the response is an MSX-friendly wrapper
-    whose <img src="pgNN.pcx"> tags refer back to the bridge's cache.
-  - "GET pgNN.pcx" (bare name, no scheme) -- serve chunk NN of the
-    most recently rendered page.
-  - Anything else -- ERR 404.
+Behaviour:
+  - "GET http(s)://..."     -- fetch the URL. If it's an HTML page the
+                               raw bytes are forwarded verbatim, with
+                               two cleanups: every `<img src>` is
+                               rewritten to a short "imNN.pcx" handle
+                               the browser can fetch back, and every
+                               `<a href>` is rewritten to an absolute
+                               URL so relative links can be followed.
+                               Images get fetched lazily + converted
+                               to 2bpp PCX on demand.
+  - "GET imNN.pcx"          -- serve the cached image URL associated
+                               with that handle, converted to PCX.
+  - "GET /submit?..."       -- form-echo helper, same as before.
+  - Anything else           -- ERR 404.
+
+There is no Playwright / screenshot pipeline in this bridge; small
+HTML-2-ish sites (like frogfind.com) render natively in the MSX
+browser's own parser.
 
 Run:
     python3 tools/web_bridge.py [--host 127.0.0.1] [--port 2323] [--verbose]
 
 Pair with:
     openmsx -exta rs232 -script tools/plug_rs232.tcl
-    A> mwbrowsr
-    Address bar: e.g. `http://www.bbcarabic.com`  (no drive: prefix)
+    A> MWBRO
+    Address bar: http://frogfind.com
 """
 
 from __future__ import annotations
 
 import argparse
-import asyncio
 import io
+import re
 import socket
 import struct
 import sys
 import urllib.parse
+import urllib.request
 from pathlib import Path
 
-# Reuse the encoding primitives from the web_to_sc6 tool -- keeps the
-# PCX output identical to what web_to_sc6.py writes to disk.
 sys.path.insert(0, str(Path(__file__).parent))
-import web_to_sc6 as w2s  # noqa: E402
+import web_to_sc6 as w2s  # noqa: E402 -- reuse PCX packing primitives
 
 try:
     from PIL import Image
 except ImportError:
     sys.exit("Pillow required: pip install Pillow")
 
-try:
-    from playwright.async_api import async_playwright
-except ImportError:
-    sys.exit("Playwright required: pip install playwright && python3 -m playwright install chromium")
 
+IMG_SRC_DQ = re.compile(rb'(<img\b[^>]*\bsrc=)"([^"]*)"', re.I)
+IMG_SRC_SQ = re.compile(rb"(<img\b[^>]*\bsrc=)'([^']*)'", re.I)
+A_HREF_DQ  = re.compile(rb'(<a\b[^>]*\bhref=)"([^"]*)"', re.I)
+A_HREF_SQ  = re.compile(rb"(<a\b[^>]*\bhref=)'([^']*)'", re.I)
 
-IMG_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp")
-
-
-def _looks_like_url(s: str) -> bool:
-    return s.lower().startswith(("http://", "https://"))
+USER_AGENT = "MSX-WBrowser/0.5 (openMSX)"
+FETCH_TIMEOUT = 20.0
 
 
 def _html_escape(s: str) -> str:
@@ -67,170 +73,144 @@ def _html_escape(s: str) -> str:
              .replace(">", "&gt;"))
 
 
-def _is_image_url(url: str) -> bool:
-    path = urllib.parse.urlparse(url).path.lower()
-    return path.endswith(IMG_EXTS)
-
-
 # ----------------------------------------------------------------------------
-# Playwright render (HTML page -> tall PNG + link boxes). Same pipeline as
-# tools/web_to_sc6.py, minus the on-disk emission.
-# ----------------------------------------------------------------------------
-
-async def _render_page(url: str) -> tuple[str, Image.Image, list[dict]]:
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch()
-        ctx = await browser.new_context(
-            viewport={"width": w2s.MSX_VIEWPORT_W, "height": w2s.MSX_VIEWPORT_H},
-            device_scale_factor=1,
-        )
-        page = await ctx.new_page()
-        await page.goto(url, wait_until="networkidle", timeout=45000)
-        await page.add_style_tag(content=w2s.READABILITY_CSS)
-        await page.wait_for_timeout(400)
-        png_bytes = await page.screenshot(full_page=True)
-        title = await page.title()
-        links = await page.evaluate("""
-() => {
-    const out = [];
-    for (const a of document.querySelectorAll('a[href]')) {
-        const r = a.getBoundingClientRect();
-        if (r.width < 4 || r.height < 4) continue;
-        out.push({
-            x: Math.round(r.left),
-            y: Math.round(r.top + window.scrollY),
-            w: Math.round(r.width),
-            h: Math.round(r.height),
-            href: a.href,
-        });
-    }
-    return out;
-}
-""")
-        await browser.close()
-    im = Image.open(io.BytesIO(png_bytes))
-    return title, im, links
-
-
-def _render_image_url(data: bytes) -> Image.Image:
-    im = Image.open(io.BytesIO(data))
-    im.load()
-    return im
-
-
-# ----------------------------------------------------------------------------
-# Bridge session state. Only one active page at a time; chunks for the most
-# recent URL live in _chunk_store, keyed by bare filename.
+# Session -- per-page state: image handle -> original URL.
 # ----------------------------------------------------------------------------
 
 class BridgeSession:
     def __init__(self, verbose: bool = False):
         self.verbose = verbose
-        self._chunks: dict[str, bytes] = {}
-        self._current_origin: str | None = None
+        self._img_cache: dict[str, str] = {}
+        self._current_base: str | None = None
+        self._img_counter = 0
 
-    # -- public API ------------------------------------------------------
+    # -- public -----------------------------------------------------------
 
-    def handle_get(self, target: str) -> tuple[str, bytes] | tuple[str, None]:
-        """Returns ("HTM", body) / ("PCX", body) / ("404", None)."""
+    def handle_get(self, target: str):
         self._log(f"GET {target!r}")
-        # Form submit lands here as "http:/submit?..." (the `http:`
-        # prefix is what makes LoadFile route to the remote bridge).
-        # Strip it before dispatching.
+
+        # Form submit: "http:/submit?..." is what the MSX side sends (the
+        # http: prefix makes LoadFile pick the remote path). Strip and
+        # hand off to the echo helper.
         if target.startswith("http:/submit") or target.startswith("/submit"):
             stripped = target[5:] if target.startswith("http:") else target
             return self._handle_submit(stripped)
-        if _looks_like_url(target):
-            return self._fetch_url(target)
-        # Bare filename -> try the current page's chunk cache.
-        blob = self._chunks.get(target.lower())
-        if blob is None:
-            return ("404", None)
-        return ("PCX", blob)
 
-    def _handle_submit(self, target: str) -> tuple[str, bytes]:
-        """Echo-render a form submission. The browser builds
-        "/submit?a=1&b=2" and lands it here via the same RemoteGet path
-        regular URL loads use; we answer with a small HTML page that
-        shows each received field so the operator can verify the
-        round-trip on the MSX screen."""
-        q = ""
-        if "?" in target:
-            q = target.split("?", 1)[1]
-        pairs = []
-        if q:
-            for pair in q.split("&"):
-                if "=" in pair:
-                    k, v = pair.split("=", 1)
-                else:
-                    k, v = pair, ""
-                pairs.append((urllib.parse.unquote(k),
-                              urllib.parse.unquote(v)))
-        self._log(f"submit: {pairs}")
-        rows = "".join(
-            f"<tr><td>{_html_escape(k)}</td><td>{_html_escape(v)}</td></tr>"
-            for k, v in pairs
-        )
-        body = (
-            "<html><head><title>Form echo</title></head><body>"
-            "<h2>Form received</h2>"
-            f"<table>{rows}</table>"
-            "</body></html>"
-        )
-        return ("HTM", body.encode("iso-8859-6", "replace"))
-
-    # -- implementation --------------------------------------------------
-
-    def _fetch_url(self, url: str) -> tuple[str, bytes] | tuple[str, None]:
-        # Image URLs are converted directly to PCX and shipped.
-        if _is_image_url(url):
-            try:
-                import urllib.request
-                with urllib.request.urlopen(url, timeout=15) as r:
-                    raw = r.read()
-                im = _render_image_url(raw)
-                im = w2s._resize_to_msx(im, Image.BOX)
-                pcx = self._to_pcx(im)
-                return ("PCX", pcx)
-            except Exception as exc:
-                self._log(f"image fetch failed: {exc}")
+        # Image handle produced by our own HTML rewriter: imNN.pcx.
+        if re.fullmatch(r"im\d+\.pcx", target, flags=re.I):
+            url = self._img_cache.get(target.lower())
+            if not url:
                 return ("404", None)
+            return self._fetch_image(url)
 
-        # HTML page: render with Playwright, slice into full-viewport
-        # PCX chunks, stash them, hand back the HTM wrapper.
+        # Real URL? Fetch and passthrough.
+        if target.lower().startswith(("http://", "https://")):
+            return self._fetch_page(target)
+
+        return ("404", None)
+
+    # -- HTML passthrough -------------------------------------------------
+
+    def _fetch_page(self, url: str):
         try:
-            title, im, links = asyncio.run(_render_page(url))
+            raw, final_url, content_type = _fetch(url)
         except Exception as exc:
-            self._log(f"playwright failed: {exc}")
+            self._log(f"fetch failed: {exc}")
             return ("404", None)
 
+        self._current_base = final_url
+
+        if content_type.startswith("image/"):
+            # User typed an image URL directly -- skip the HTML rewrite
+            # and deliver the PCX.
+            return self._convert_image_bytes(raw)
+
+        # Everything else we treat as HTML / text. Rewrite img srcs and
+        # a hrefs, then pass the result through.
+        body = self._rewrite_html(raw)
+        self._log(f"HTM {len(body)} B (was {len(raw)}) from {final_url}")
+        return ("HTM", body)
+
+    def _rewrite_html(self, body: bytes) -> bytes:
+        # Drop <script>/<style>/<noscript> blocks; the MSX parser ignores
+        # them anyway but stripping keeps the wire small.
+        body = re.sub(rb"<script\b[^>]*>.*?</script>", b"",
+                      body, flags=re.I | re.S)
+        body = re.sub(rb"<style\b[^>]*>.*?</style>", b"",
+                      body, flags=re.I | re.S)
+        body = re.sub(rb"<noscript\b[^>]*>.*?</noscript>", b"",
+                      body, flags=re.I | re.S)
+
+        # Reset per-page image cache.
+        self._img_cache = {}
+        self._img_counter = 0
+
+        def img_repl(m: re.Match) -> bytes:
+            prefix = m.group(1)
+            src = m.group(2).decode("latin-1", "replace").strip()
+            handle = self._register_image(src)
+            return prefix + b'"' + handle.encode("ascii") + b'"'
+
+        def href_repl(m: re.Match) -> bytes:
+            prefix = m.group(1)
+            href = m.group(2).decode("latin-1", "replace").strip()
+            # In-page anchors + javascript: links are useless on MSX; leave
+            # them as-is so the click is a no-op rather than a 404.
+            if href.startswith(("#", "javascript:", "mailto:")):
+                return m.group(0)
+            absolute = urllib.parse.urljoin(self._current_base or "", href)
+            return prefix + b'"' + absolute.encode("latin-1", "replace") + b'"'
+
+        body = IMG_SRC_DQ.sub(img_repl, body)
+        body = IMG_SRC_SQ.sub(img_repl, body)
+        body = A_HREF_DQ.sub(href_repl, body)
+        body = A_HREF_SQ.sub(href_repl, body)
+
+        # Best-effort encoding: decode as UTF-8 (the modern default) then
+        # re-encode as latin-1 so the MSX font can render ASCII + Latin-1
+        # glyphs it has. Non-encodable chars get '?'.
+        try:
+            text = body.decode("utf-8")
+        except UnicodeDecodeError:
+            text = body.decode("latin-1", "replace")
+        return text.encode("latin-1", "replace")
+
+    def _register_image(self, src: str) -> str:
+        """Absolutise + mint a short imNN.pcx handle for `src`."""
+        absolute = urllib.parse.urljoin(self._current_base or "", src)
+        # Re-use existing handles so two <img>s to the same URL share a fetch.
+        for handle, url in self._img_cache.items():
+            if url == absolute:
+                return handle
+        self._img_counter += 1
+        handle = f"im{self._img_counter:02d}.pcx"
+        self._img_cache[handle] = absolute
+        return handle
+
+    # -- Image conversion -------------------------------------------------
+
+    def _fetch_image(self, url: str):
+        try:
+            raw, _final, ctype = _fetch(url)
+        except Exception as exc:
+            self._log(f"img fetch failed: {exc}")
+            return ("404", None)
+        return self._convert_image_bytes(raw)
+
+    def _convert_image_bytes(self, raw: bytes):
+        try:
+            im = Image.open(io.BytesIO(raw))
+            im.load()
+        except Exception as exc:
+            self._log(f"image decode failed: {exc}")
+            return ("404", None)
         im = w2s._resize_to_msx(im, Image.BOX)
-        total_h = im.size[1]
-        rows = w2s.MSX_VIEWPORT_H
-        pages = (total_h + rows - 1) // rows
-        self._chunks = {}
-        self._current_origin = url
-        chunks_meta = []
-        for i in range(pages):
-            name = f"pg{i + 1:02d}.pcx"
-            top = i * rows
-            bot = min(total_h, top + rows)
-            sub = im.crop((0, top, im.size[0], bot))
-            pcx = self._to_pcx(sub)
-            self._chunks[name] = pcx
-            areas = w2s._clip_links_to_chunk(links, top, bot - top)
-            chunks_meta.append({
-                "name":   name.upper(),
-                "map_id": f"M{i + 1:02d}" if areas else None,
-                "areas":  areas,
-            })
-        self._log(f"rendered {url} -> {pages} chunks, {sum(len(b) for b in self._chunks.values())} B")
-        html = w2s._wrapper_html(chunks_meta, title or url)
-        return ("HTM", html.encode("iso-8859-6", "replace"))
+        pcx = self._to_pcx(im)
+        self._log(f"PCX {len(pcx)} B")
+        return ("PCX", pcx)
 
     @staticmethod
     def _to_pcx(im: Image.Image) -> bytes:
-        """In-memory twin of web_to_sc6._write_pcx_2bpp."""
         raw = w2s._pack_sc6_chunk(im)
         rows = len(raw) // w2s.SC6_ROW_BYTES
         width_px = w2s.MSX_VIEWPORT_W
@@ -261,18 +241,58 @@ class BridgeSession:
                 x += run
         return bytes(out)
 
+    # -- Form submit echo -------------------------------------------------
+
+    def _handle_submit(self, target: str):
+        q = target.split("?", 1)[1] if "?" in target else ""
+        pairs = []
+        if q:
+            for pair in q.split("&"):
+                if "=" in pair:
+                    k, v = pair.split("=", 1)
+                else:
+                    k, v = pair, ""
+                pairs.append((urllib.parse.unquote(k),
+                              urllib.parse.unquote(v)))
+        self._log(f"submit: {pairs}")
+        rows = "".join(
+            f"<tr><td>{_html_escape(k)}</td><td>{_html_escape(v)}</td></tr>"
+            for k, v in pairs
+        )
+        body = (
+            "<html><head><title>Form echo</title></head><body>"
+            "<h2>Form received</h2>"
+            f"<table>{rows}</table>"
+            "</body></html>"
+        )
+        return ("HTM", body.encode("iso-8859-6", "replace"))
+
+    # -- helpers ----------------------------------------------------------
+
     def _log(self, msg: str) -> None:
         if self.verbose:
             print(f"[bridge] {msg}", flush=True)
 
 
+def _fetch(url: str) -> tuple[bytes, str, str]:
+    """HTTP GET with a realistic User-Agent. Returns (bytes, final URL
+    after redirects, lower-cased Content-Type)."""
+    req = urllib.request.Request(url, headers={
+        "User-Agent": USER_AGENT,
+        "Accept":     "text/html, image/*;q=0.8, */*;q=0.1",
+    })
+    with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT) as r:
+        data = r.read()
+        final_url = r.url
+        ctype = (r.headers.get("content-type") or "").lower()
+    return data, final_url, ctype
+
+
 # ----------------------------------------------------------------------------
-# Line-oriented TCP server. openMSX dials out; we accept a single connection
-# at a time (serialises nicely with the emulator's single UART).
+# Line-oriented TCP server.
 # ----------------------------------------------------------------------------
 
 def _readline(conn: socket.socket) -> bytes:
-    """Blocking read up to and including \\r\\n."""
     buf = bytearray()
     while True:
         b = conn.recv(1)
@@ -285,8 +305,8 @@ def _readline(conn: socket.socket) -> bytes:
             return bytes(buf)
 
 
-def _send_response(conn: socket.socket, kind: str, body: bytes | None) -> None:
-    if kind == "HTM" or kind == "PCX":
+def _send_response(conn: socket.socket, kind: str, body):
+    if kind in ("HTM", "PCX"):
         header = f"OK {kind} {len(body)}\r\n".encode("ascii")
         conn.sendall(header)
         conn.sendall(body)
@@ -302,38 +322,32 @@ def serve_forever(host: str, port: int, verbose: bool) -> None:
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((host, port))
     srv.listen(1)
-    print(f"web bridge listening on {host}:{port}", flush=True)
+    print(f"web_bridge listening on {host}:{port}", flush=True)
     while True:
         conn, addr = srv.accept()
-        print(f"openMSX connected from {addr}", flush=True)
+        print(f"[connected from {addr}]", flush=True)
         try:
             while True:
                 line = _readline(conn)
                 if not line:
                     break
-                if not line.endswith(b"\r\n"):
-                    _send_response(conn, "500", None)
-                    break
-                try:
-                    text = line.rstrip(b"\r\n").decode("ascii", "replace")
-                except Exception:
-                    _send_response(conn, "500", None)
-                    continue
+                text = line.rstrip(b"\r\n").decode("ascii", "replace")
                 if not text.startswith("GET "):
                     _send_response(conn, "500", None)
                     continue
-                target = text[4:].strip()
+                target = text[4:]
                 kind, body = session.handle_get(target)
                 _send_response(conn, kind, body)
-        except (ConnectionResetError, BrokenPipeError):
-            pass
+        except (ConnectionError, OSError) as exc:
+            print(f"[session error: {exc}]", file=sys.stderr, flush=True)
         finally:
             conn.close()
-            print("connection closed; waiting for next", flush=True)
+            print("[disconnected]", flush=True)
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=2323)
     ap.add_argument("--verbose", action="store_true")
@@ -341,7 +355,8 @@ def main() -> int:
     try:
         serve_forever(args.host, args.port, args.verbose)
     except KeyboardInterrupt:
-        print("\nshutting down", flush=True)
+        print("\nbye.")
+        return 0
     return 0
 
 
