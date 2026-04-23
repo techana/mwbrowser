@@ -9207,24 +9207,48 @@ SerialWrite:    ; send byte in A; blocks until TxRDY.
     out     (UART_DATA), a
     ret
 
-SerialRead:     ; block for RxRDY then return byte in A. Overrun /
+SerialRead:     ; Poll for RxRDY and return byte in A. Overrun /
                 ; Parity / Framing errors in status bits 3..5 latch
                 ; until the command register is rewritten with ER=1;
                 ; handle that inline. VBLANK gets masked at the VDP
                 ; level by SerialMaskVblank around the outer call so
                 ; the receiver can't be starved mid-burst.
+                ;
+                ; Bounded wait so a dead / unplugged bridge doesn't
+                ; hang the browser forever: the (B, HL) counter below
+                ; unwinds after roughly a second of wall time if no
+                ; byte arrives, returning CF=1 (= timeout). Callers
+                ; propagate the error up to LoadFile which then
+                ; surfaces a 404 page in the content area. On success
+                ; CF=0 and A holds the received byte.
+    ld      b, SR_TIMEOUT_OUTER
+.srOuter:
+    ld      hl, 0xFFFF
 .srPoll:
     in      a, (UART_STATUS)
     bit     1, a                        ; RxRDY
     jr      nz, .srGot
     and     0x38                        ; PE | OE | FE
-    jr      z, .srPoll
+    jr      z, .srTick
     ld      a, 0x37                     ; RTS | ErrRst | RxEN | DTR | TxEN
     out     (UART_STATUS), a
-    jr      .srPoll
+.srTick:
+    dec     hl
+    ld      a, h
+    or      l
+    jr      nz, .srPoll
+    djnz    .srOuter
+    scf                                 ; out of budget -> timeout
+    ret
 .srGot:
     in      a, (UART_DATA)
+    and     a                           ; CF=0
     ret
+
+; Outer loop counter for SerialRead's budget. One "inner pass" is ~45
+; Z80 cycles * 65536 iterations = ~0.8 s at 3.58 MHz; the outer count
+; multiplies that into a ~1.6 s total before we give up.
+SR_TIMEOUT_OUTER equ 2
 
 SerialWriteZ:   ; HL -> NUL-terminated string.
     ld      a, [hl]
@@ -9276,16 +9300,22 @@ RemoteGet:
     call    SerialWrite
     ; Drain status line into SerialBuf (16 B); parser reads fresh bytes
     ; from the UART directly rather than buffering so we save code.
+    ; Every SerialRead can now time out; CF=1 surfaces as a failure so
+    ; a dead / unplugged bridge doesn't hang the browser forever.
     call    SerialRead                  ; 'O' or 'E'
+    jr      c, .rgFail
     cp      'E'
     jr      z, .rgDrainErr
     cp      'O'
     jr      nz, .rgFail
     call    SerialRead                  ; 'K'
+    jr      c, .rgFail
     cp      'K'
     jr      nz, .rgFail
     call    SerialRead                  ; ' '
+    jr      c, .rgFail
     call    SerialRead                  ; 'H' or 'P'
+    jr      c, .rgFail
     ld      b, 1
     cp      'H'
     jr      z, .rgKind
@@ -9296,11 +9326,15 @@ RemoteGet:
     ld      a, b
     ld      [SerialKind], a
     call    SerialRead                  ; second kind char (T/C)
+    jr      c, .rgFail
     call    SerialRead                  ; third kind char (M/X)
+    jr      c, .rgFail
     call    SerialRead                  ; space
+    jr      c, .rgFail
     ld      de, 0
 .rgDigit:
     call    SerialRead
+    jr      c, .rgFail
     cp      0x0D
     jr      z, .rgEol
     sub     '0'
@@ -9324,11 +9358,13 @@ RemoteGet:
     jr      .rgDigit
 .rgEol:
     call    SerialRead                  ; consume LF
+    jr      c, .rgFail
     ld      [SerialLen], de
     and     a
     ret
 .rgDrainErr:
     call    SerialRead                  ; consume remainder of "ERR ..." line
+    jr      c, .rgFail
     cp      0x0A
     jr      nz, .rgDrainErr
 .rgFail:
@@ -9370,6 +9406,7 @@ RemoteLoadFile:
     call    SerialRead
     pop     de
     pop     bc
+    jr      c, .rlfFail                  ; mid-body timeout -> bail
     ld      [de], a
     inc     de
     dec     bc
@@ -9388,6 +9425,7 @@ RemoteLoadFile:
     push    bc
     call    SerialRead
     pop     bc
+    jr      c, .rlfFail                  ; unplugged bridge -> abandon the drain
     dec     bc
     jr      .rlfDrain
 .rlfDone:
@@ -9395,6 +9433,9 @@ RemoteLoadFile:
     xor     a
     ret
 .rlfFail:
+    ; VBLANK-unmask before returning so the main loop's keyboard ISR
+    ; comes back even if we abort mid-transfer.
+    call    SerialUnmaskVblank
     ld      a, 1
     ret                                  ; caller's 404 handler paints via DrawString
 
@@ -9422,7 +9463,11 @@ RemoteImgOpen:
     ret
 
 ; RemoteImgByte: pull next body byte from the UART and decrement
-; ImgBytesLeft. CF=1 on EOF.
+; ImgBytesLeft. CF=1 on end-of-body OR on SerialRead timeout -- both
+; surface the same way to the image decoders (they treat CF as "no
+; more bytes", render whatever they've drawn, and let TagImg fall
+; through to the alt-text / placeholder if we hadn't committed any
+; pixels yet).
 RemoteImgByte:
     ld      hl, [ImgBytesLeft]
     ld      a, h
@@ -9435,6 +9480,7 @@ RemoteImgByte:
     ret     z
 .ribGo:
     call    SerialRead
+    ret     c                            ; bridge timeout -> propagate EOF
     push    af
     ld      hl, [ImgBytesLeft]
     ld      a, h
