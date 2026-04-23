@@ -241,39 +241,63 @@ MainLoop:
 
     cp      KEY_TAB
     jr      nz, NotTab
-    ; Tab in Content sub-cycles through visible links (dotted underline
-    ; marks the active one) before rolling back to the toolbar via the
-    ; normal CycleFocus path.
+    ; Tab in Content sub-cycles through (a) visible links and (b) form
+    ; text/password fields before rolling back to the toolbar via
+    ; CycleFocus. Order: links 0..N-1 -> form fields 0..M-1 -> toolbar.
     ld      a, [Focus]
     cp      FOC_CONTENT
     jr      nz, .tabCycle
+    ; --- Try advancing the form-field focus first if it's already on
+    ;     a form field (or about to be -- after the last link).
+    ld      a, [HtmlFormFocus]
+    cp      0xFF
+    jr      nz, .tabFormAdv
+    ; Form focus is empty. Try the link path next.
     ld      a, [LinkCount]
     or      a
-    jr      z, .tabCycle                ; no links -> normal cycle
+    jr      z, .tabTryFormStart         ; no links -> try forms first
     ld      a, [HtmlFocusLink]
     cp      0xFF
     jr      nz, .tabAdv
-    ; First Tab in Content: focus link 0.
-    xor     a
+    xor     a                           ; first Tab -> link 0
     ld      [HtmlFocusLink], a
     call    RefreshAfterScroll
     jp      MainLoop
 .tabAdv:
-    ; Already focused on a link -- advance to the next one.
-    ld      b, a                        ; B = current focus
+    ld      b, a
     ld      a, [LinkCount]
     dec     a
     cp      b
-    jr      c, .tabExit                 ; focus past the last link
-    jr      z, .tabExit
+    jr      c, .tabLinksDone
+    jr      z, .tabLinksDone
     inc     b
     ld      a, b
     ld      [HtmlFocusLink], a
     call    RefreshAfterScroll
     jp      MainLoop
-.tabExit:
+.tabLinksDone:
+    ; Past the last link. Drop link focus and try forms.
     ld      a, 0xFF
     ld      [HtmlFocusLink], a
+.tabTryFormStart:
+    ; If we have any text/password slots, focus the first one.
+    call    FormFirstEditableSlot       ; A = slot index, or 0xFF
+    cp      0xFF
+    jr      z, .tabFormDone
+    ld      [HtmlFormFocus], a
+    call    RefreshAfterScroll
+    jp      MainLoop
+.tabFormAdv:
+    ; Already on a form field. Advance to the next text/pass slot.
+    call    FormNextEditableSlot        ; A = next slot, or 0xFF
+    cp      0xFF
+    jr      z, .tabFormDone
+    ld      [HtmlFormFocus], a
+    call    RefreshAfterScroll
+    jp      MainLoop
+.tabFormDone:
+    ld      a, 0xFF
+    ld      [HtmlFormFocus], a
     call    RefreshAfterScroll
 .tabCycle:
     call    CycleFocus
@@ -355,6 +379,25 @@ NotCls:
     jp      MainLoop
 
 OnContent:
+    ; Form-field typing path: when a text/password slot is focused,
+    ; printable ASCII appends to its value, BS pops, ENTER triggers
+    ; submit. Any other key falls through to the normal navigation
+    ; handlers below (so Esc / arrows / vim keys still work without a
+    ; field focused).
+    ld      a, [HtmlFormFocus]
+    cp      0xFF
+    jr      z, .ocNoForm
+    ld      a, b
+    cp      KEY_BACKSPACE
+    jp      z, DoFormBackspace
+    cp      KEY_ENTER
+    jp      z, DoFormSubmit
+    cp      ' '                         ; printable ASCII range
+    jr      c, .ocNoForm
+    cp      0x7F
+    jr      nc, .ocNoForm
+    jp      DoFormType
+.ocNoForm:
     ld      a, b
     cp      KEY_ENTER
     jp      z, DoLinkEnter              ; if a link is Tab-focused, open it
@@ -392,6 +435,149 @@ DoScrollDn:
 DoScrollUp:
     call    ScrollUp
     jp      MainLoop
+
+; DoFormType: append the printable ASCII char in B to the focused
+; text/password slot's value buffer (capped at FORM_VALUE_MAX), then
+; re-render the page so the new char appears inside the box.
+DoFormType:
+    ld      a, [HtmlFormFocus]
+    cp      0xFF
+    jp      z, MainLoop
+    call    FormGetValuePtr             ; HL -> value buf
+    ; Walk HL to the NUL terminator, recording the length in DftLen.
+    ; The whole routine deliberately keeps B intact (it carries the
+    ; pressed key) so we don't push/pop BC and clobber C halfway.
+    xor     a
+    ld      [DftLen], a
+.dftLen:
+    ld      a, [hl]
+    or      a
+    jr      z, .dftAtEnd
+    inc     hl
+    ld      a, [DftLen]
+    inc     a
+    ld      [DftLen], a
+    cp      FORM_VALUE_MAX
+    jr      c, .dftLen
+.dftAtEnd:
+    ld      a, [DftLen]
+    cp      FORM_VALUE_MAX
+    jp      nc, MainLoop                ; full -> drop char silently
+    ; HL points at the current NUL. Write the new char then a fresh NUL.
+    ld      a, b
+    ld      [hl], a
+    inc     hl
+    xor     a
+    ld      [hl], a
+    call    RefreshAfterScroll
+    jp      MainLoop
+
+DftLen:         db 0
+
+; DoFormBackspace: drop the last char from the focused field's value.
+DoFormBackspace:
+    ld      a, [HtmlFormFocus]
+    cp      0xFF
+    jp      z, MainLoop
+    call    FormGetValuePtr
+    ; Walk to NUL.
+    ld      c, 0
+.dfbLen:
+    ld      a, [hl]
+    or      a
+    jr      z, .dfbAtEnd
+    inc     hl
+    inc     c
+    jr      .dfbLen
+.dfbAtEnd:
+    ld      a, c
+    or      a
+    jp      z, MainLoop                 ; already empty
+    dec     hl
+    xor     a
+    ld      [hl], a
+    call    RefreshAfterScroll
+    jp      MainLoop
+
+; DoFormSubmit: triggered when Enter is pressed on a focused form field
+; (or when a submit/button widget is clicked). Walks FormFields and
+; sends "name=value&...\r\n" over the UART. The bridge on the host side
+; is expected to echo something back so the operator can verify the
+; round trip. Skips slots with empty NAME or hidden TYPE so the wire
+; format matches what a real form post would carry.
+DoFormSubmit:
+    ld      hl, .dfsHeader
+    call    SerialWriteZ
+    xor     a
+    ld      [DfsAmpPending], a
+    ld      [DfsIdx], a
+.dfsLoop:
+    ld      a, [DfsIdx]
+    ld      b, a
+    ld      a, [FormCount]
+    cp      b
+    jp      z, .dfsDone
+    ld      a, b
+    call    FormGetTypePtr              ; HL -> FormType[idx]
+    ld      a, [hl]
+    cp      'H'
+    jr      z, .dfsSkipBuiltin          ; hidden -- still sent (matches HTML)
+    cp      'S'
+    jr      z, .dfsSkip                 ; submit/button: don't include
+    cp      'B'
+    jr      z, .dfsSkip
+    cp      'I'
+    jr      z, .dfsSkip                 ; image: skip for now
+.dfsSkipBuiltin:
+    ; Field type is text/pass/check/radio/hidden. Need NAME to be
+    ; non-empty to include it in the query string.
+    ld      a, [DfsIdx]
+    call    FormGetNamePtr
+    ld      a, [hl]
+    or      a
+    jr      z, .dfsSkip                 ; no name -> skip
+    ; Emit '&' if anything came before us.
+    ld      a, [DfsAmpPending]
+    or      a
+    jr      z, .dfsNoAmp
+    ld      a, '&'
+    call    SerialWrite
+.dfsNoAmp:
+    ld      a, 1
+    ld      [DfsAmpPending], a
+    ; name=
+    ld      a, [DfsIdx]
+    call    FormGetNamePtr
+    call    SerialWriteZ
+    ld      a, '='
+    call    SerialWrite
+    ; value
+    ld      a, [DfsIdx]
+    call    FormGetValuePtr
+    call    SerialWriteZ
+.dfsSkip:
+    ld      a, [DfsIdx]
+    inc     a
+    ld      [DfsIdx], a
+    jp      .dfsLoop
+.dfsDone:
+    ld      hl, .dfsTail
+    call    SerialWriteZ
+    jp      MainLoop
+.dfsHeader:     db "FORM "
+                db 0
+.dfsTail:       db 0x0D, 0x0A, 0
+
+DfsIdx:         db 0
+DfsAmpPending:  db 0
+
+; FormGetTypePtr: A = slot. Returns HL -> FormType[A].
+FormGetTypePtr:
+    ld      e, a
+    ld      d, 0
+    ld      hl, FormType
+    add     hl, de
+    ret
 
 ; DoLinkEnter: Enter pressed while Focus=Content. If a link is currently
 ; Tab-focused, copy its href into UrlBuf and navigate. Otherwise fall
@@ -2058,7 +2244,7 @@ PrintFileContent:
     ret     z
 
     ; --- Reset HTML parser state ---
-    call    FormReset                   ; rebuild form-fields table
+    call    FormBeginRender             ; reset parse cursor; preserve typed values when sticky
     xor     a
     ld      [HtmlInHead], a
     ld      [HtmlInTitle], a
@@ -2203,6 +2389,7 @@ PrintFileContent:
     ; path exited with the mask on.
     call    ArFlush
     call    LineFlush
+    call    FormEndRender               ; flip FormSticky on
     jp      SerialUnmaskVblank
 
 .tag:
@@ -3416,11 +3603,20 @@ PaintBoxConnectors:
     call    LGet_Glyph
     cp      WG_BOX_L
     jr      z, .pbcSawL
+    cp      WG_BOX_LF
+    jr      z, .pbcSawLF
     ld      a, [PbcI]
     inc     a
     ld      [PbcI], a
     jr      .pbcLoop
+.pbcSawLF:
+    ld      a, COL_BLACK
+    ld      [PbcColor], a
+    jr      .pbcAnchor
 .pbcSawL:
+    ld      a, COL_DGRAY
+    ld      [PbcColor], a
+.pbcAnchor:
     ld      a, [PbcI]
     ld      [PbcL], a
     inc     a
@@ -3434,8 +3630,12 @@ PaintBoxConnectors:
     call    LGet_Glyph
     cp      WG_BOX_R
     jr      z, .pbcDraw
+    cp      WG_BOX_RF
+    jr      z, .pbcDraw
     cp      WG_BOX_L
     jr      z, .pbcSawL                      ; nested L: re-anchor
+    cp      WG_BOX_LF
+    jr      z, .pbcSawLF
     ld      a, [PbcI]
     inc     a
     ld      [PbcI], a
@@ -3470,7 +3670,7 @@ PaintBoxConnectors:
     ld      c, a                             ; C = top row
     push    bc
     push    de
-    ld      a, COL_DGRAY
+    ld      a, [PbcColor]
     call    DrawHLine
     pop     de
     pop     bc
@@ -3479,12 +3679,13 @@ PaintBoxConnectors:
     ld      a, [TextY]
     add     a, WG_HEIGHT - 1 - WG_Y_RAISE
     ld      c, a                             ; C = bottom row
-    ld      a, COL_DGRAY
+    ld      a, [PbcColor]
     call    DrawHLine
     ld      a, [PbcI]
     inc     a
     ld      [PbcI], a
     jp      .pbcLoop
+PbcColor:       db 0
 FxLinkI:        db 0                ; link iteration index for FixRtlLinkRectsOnLine
 FxOrigStart:    dw 0
 FxOrigEnd:      dw 0
@@ -8449,29 +8650,46 @@ TagInput:
 .inputText:
     ; Allocate a slot, copy in name + initial value. Render value chars
     ; inside the box (left-aligned), then pad with empty M cells to fill
-    ; the remaining width.
+    ; the remaining width. If this slot is the focused one (HtmlFormFocus),
+    ; switch the box edges to the BLACK-bordered LF/MF/RF variants so
+    ; the user can see which field will receive their typing.
     call    FormAllocCurrent            ; A = slot, CF=1 if no room
-    push    af
+    push    af                          ; save CF for later
     call    nc, FormStoreFromSlotA
-    pop     af                          ; A = slot, CF preserved? actually no
-    ; Render the box. Even on full table we still draw an empty box so
-    ; the page doesn't shift between renders; it just won't be live-editable.
-    ld      a, WG_BOX_L
-    call    EmitSink
-    ; Emit value chars (from FormValue[slot] if we have one; else empty).
-    ld      a, [FormCount]
+    pop     af
+    ; A still holds the slot index. Stash it in .tiSlot for the rest of
+    ; this routine; reading FormCount-1 later would be wrong on sticky
+    ; re-renders (FormCount stays at the total, not "slots so far").
+    ld      [.tiSlot], a
+    ; Focus check: is this slot the focused one?
+    ld      b, a
+    ld      a, [HtmlFormFocus]
+    cp      b
+    jr      z, .tiFocused
+    xor     a
+    jr      .tiFocusStored
+.tiFocused:
+    ld      a, 1
+.tiFocusStored:
+    ld      [.tiFocusFlag], a
+    ; Emit left edge (focused or not).
+    ld      a, [.tiFocusFlag]
     or      a
-    jr      z, .tiNoSlot                ; no slot was allocated (table was full)
-    dec     a                           ; A = our slot index
-    call    FormGetValuePtr             ; HL -> value buf
+    ld      a, WG_BOX_L
+    jr      z, .tiEmitL
+    ld      a, WG_BOX_LF
+.tiEmitL:
+    call    EmitSink
+    ; Walk value chars (or '*' for password).
     ld      b, 0                        ; B = chars emitted
+    ld      a, [.tiSlot]
+    call    FormGetValuePtr             ; HL -> value buf
 .tiVLoop:
     ld      a, [hl]
     or      a
-    jr      z, .tiVDone
+    jr      z, .tiPad
     push    bc
     push    hl
-    ; For password type render '*' instead of the actual char.
     ld      a, [HtmlInputType]
     cp      'P'
     jr      nz, .tiVPlain
@@ -8488,22 +8706,34 @@ TagInput:
     ld      a, b
     cp      TI_TEXT_DEFAULT_W
     jr      c, .tiVLoop
-.tiVDone:
-.tiNoSlot:
-    ; Pad out the remaining width with M cells.
+.tiPad:
+    ; Pad remaining width with M (or MF when focused) cells.
     ld      a, TI_TEXT_DEFAULT_W
     sub     b
     jr      z, .tiPadDone
     ld      b, a
 .tiPadLoop:
     push    bc
+    ld      a, [.tiFocusFlag]
+    or      a
     ld      a, WG_BOX_M
+    jr      z, .tiPadEmit
+    ld      a, WG_BOX_MF
+.tiPadEmit:
     call    EmitSink
     pop     bc
     djnz    .tiPadLoop
 .tiPadDone:
+    ld      a, [.tiFocusFlag]
+    or      a
     ld      a, WG_BOX_R
+    jr      z, .tiEmitR
+    ld      a, WG_BOX_RF
+.tiEmitR:
     jp      EmitSink
+
+.tiFocusFlag:    db 0
+.tiSlot:         db 0
 
 .inputSubmit:
     call    FormAllocCurrent
@@ -8572,25 +8802,67 @@ TagInput:
 ; is which.
 ; ---------------------------------------------------------------------------
 
-; FormReset: zero FormCount + clear focus. Called by PrintFileContent at
-; the start of every render so navigation / scrolling re-allocates from
-; an empty table. Clobbers A.
+; FormReset: zero FormCount and clear FormSticky so the next render
+; treats every <input> as fresh (initial value re-loaded from VALUE=).
+; Called when navigating to a NEW URL via NavigateToCurrentUrl. After
+; the first render the flag flips so re-renders triggered by typing /
+; scrolling preserve any user-edited values. Clobbers A.
 FormReset:
     xor     a
     ld      [FormCount], a
+    ld      [FormSticky], a
+    ld      a, 0xFF
+    ld      [HtmlFormFocus], a
     ret
 
-; FormAllocCurrent: reserve the next slot and return its index in A.
-; CF=0 on success, CF=1 if FormCount == FORM_MAX (table full -- caller
-; should still render the widget but skip the per-slot bookkeeping).
-; Increments FormCount on success. Clobbers A.
+; FormBeginRender: called by PrintFileContent at the start of each
+; render. If FormSticky is 0 (fresh page), zero FormCount so TagInput
+; rebuilds the table from scratch. If sticky, keep FormCount but reset
+; the per-render write cursor (FormParseCursor) so the parser visits
+; slots in the same logical order to update positions only.
+FormBeginRender:
+    ld      a, [FormSticky]
+    or      a
+    jr      nz, .fbrSticky
+    xor     a
+    ld      [FormCount], a
+.fbrSticky:
+    xor     a
+    ld      [FormParseCursor], a
+    ret
+
+; FormEndRender: flip FormSticky on so future RefreshAfterScroll passes
+; preserve typed values. Called at the end of PrintFileContent.
+FormEndRender:
+    ld      a, 1
+    ld      [FormSticky], a
+    ret
+
+FormSticky:     db 0
+FormParseCursor: db 0
+
+; FormAllocCurrent: reserve the parse cursor's current slot and return
+; its index in A. CF=0 on success, CF=1 if FormParseCursor reached
+; FORM_MAX. On a fresh-page render this is the same as "next FormCount"
+; and it grows the table; on a sticky re-render it just walks existing
+; slots in the same parser order so values from previous render survive.
 FormAllocCurrent:
-    ld      a, [FormCount]
+    ld      a, [FormParseCursor]
     cp      FORM_MAX
     jr      nc, .faFull
     ld      [FormSlotTmp], a
     inc     a
+    ld      [FormParseCursor], a
+    ; If we're growing the table (cursor went past current count), bump
+    ; FormCount too. On sticky re-renders the cursor stays <= count so
+    ; we don't double-grow.
+    ld      b, a
+    ld      a, [FormCount]
+    cp      b
+    jr      nc, .faGrowSkip
+    ld      a, b
     ld      [FormCount], a
+.faGrowSkip:
     ld      a, [FormSlotTmp]
     or      a                               ; CF=0
     ret
@@ -8600,11 +8872,17 @@ FormAllocCurrent:
 
 FormSlotTmp:    db 0
 
-; FormStoreFromSlotA: A = slot index. Stash HtmlInputType[0] into
-; FormType[A], copy HtmlNameAttr into FormName[A], copy HtmlCurHref into
-; FormValue[A]. Used right after FormAllocCurrent to populate a freshly
-; allocated slot from the current parser scratch state. Clobbers all.
+; FormStoreFromSlotA: A = slot index. On a fresh-page render (FormSticky
+; is 0) this writes type / width / name / value into the slot from the
+; current parser scratch state. On a sticky re-render it returns
+; immediately so the user's typed value isn't clobbered by the original
+; VALUE= attribute on every keystroke.
 FormStoreFromSlotA:
+    push    af
+    ld      a, [FormSticky]
+    or      a
+    jr      nz, .fsfSticky
+    pop     af
     push    af
     ; --- type byte ---
     ld      e, a
@@ -8613,7 +8891,7 @@ FormStoreFromSlotA:
     add     hl, de
     ld      a, [HtmlInputType]
     ld      [hl], a
-    ; --- width = TI_TEXT_DEFAULT_W (relevant for text/pass) ---
+    ; --- width ---
     pop     af
     push    af
     ld      e, a
@@ -8625,18 +8903,21 @@ FormStoreFromSlotA:
     ; --- name ---
     pop     af
     push    af
-    call    FormGetNamePtr                  ; HL -> dest
-    ex      de, hl                          ; DE = dest
+    call    FormGetNamePtr
+    ex      de, hl
     ld      hl, HtmlNameAttr
     ld      bc, FORM_NAME_MAX + 1
     ldir
     ; --- value ---
     pop     af
-    call    FormGetValuePtr                 ; HL -> dest
-    ex      de, hl                          ; DE = dest
+    call    FormGetValuePtr
+    ex      de, hl
     ld      hl, HtmlCurHref
     ld      bc, FORM_VALUE_MAX + 1
     ldir
+    ret
+.fsfSticky:
+    pop     af
     ret
 
 ; FormGetNamePtr: A = slot. Returns HL -> FormName[A * (NAME_MAX + 1)].
@@ -8659,6 +8940,95 @@ FormGetNamePtr:
     ld      de, FormName
     add     hl, de
     pop     af
+    ret
+
+; FormFirstEditableSlot: scan FormFields for the first text or password
+; slot. Returns A = slot index (CF=0), or 0xFF (CF=1) if there's none.
+; Clobbers BC, HL.
+FormFirstEditableSlot:
+    ld      a, [FormCount]
+    or      a
+    jr      z, .ffeNone
+    ld      b, a
+    ld      hl, FormType
+    ld      c, 0
+.ffeLoop:
+    ld      a, [hl]
+    cp      'T'
+    jr      z, .ffeHit
+    cp      'P'
+    jr      z, .ffeHit
+    inc     hl
+    inc     c
+    dec     b
+    jr      nz, .ffeLoop
+.ffeNone:
+    ld      a, 0xFF
+    scf
+    ret
+.ffeHit:
+    ld      a, c
+    or      a                                ; CF=0
+    ret
+
+; FormNextEditableSlot: advance HtmlFormFocus to the next text/pass slot
+; after the current one. Returns A = next slot, or 0xFF if no more.
+; Clobbers BC, HL.
+FormNextEditableSlot:
+    ld      a, [HtmlFormFocus]
+    inc     a                                ; start from focus+1
+    ld      c, a                             ; C = candidate slot
+.fneCheck:
+    ld      a, [FormCount]
+    cp      c
+    jr      z, .fneNone
+    jr      c, .fneNone
+    ld      b, 0
+    ld      a, c
+    ld      e, a
+    ld      d, b
+    ld      hl, FormType
+    add     hl, de
+    ld      a, [hl]
+    cp      'T'
+    jr      z, .fneHit
+    cp      'P'
+    jr      z, .fneHit
+    inc     c
+    jr      .fneCheck
+.fneNone:
+    ld      a, 0xFF
+    scf
+    ret
+.fneHit:
+    ld      a, c
+    or      a
+    ret
+
+; FormFirstSubmitSlot: find the first slot with type 'S' or 'B' (submit
+; or button). Returns A = slot index, or 0xFF if none. Clobbers BC, HL.
+FormFirstSubmitSlot:
+    ld      a, [FormCount]
+    or      a
+    jr      z, .fssNone
+    ld      b, a
+    ld      hl, FormType
+    ld      c, 0
+.fssLoop:
+    ld      a, [hl]
+    cp      'S'
+    jr      z, .fssHit
+    cp      'B'
+    jr      z, .fssHit
+    inc     hl
+    inc     c
+    dec     b
+    jr      nz, .fssLoop
+.fssNone:
+    ld      a, 0xFF
+    ret
+.fssHit:
+    ld      a, c
     ret
 
 ; FormGetValuePtr: A = slot. Returns HL -> FormValue[A * (VALUE_MAX + 1)].
@@ -9250,6 +9620,7 @@ NavigateAndFocusContent:
 NavigateToCurrentUrl:
     ld      a, 0xFF
     ld      [HtmlFocusLink], a
+    call    FormReset                       ; new page -> rebuild form table fresh
 
     ld      a, 1
     ld      [Busy], a
@@ -11132,8 +11503,11 @@ WG_CHK_ON       equ 0x05
 WG_RAD_OFF      equ 0x06
 WG_RAD_ON       equ 0x07
 WG_SEL_ARROW    equ 0x08                    ; down-pointing dropdown indicator
+WG_BOX_LF       equ 0x09                    ; focused-input variants: black
+WG_BOX_MF       equ 0x0A                    ; border instead of dgray
+WG_BOX_RF       equ 0x0B
 WG_FIRST        equ 0x01
-WG_LAST         equ 0x08
+WG_LAST         equ 0x0B
 
 WG_HEIGHT       equ 14
 WG_Y_RAISE      equ 3                       ; widget top sits this many px above TextY
@@ -11276,6 +11650,57 @@ WidgetRadOn:
     db  0xA8, 0x2A      ; row 12: bottom cap
     db  0xAA, 0xAA      ; row 13
 
+; Focused-input variants of the box edges/middle. Border colour shifts
+; from dgray (00) to black (FF) so the user can see which text/password
+; field will receive their keystrokes. The interior whites are unchanged.
+WidgetBoxLF:
+    db  0xFF, 0xFF      ; row 0:  top border (8 px black)
+    db  0xEA, 0xAA      ; row 1:  K W W W W W W W
+    db  0xEA, 0xAA      ; row 2
+    db  0xEA, 0xAA      ; row 3
+    db  0xEA, 0xAA      ; row 4
+    db  0xEA, 0xAA      ; row 5
+    db  0xEA, 0xAA      ; row 6
+    db  0xEA, 0xAA      ; row 7
+    db  0xEA, 0xAA      ; row 8
+    db  0xEA, 0xAA      ; row 9
+    db  0xEA, 0xAA      ; row 10
+    db  0xEA, 0xAA      ; row 11
+    db  0xEA, 0xAA      ; row 12
+    db  0xFF, 0xFF      ; row 13: bottom border
+
+WidgetBoxMF:
+    db  0xFF, 0xFF      ; row 0
+    db  0xAA, 0xAA      ; row 1
+    db  0xAA, 0xAA      ; row 2
+    db  0xAA, 0xAA      ; row 3
+    db  0xAA, 0xAA      ; row 4
+    db  0xAA, 0xAA      ; row 5
+    db  0xAA, 0xAA      ; row 6
+    db  0xAA, 0xAA      ; row 7
+    db  0xAA, 0xAA      ; row 8
+    db  0xAA, 0xAA      ; row 9
+    db  0xAA, 0xAA      ; row 10
+    db  0xAA, 0xAA      ; row 11
+    db  0xAA, 0xAA      ; row 12
+    db  0xFF, 0xFF      ; row 13
+
+WidgetBoxRF:
+    db  0xFF, 0xFF      ; row 0
+    db  0xAA, 0xAB      ; row 1:  W W W W W W W K
+    db  0xAA, 0xAB      ; row 2
+    db  0xAA, 0xAB      ; row 3
+    db  0xAA, 0xAB      ; row 4
+    db  0xAA, 0xAB      ; row 5
+    db  0xAA, 0xAB      ; row 6
+    db  0xAA, 0xAB      ; row 7
+    db  0xAA, 0xAB      ; row 8
+    db  0xAA, 0xAB      ; row 9
+    db  0xAA, 0xAB      ; row 10
+    db  0xAA, 0xAB      ; row 11
+    db  0xAA, 0xAB      ; row 12
+    db  0xFF, 0xFF      ; row 13
+
 ; Down-pointing arrow used as the dropdown indicator on the right edge
 ; of <select>. Carries the M-cell top + bottom border rows so the box's
 ; outline stays continuous if PaintBoxConnectors is ever skipped; the
@@ -11308,6 +11733,9 @@ WidgetBitmaps:
     dw  WidgetRadOff
     dw  WidgetRadOn
     dw  WidgetSelArrow
+    dw  WidgetBoxLF
+    dw  WidgetBoxMF
+    dw  WidgetBoxRF
 
 ; resources/up.png -> 8x5 MSX pixels. DrawDownArrow reuses this by reading
 ; rows in reverse (DrawBitmapReverse), so no separate down-arrow bitmap.
