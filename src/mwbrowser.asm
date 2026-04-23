@@ -2629,20 +2629,13 @@ EmitRaw:
     pop     bc
 .posOk:
 
-    ; Skip phase: wrap has already been handled above; skip the buffer
-    ; append and the TextY bottom check, but keep TextX advancing so the
-    ; next wrap fires at the same X as it would during a full render.
-    ; B still holds the glyph -- scratch through C for the 16-bit OR.
-    ld      a, [HtmlLineSkip]
-    ld      c, a
-    ld      a, [HtmlLineSkip + 1]
-    or      c
-    jr      z, .doAppend
-    ld      hl, [TextX]
-    ld      de, 8
-    add     hl, de
-    ld      [TextX], hl
-    jr      .done
+    ; Fall through to .doAppend regardless of HtmlLineSkip -- during
+    ; scrolled passes we still populate LineBuf so SmartWrap can
+    ; break on spaces the same way it does in a full-render pass.
+    ; LineDrawCells checks HtmlLineSkip and suppresses the actual
+    ; VRAM paint when we're still skipping, so the cells we append
+    ; here never reach the screen; they only exist long enough for
+    ; the wrap logic to match the non-scrolled render's line breaks.
 
 .doAppend:
     ; Bottom check: past canvas bottom -> advance cursor silently (no append).
@@ -2754,10 +2747,22 @@ LineFlush:
     or      a
     ret     z
 
+    ; Suppress the actual VRAM paint while HtmlLineSkip > 0 (the
+    ; first N rendered lines of a scrolled pass are cells we need
+    ; to have *laid out* for wrap consistency with the non-scrolled
+    ; render, but we don't want them on screen). Resolve/BiDi still
+    ; run so any internal state stays consistent.
+    ld      a, [HtmlLineSkip]
+    ld      b, a
+    ld      a, [HtmlLineSkip + 1]
+    or      b
+    jr      nz, .lfSkipDraw
+
     call    LineResolveNeutrals
     call    LineBidiReorder
     call    LineDrawCells
 
+.lfSkipDraw:
     xor     a
     ld      [LineLen], a
     ret
@@ -8596,12 +8601,14 @@ HistoryUpdateFlags:
 ; Step 2: Scrolling
 ; ============================================================================
 
-; RefreshAfterScroll: recompute thumb, redraw content + scrollbar.
+; RefreshAfterScroll: refresh the scrollbar first (so the thumb jumps
+; ahead of the slower content repaint and the user sees their scroll
+; acknowledged immediately), then redraw the content area itself.
 RefreshAfterScroll:
     call    ComputeThumb
+    call    DrawScrollbar
     call    ClearContentArea
-    call    PrintFileContent
-    jp      DrawScrollbar
+    jp      PrintFileContent
 
 ; ScrollUp: decrement ScrollLine if > 0, refresh.
 ScrollUp:
