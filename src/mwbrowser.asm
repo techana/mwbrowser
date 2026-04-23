@@ -2058,6 +2058,7 @@ PrintFileContent:
     ret     z
 
     ; --- Reset HTML parser state ---
+    call    FormReset                   ; rebuild form-fields table
     xor     a
     ld      [HtmlInHead], a
     ld      [HtmlInTitle], a
@@ -4151,6 +4152,7 @@ ScanHrefAttr:
     ld      [HtmlInputType + 1], a
     xor     a
     ld      [HtmlChecked], a                ; CHECKED defaults to false
+    ld      [HtmlNameAttr], a               ; NAME defaults to empty
 .sh_scan:
     ld      a, [hl]
     cp      '>'
@@ -4186,6 +4188,10 @@ ScanHrefAttr:
     jp      z, .sh_tryType
     cp      'T'
     jp      z, .sh_tryType
+    cp      'n'
+    jp      z, .sh_tryName
+    cp      'N'
+    jp      z, .sh_tryName
     inc     hl
     jp      .sh_scan
 
@@ -4527,6 +4533,85 @@ ScanHrefAttr:
 .sh_typeSkip:
     inc     hl
     jr      .sh_typeTail
+
+; NAME= parser. Captures up to FORM_NAME_MAX bytes into HtmlNameAttr.
+; Used by TagInput to label a form slot for the eventual submit query
+; string ("name=value&...").
+.sh_tryName:
+    push    hl
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'A'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'M'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'E'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    cp      '='
+    jp      nz, .sh_noMatch
+    inc     hl
+    pop     bc
+    ; Optional opening quote.
+    ld      b, 0
+    ld      a, [hl]
+    cp      0x22
+    jr      z, .sh_nameQuoted
+    cp      0x27
+    jr      z, .sh_nameQuoted
+    jr      .sh_nameRead
+.sh_nameQuoted:
+    ld      b, a
+    inc     hl
+.sh_nameRead:
+    ld      de, HtmlNameAttr
+    ld      c, FORM_NAME_MAX
+.sh_nameLoop:
+    ld      a, [hl]
+    or      a
+    jr      z, .sh_nameDone
+    cp      '>'
+    jr      z, .sh_nameDone
+    ld      a, b
+    or      a
+    jr      z, .sh_nameBareEnd
+    ld      a, [hl]
+    cp      b
+    jr      z, .sh_nameAfterQuote
+    jr      .sh_nameStore
+.sh_nameBareEnd:
+    ld      a, [hl]
+    cp      ' '
+    jr      z, .sh_nameDone
+    cp      0x09
+    jr      z, .sh_nameDone
+    cp      '/'
+    jr      z, .sh_nameDone
+.sh_nameStore:
+    ld      a, c
+    or      a
+    jr      z, .sh_nameSkip                  ; buffer full -> drop char
+    ld      a, [hl]
+    ld      [de], a
+    inc     de
+    dec     c
+.sh_nameSkip:
+    inc     hl
+    jr      .sh_nameLoop
+.sh_nameAfterQuote:
+    inc     hl                               ; consume closing quote
+.sh_nameDone:
+    xor     a
+    ld      [de], a                          ; NUL-terminate
+    jp      .sh_scan
 
 .sh_tryAlt:
     push    hl
@@ -8327,10 +8412,20 @@ TagA:
 TagForm:
     ret
 
+; Default visible width (inner cells, exclusive of the L/R borders) for a
+; text or password input that didn't carry SIZE=. Must match
+; FORM_VALUE_MAX so the widget reserves exactly enough cells for the
+; value buffer's full capacity.
+TI_TEXT_DEFAULT_W equ FORM_VALUE_MAX
+
 ; <input>: dispatch on HtmlInputType (first two letters of type=,
 ; uppercased). Defaults to text when no TYPE was given. Widgets are
 ; built from the WG_* sentinel cells (see WidgetBitmaps); the BiDi /
 ; wrap pipeline treats them like any other 8-px-wide glyph cell.
+;
+; Every visible <input> gets a slot in the FormFields table (FormAlloc)
+; so typing, focus, and submit can find it later. The slot's value is
+; primed from the parsed VALUE= attribute and may be edited live.
 TagInput:
     ld      a, [HtmlIsClose]
     or      a
@@ -8352,24 +8447,67 @@ TagInput:
     jp      z, .inputImage
     ; fall through: type=text (or anything we don't understand)
 .inputText:
-    ; Visible width: SIZE attribute would belong here once parsed; for
-    ; now use TI_TEXT_DEFAULT_W cells of inner space + 2 for the borders.
-    ; The value text is intentionally NOT echoed inside the box -- once
-    ; focus + typing is wired up the live edit buffer will render it,
-    ; and the parsed value will become its initial contents.
+    ; Allocate a slot, copy in name + initial value. Render value chars
+    ; inside the box (left-aligned), then pad with empty M cells to fill
+    ; the remaining width.
+    call    FormAllocCurrent            ; A = slot, CF=1 if no room
+    push    af
+    call    nc, FormStoreFromSlotA
+    pop     af                          ; A = slot, CF preserved? actually no
+    ; Render the box. Even on full table we still draw an empty box so
+    ; the page doesn't shift between renders; it just won't be live-editable.
     ld      a, WG_BOX_L
     call    EmitSink
-    ld      b, TI_TEXT_DEFAULT_W
-.tiBoxLoop:
+    ; Emit value chars (from FormValue[slot] if we have one; else empty).
+    ld      a, [FormCount]
+    or      a
+    jr      z, .tiNoSlot                ; no slot was allocated (table was full)
+    dec     a                           ; A = our slot index
+    call    FormGetValuePtr             ; HL -> value buf
+    ld      b, 0                        ; B = chars emitted
+.tiVLoop:
+    ld      a, [hl]
+    or      a
+    jr      z, .tiVDone
+    push    bc
+    push    hl
+    ; For password type render '*' instead of the actual char.
+    ld      a, [HtmlInputType]
+    cp      'P'
+    jr      nz, .tiVPlain
+    ld      a, '*'
+    jr      .tiVEmit
+.tiVPlain:
+    ld      a, [hl]
+.tiVEmit:
+    call    EmitSink
+    pop     hl
+    pop     bc
+    inc     hl
+    inc     b
+    ld      a, b
+    cp      TI_TEXT_DEFAULT_W
+    jr      c, .tiVLoop
+.tiVDone:
+.tiNoSlot:
+    ; Pad out the remaining width with M cells.
+    ld      a, TI_TEXT_DEFAULT_W
+    sub     b
+    jr      z, .tiPadDone
+    ld      b, a
+.tiPadLoop:
     push    bc
     ld      a, WG_BOX_M
     call    EmitSink
     pop     bc
-    djnz    .tiBoxLoop
+    djnz    .tiPadLoop
+.tiPadDone:
     ld      a, WG_BOX_R
     jp      EmitSink
 
 .inputSubmit:
+    call    FormAllocCurrent
+    call    nc, FormStoreFromSlotA
     ; Padded "[ Label ]" rectangle. Label text rides on top of the
     ; WG_BOX_M fill cells; for ASCII glyphs the font's blank top/bottom
     ; rows leave the box outline intact.
@@ -8391,6 +8529,8 @@ TagInput:
 .tisDefault:    db "OK", 0
 
 .inputCheckbox:
+    call    FormAllocCurrent
+    call    nc, FormStoreFromSlotA
     ld      a, [HtmlChecked]
     or      a
     ld      a, WG_CHK_OFF
@@ -8405,6 +8545,8 @@ TagInput:
     jr      z, .inputRadio
     jp      .inputSubmit                ; reset: same visual as submit
 .inputRadio:
+    call    FormAllocCurrent
+    call    nc, FormStoreFromSlotA
     ld      a, [HtmlChecked]
     or      a
     ld      a, WG_RAD_OFF
@@ -8414,24 +8556,130 @@ TagInput:
     jp      EmitSink
 
 .inputHidden:
-    ret                                 ; not visible
+    call    FormAllocCurrent
+    call    nc, FormStoreFromSlotA
+    ret                                 ; hidden inputs aren't drawn
 
 .inputImage:
     jp      TagImg                      ; behaves like an inline <img>
 
-; Default visible width (inner cells, exclusive of the L/R borders) for a
-; text or password input that didn't carry SIZE=. Matches the rough look
-; of a typical HTML 2 search box at our 8 px per char metric.
-TI_TEXT_DEFAULT_W equ 18
+; ---------------------------------------------------------------------------
+; Form-field slot helpers. The slot table (FormType / FormName / FormValue
+; / FormWidth, see globals near HtmlFormFocus) is rebuilt at every
+; PrintFileContent pass via FormReset, then each visible <input> grows it
+; by one slot via FormAllocCurrent. Slot indices are stable across the
+; render so click hit-testing and re-render keep agreeing on which slot
+; is which.
+; ---------------------------------------------------------------------------
 
-.inputHidden:
-    ret                                  ; not visible
+; FormReset: zero FormCount + clear focus. Called by PrintFileContent at
+; the start of every render so navigation / scrolling re-allocates from
+; an empty table. Clobbers A.
+FormReset:
+    xor     a
+    ld      [FormCount], a
+    ret
 
-.inputImage:
-    ; <input type="image" src="..."> -- behaves like an inline image
-    ; that also acts as a submit hotspot. For now, just render the
-    ; image (or its width/height placeholder) by jumping into TagImg.
-    jp      TagImg
+; FormAllocCurrent: reserve the next slot and return its index in A.
+; CF=0 on success, CF=1 if FormCount == FORM_MAX (table full -- caller
+; should still render the widget but skip the per-slot bookkeeping).
+; Increments FormCount on success. Clobbers A.
+FormAllocCurrent:
+    ld      a, [FormCount]
+    cp      FORM_MAX
+    jr      nc, .faFull
+    ld      [FormSlotTmp], a
+    inc     a
+    ld      [FormCount], a
+    ld      a, [FormSlotTmp]
+    or      a                               ; CF=0
+    ret
+.faFull:
+    scf
+    ret
+
+FormSlotTmp:    db 0
+
+; FormStoreFromSlotA: A = slot index. Stash HtmlInputType[0] into
+; FormType[A], copy HtmlNameAttr into FormName[A], copy HtmlCurHref into
+; FormValue[A]. Used right after FormAllocCurrent to populate a freshly
+; allocated slot from the current parser scratch state. Clobbers all.
+FormStoreFromSlotA:
+    push    af
+    ; --- type byte ---
+    ld      e, a
+    ld      d, 0
+    ld      hl, FormType
+    add     hl, de
+    ld      a, [HtmlInputType]
+    ld      [hl], a
+    ; --- width = TI_TEXT_DEFAULT_W (relevant for text/pass) ---
+    pop     af
+    push    af
+    ld      e, a
+    ld      d, 0
+    ld      hl, FormWidth
+    add     hl, de
+    ld      a, TI_TEXT_DEFAULT_W
+    ld      [hl], a
+    ; --- name ---
+    pop     af
+    push    af
+    call    FormGetNamePtr                  ; HL -> dest
+    ex      de, hl                          ; DE = dest
+    ld      hl, HtmlNameAttr
+    ld      bc, FORM_NAME_MAX + 1
+    ldir
+    ; --- value ---
+    pop     af
+    call    FormGetValuePtr                 ; HL -> dest
+    ex      de, hl                          ; DE = dest
+    ld      hl, HtmlCurHref
+    ld      bc, FORM_VALUE_MAX + 1
+    ldir
+    ret
+
+; FormGetNamePtr: A = slot. Returns HL -> FormName[A * (NAME_MAX + 1)].
+; Clobbers HL, DE. Preserves A.
+FormGetNamePtr:
+    ld      e, a
+    ld      d, 0
+    push    af
+    ; offset = A * 13. Use a tiny shift+add chain.
+    ld      h, d
+    ld      l, e                            ; HL = A
+    add     hl, hl                          ; *2
+    add     hl, hl                          ; *4
+    add     hl, hl                          ; *8
+    add     hl, de                          ; *9
+    add     hl, de                          ; *10
+    add     hl, de                          ; *11
+    add     hl, de                          ; *12
+    add     hl, de                          ; *13
+    ld      de, FormName
+    add     hl, de
+    pop     af
+    ret
+
+; FormGetValuePtr: A = slot. Returns HL -> FormValue[A * (VALUE_MAX + 1)].
+; VALUE_MAX + 1 = 19. Clobbers HL, DE. Preserves A.
+FormGetValuePtr:
+    ld      e, a
+    ld      d, 0
+    push    af
+    ld      h, d
+    ld      l, e                            ; HL = A
+    add     hl, hl                          ; *2
+    add     hl, hl                          ; *4
+    add     hl, hl                          ; *8
+    add     hl, hl                          ; *16
+    add     hl, de                          ; *17
+    add     hl, de                          ; *18
+    add     hl, de                          ; *19
+    ld      de, FormValue
+    add     hl, de
+    pop     af
+    ret
 
 ; Helper: walk a NUL-terminated string at HL, emitting each byte
 ; through EmitSink. Returns when it hits the NUL.
@@ -11178,6 +11426,33 @@ HtmlChecked:    db 0
 ; need a 2-pass scan to do that without rolling back already-emitted
 ; cells). For now: first option = the visible one.
 HtmlSelectFound: db 0
+
+; ---------------------------------------------------------------------------
+; Form-field slot table. One slot per <input> we want to remember after
+; parsing -- text / password / submit / checkbox / radio. Filled by
+; TagInput as the page renders; consumed by:
+;   - the text/pass renderer (so value chars appear inside the box)
+;   - Tab focus cycling (see HtmlFormFocus)
+;   - keyboard typing (appends to the focused slot's value)
+;   - submit-click -> SerialWriteZ (URL-encoded query string)
+;
+; FORM_NAME_MAX/VALUE_MAX are NOT including the trailing NUL.
+; ---------------------------------------------------------------------------
+FORM_MAX        equ 8
+FORM_NAME_MAX   equ 12
+FORM_VALUE_MAX  equ 18                       ; matches TI_TEXT_DEFAULT_W
+
+FormCount:      db 0                         ; live slots in [0..FormCount)
+HtmlFormFocus:  db 0xFF                      ; slot index, or 0xFF = none
+FormType:       ds FORM_MAX                  ; 'T','P','S','C','R','B','I','H'
+FormWidth:      ds FORM_MAX                  ; visible width in chars (text/pass)
+FormName:       ds FORM_MAX * (FORM_NAME_MAX + 1)
+FormValue:      ds FORM_MAX * (FORM_VALUE_MAX + 1)
+
+; HtmlNameAttr is captured by ScanHrefAttr from a NAME=... attribute
+; on the current tag. TagInput then copies it into FormName[slot] when
+; allocating a form slot.
+HtmlNameAttr:   ds FORM_NAME_MAX + 1
 
 ; Image-map scratch. `<map>` begins a block of `<area>` rects; their
 ; coords are page-local (relative to the chunk's top-left). When the
