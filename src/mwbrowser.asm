@@ -567,13 +567,15 @@ CycleFocusBack:
     ret
 
 ; DoFormType: append the printable ASCII char in B to the focused
-; text/password slot's value buffer (capped at FORM_VALUE_MAX), then
-; re-render the page so the new char appears inside the box.
+; text/password slot's value, then paint JUST the new char into the
+; next free cell of its input box -- bypassing PrintFileContent so
+; every keystroke doesn't re-walk and re-paint the whole page. Normal
+; scrolling / nav will re-render and pick up any divergence.
 DoFormType:
     ld      a, [HtmlFormFocus]
     cp      0xFF
     jp      z, MainLoop
-    call    FormGetValuePtr             ; HL -> value buf
+    call    FormGetValuePtr
     xor     a
     ld      [DftLen], a
 .dftLen:
@@ -589,40 +591,110 @@ DoFormType:
 .dftAtEnd:
     ld      a, [DftLen]
     cp      FORM_VALUE_MAX
-    jp      nc, MainLoop
+    jp      nc, MainLoop                ; full -> drop
     ld      a, b
     ld      [hl], a
     inc     hl
     xor     a
     ld      [hl], a
-    call    RefreshContentInPlace
+    ; For password slots, paint '*' so the live display stays masked.
+    ld      a, [HtmlFormFocus]
+    call    FormGetTypePtr
+    ld      a, [hl]
+    cp      'P'
+    ld      a, b
+    jr      nz, .dftHaveChar
+    ld      a, '*'
+.dftHaveChar:
+    call    FormPaintCharAtEnd
     jp      MainLoop
 
 DftLen:         db 0
 
-; DoFormBackspace: drop the last char from the focused field's value.
+; DoFormBackspace: remove the last char, then overpaint that cell
+; with the empty-interior WG_BOX_M widget so the trailing glyph
+; visually disappears.
 DoFormBackspace:
     ld      a, [HtmlFormFocus]
     cp      0xFF
     jp      z, MainLoop
     call    FormGetValuePtr
-    ld      c, 0
+    xor     a
+    ld      [DftLen], a
 .dfbLen:
     ld      a, [hl]
     or      a
     jr      z, .dfbAtEnd
     inc     hl
-    inc     c
+    ld      a, [DftLen]
+    inc     a
+    ld      [DftLen], a
     jr      .dfbLen
 .dfbAtEnd:
-    ld      a, c
+    ld      a, [DftLen]
     or      a
     jp      z, MainLoop
     dec     hl
     xor     a
     ld      [hl], a
-    call    RefreshContentInPlace
+    ld      a, [DftLen]
+    dec     a
+    ld      [DftLen], a
+    ld      a, WG_BOX_M
+    call    FormPaintCharAtEnd
     jp      MainLoop
+
+; FormPaintCharAtEnd: paint A (either a printable char or a widget
+; sentinel id < WG_LAST+1) at cell (DftLen + 1) of the focused slot's
+; input box. Cell 0 is the WG_BOX_L edge, so the first value glyph
+; sits at cell 1. Clobbers everything.
+FormPaintCharAtEnd:
+    ld      [FpcChar], a
+    ld      a, [HtmlFormFocus]
+    ld      e, a
+    ld      d, 0
+    ; HL = FormScreenX[slot] (16-bit pixel X).
+    ld      hl, FormScreenX
+    add     hl, de
+    add     hl, de
+    ld      a, [hl]
+    inc     hl
+    ld      h, [hl]
+    ld      l, a
+    ; HL = byteCol = pixel X / 4.
+    srl     h
+    rr      l
+    srl     h
+    rr      l
+    ld      a, [DftLen]
+    inc     a
+    add     a, a                        ; cells are 2 byte-cols wide
+    add     a, l
+    ld      b, a                        ; B = byteCol
+    ; C = FormScreenY[slot].
+    ld      hl, FormScreenY
+    add     hl, de
+    ld      a, [hl]
+    ld      c, a
+    ; Sentinel IDs (< 0x10) take the widget-bitmap path; printable
+    ; chars go through the normal font blit.
+    ld      a, [FpcChar]
+    cp      WG_LAST + 1
+    jr      nc, .fpcText
+    or      a
+    jr      z, .fpcText
+    jp      DrawWidgetGlyph
+.fpcText:
+    ; DrawCharFast reads HtmlStyleFlags + HtmlFg; make sure we're
+    ; painting with plain-text defaults rather than whatever style the
+    ; last LineDrawCells cell left behind.
+    push    af
+    xor     a
+    ld      [HtmlStyleFlags], a
+    pop     af
+    jp      DrawCharFast
+
+FpcChar:        db 0
 
 ; DoFormToggle: flip the checked state of the currently-focused
 ; checkbox/radio. The state lives in the slot's value buffer: an empty
@@ -12950,7 +13022,7 @@ FormOptCount:    ds FORM_MAX
 ;
 ; FORM_NAME_MAX/VALUE_MAX are NOT including the trailing NUL.
 ; ---------------------------------------------------------------------------
-FORM_MAX        equ 12
+FORM_MAX        equ 20
 FORM_NAME_MAX   equ 12
 FORM_VALUE_MAX  equ 18                       ; matches TI_TEXT_DEFAULT_W
 
