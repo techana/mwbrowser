@@ -9408,16 +9408,24 @@ HtmlNextDir:    db 0xFF                 ; scratch: dir= parsed on current tag
 ; machine-derived and can be regenerated without touching this source.
     include "iso8859_6.inc"
 
-; Emit the .COM to disk. FileBuf (just below) is the next free byte after
-; the last emitted code/data; we save exactly that many bytes.
-    SAVEBIN "dist/mwbro.com", 0x0100, $-0x0100
+; Emit the .COM to disk. The saved range stops at the last emitted byte
+; (FileEnd); FileBuf and friends below live in free TPA memory past
+; the .COM image and are pinned at a fixed runtime address so further
+; code growth doesn't shift them into whatever page of memory the
+; MSX-DOS BDOS or a shadowed slot secretly cares about.
 
-; FileBuf and FontBuf both live in free TPA memory past the .COM image.
-; Declaring them as pure label equates avoids emitting any bytes, so the disk
-; binary stays small; at runtime we read/write into the free RAM that
-; MSX-DOS leaves above the program.
-FileBuf         equ $
-FontBuf         equ FileBuf + FILE_BUF_SIZE
-; 128-byte DMA scratch used by the streaming external-image loaders
-; (SC6/PCX/BMP). Sits above the font cache in TPA.
-ImgBuf          equ FontBuf + 2048
+FileEnd:
+    SAVEBIN "dist/mwbro.com", 0x0100, FileEnd - 0x0100
+
+; FileBuf / FontBuf / ImgBuf pin at 0x5000. Empirically, letting these
+; float as the .COM grew past ~15565 B on AX-370 and ~15855 B on
+; Sony HB-F1XD caused Shutdown's palette-restore block to run via a
+; spurious jump -- almost certainly stack / return-address corruption
+; when one of these buffers crossed an address MSX-DOS or the slot
+; handler treats specially. Pinning at 0x5000 leaves 0x4F00 B (~20 KB)
+; for code + inline ds arrays, which is plenty of growth room, and
+; stops the .COM from caring about its own absolute size at all.
+    ORG 0x5000
+FileBuf:        ds FILE_BUF_SIZE        ; 36 KB HTTP/body landing buffer
+FontBuf:        ds FONT_BUF_SIZE        ; 2 KB MSX font pulled from CGTABL
+ImgBuf:         ds 128                  ; DMA scratch for streaming image loaders
