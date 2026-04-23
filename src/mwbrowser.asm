@@ -574,9 +574,6 @@ DoFormType:
     cp      0xFF
     jp      z, MainLoop
     call    FormGetValuePtr             ; HL -> value buf
-    ; Walk HL to the NUL terminator, recording the length in DftLen.
-    ; The whole routine deliberately keeps B intact (it carries the
-    ; pressed key) so we don't push/pop BC and clobber C halfway.
     xor     a
     ld      [DftLen], a
 .dftLen:
@@ -592,8 +589,7 @@ DoFormType:
 .dftAtEnd:
     ld      a, [DftLen]
     cp      FORM_VALUE_MAX
-    jp      nc, MainLoop                ; full -> drop char silently
-    ; HL points at the current NUL. Write the new char then a fresh NUL.
+    jp      nc, MainLoop
     ld      a, b
     ld      [hl], a
     inc     hl
@@ -603,6 +599,30 @@ DoFormType:
     jp      MainLoop
 
 DftLen:         db 0
+
+; DoFormBackspace: drop the last char from the focused field's value.
+DoFormBackspace:
+    ld      a, [HtmlFormFocus]
+    cp      0xFF
+    jp      z, MainLoop
+    call    FormGetValuePtr
+    ld      c, 0
+.dfbLen:
+    ld      a, [hl]
+    or      a
+    jr      z, .dfbAtEnd
+    inc     hl
+    inc     c
+    jr      .dfbLen
+.dfbAtEnd:
+    ld      a, c
+    or      a
+    jp      z, MainLoop
+    dec     hl
+    xor     a
+    ld      [hl], a
+    call    RefreshContentInPlace
+    jp      MainLoop
 
 ; DoFormToggle: flip the checked state of the currently-focused
 ; checkbox/radio. The state lives in the slot's value buffer: an empty
@@ -756,31 +776,6 @@ FormStrEq:
 .fseNo:
     xor     a
     ret
-
-; DoFormBackspace: drop the last char from the focused field's value.
-DoFormBackspace:
-    ld      a, [HtmlFormFocus]
-    cp      0xFF
-    jp      z, MainLoop
-    call    FormGetValuePtr
-    ; Walk to NUL.
-    ld      c, 0
-.dfbLen:
-    ld      a, [hl]
-    or      a
-    jr      z, .dfbAtEnd
-    inc     hl
-    inc     c
-    jr      .dfbLen
-.dfbAtEnd:
-    ld      a, c
-    or      a
-    jp      z, MainLoop                 ; already empty
-    dec     hl
-    xor     a
-    ld      [hl], a
-    call    RefreshContentInPlace
-    jp      MainLoop
 
 ; DoFormSubmit: triggered when Enter is pressed on a focused form field
 ; (or when a submit/button widget is clicked). Walks FormFields and
@@ -9825,7 +9820,10 @@ TagSelect:
     ld      a, [HtmlSelectSlot]
     call    FormCaptureRect
     ; Decide focus visual for the L edge (re-use WG_BOX_LF / _MF / _RF
-    ; for the focused state, same as submit/text).
+    ; for the focused state, same as submit/text). Reload slot from
+    ; HtmlSelectSlot -- FormCaptureRect ends with `xor a; ld [hl], a`
+    ; so A is 0, not the slot index.
+    ld      a, [HtmlSelectSlot]
     ld      b, a
     ld      a, [HtmlFormFocus]
     cp      b
@@ -10237,6 +10235,12 @@ EntityTable:
 ; rect contains the current mouse position. On hit: flash the button
 ; (paint its interior dgray briefly), trigger DoFormSubmit. Returns
 ; normally on miss so the caller can fall through to TryLinkClick.
+; TryFormClick: walk all focusable form slots looking for a mouse hit.
+; On hit: set focus to the clicked slot, then dispatch by type:
+;   submit/button  -> flash + fire DoFormSubmit
+;   checkbox/radio -> refresh (to show new focus border) + DoFormToggle
+;   select         -> refresh + DoFormSelectCycle
+;   text/password  -> just refresh; the focus border shows the caret
 TryFormClick:
     ld      a, [FormCount]
     or      a
@@ -10248,25 +10252,46 @@ TryFormClick:
     ld      a, c
     call    FormGetTypePtr
     ld      a, [hl]
-    cp      'S'
-    jr      z, .tfcSubmitLike
-    cp      'B'
-    jr      z, .tfcSubmitLike
-    pop     bc
-    inc     c
-    djnz    .tfcLoop
-    ret
-.tfcSubmitLike:
+    call    FormTypeIsFocusable             ; Z if not focusable
+    jr      z, .tfcSkip
     pop     bc
     push    bc
     ld      a, c
     call    FormHitTest                     ; CF=0 if hit
+    jr      c, .tfcSkip
+    ; Hit: set focus, dispatch by type.
     pop     bc
-    jr      c, .tfcMiss
+    push    bc
+    ld      a, c
+    ld      [HtmlFormFocus], a
+    call    FormGetTypePtr
+    ld      a, [hl]
+    pop     bc
+    cp      'S'
+    jp      z, .tfcFire
+    cp      'B'
+    jp      z, .tfcFire
+    cp      'C'
+    jp      z, .tfcToggle
+    cp      'R'
+    jp      z, .tfcToggle
+    cp      'L'
+    jp      z, .tfcCycle
+    ; Text / password (or anything else focusable): just refresh.
+    call    RefreshContentInPlace
+    ret
+.tfcFire:
     ld      a, c
     call    FormFlashSlot
     jp      DoFormSubmit
-.tfcMiss:
+.tfcToggle:
+    call    RefreshContentInPlace
+    jp      DoFormToggle
+.tfcCycle:
+    call    RefreshContentInPlace
+    jp      DoFormSelectCycle
+.tfcSkip:
+    pop     bc
     inc     c
     djnz    .tfcLoop
     ret
@@ -10691,6 +10716,7 @@ GoForward:
 ReloadCurrent:
     ld      a, 0xFF
     ld      [HtmlFocusLink], a
+    call    FormReset                       ; new-page render -> fresh form table
     ld      a, 1
     ld      [Busy], a
     call    PaintToolbar
@@ -12924,7 +12950,7 @@ FormOptCount:    ds FORM_MAX
 ;
 ; FORM_NAME_MAX/VALUE_MAX are NOT including the trailing NUL.
 ; ---------------------------------------------------------------------------
-FORM_MAX        equ 8
+FORM_MAX        equ 12
 FORM_NAME_MAX   equ 12
 FORM_VALUE_MAX  equ 18                       ; matches TI_TEXT_DEFAULT_W
 
@@ -13057,7 +13083,7 @@ FileEnd:
 ; handler treats specially. Pinning at 0x5000 leaves 0x4F00 B (~20 KB)
 ; for code + inline ds arrays, which is plenty of growth room, and
 ; stops the .COM from caring about its own absolute size at all.
-    ORG 0x5000
+    ORG 0x5800
 FileBuf:        ds FILE_BUF_SIZE        ; 36 KB HTTP/body landing buffer
 FontBuf:        ds FONT_BUF_SIZE        ; 2 KB MSX font pulled from CGTABL
 ImgBuf:         ds 128                  ; DMA scratch for streaming image loaders
