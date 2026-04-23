@@ -589,7 +589,9 @@ DoFormClearRadioGroup:
     ld      e, a
     ld      a, [DfcrNamePtr + 1]
     ld      d, a
+    push    bc                          ; FormStrEq clobbers C; save it
     call    FormStrEq
+    pop     bc
     or      a
     jr      z, .dfcrSkip                ; different name
     ; Same group -> clear value.
