@@ -58,15 +58,27 @@ except ImportError:
     sys.exit("Pillow required: pip install Pillow")
 
 
-IMG_TAG    = re.compile(rb"<img\b[^>]*>", re.I)
-IMG_SRC    = re.compile(rb"""\bsrc\s*=\s*["']?([^"'\s>]+)["']?""", re.I)
-IMG_W      = re.compile(rb"""\bwidth\s*=\s*["']?(\d+)["']?""", re.I)
-IMG_H      = re.compile(rb"""\bheight\s*=\s*["']?(\d+)["']?""", re.I)
-A_HREF_DQ  = re.compile(rb'(<a\b[^>]*\bhref=)"([^"]*)"', re.I)
-A_HREF_SQ  = re.compile(rb"(<a\b[^>]*\bhref=)'([^']*)'", re.I)
+IMG_TAG    = re.compile(r"<img\b[^>]*>", re.I)
+IMG_SRC    = re.compile(r"""\bsrc\s*=\s*["']?([^"'\s>]+)["']?""", re.I)
+IMG_W      = re.compile(r"""\bwidth\s*=\s*["']?(\d+)["']?""", re.I)
+IMG_H      = re.compile(r"""\bheight\s*=\s*["']?(\d+)["']?""", re.I)
+A_HREF_DQ  = re.compile(r'(<a\b[^>]*\bhref=)"([^"]*)"', re.I)
+A_HREF_SQ  = re.compile(r"(<a\b[^>]*\bhref=)'([^']*)'", re.I)
+FORM_TAG   = re.compile(r"(?is)<form\b([^>]*)>")
+FORM_ACTION = re.compile(r"""\baction\s*=\s*["']?([^"'\s>]+)""", re.I)
+FORM_METHOD = re.compile(r"""\bmethod\s*=\s*["']?(\w+)""", re.I)
+FORM_BLOCK  = re.compile(r"(?is)<form\b.*?</form\s*>")
+META_CHARSET_B = re.compile(rb"""<meta[^>]*charset\s*=\s*["']?([\w-]+)""", re.I)
 
 USER_AGENT = "MSX-WBrowser/0.5 (openMSX)"
 FETCH_TIMEOUT = 20.0
+
+# Outgoing wire encoding. ISO-8859-6 covers Latin letters + ASCII in its
+# low half and Arabic in 0xC1..0xDA. The MSX side renders those byte
+# values directly through its font tables (Latin + AX-370 Arabic
+# CGTABL), so anything the decoder can't map lands as '?' rather than
+# arbitrary multi-byte noise.
+WIRE_CHARSET = "iso-8859-6"
 
 
 def _html_escape(s: str) -> str:
@@ -77,6 +89,91 @@ def _html_escape(s: str) -> str:
 
 def _int_or_none(m):
     return int(m.group(1)) if m else None
+
+
+def _decode_body(raw: bytes, content_type: str) -> str:
+    """Decode a server's HTML bytes to unicode. Tries, in order:
+    the Content-Type header's charset, a <meta charset> near the top,
+    then UTF-8, then a last-ditch latin-1. Aliases like windows-1256
+    are kept -- Python handles them natively."""
+    charset = None
+    m = re.search(r"charset\s*=\s*([\w-]+)", content_type, re.I)
+    if m:
+        charset = m.group(1).strip().lower()
+    if not charset:
+        mm = META_CHARSET_B.search(raw[:2048])
+        if mm:
+            charset = mm.group(1).decode("ascii", "replace").strip().lower()
+    for cs in (charset, "utf-8", "cp1256", "latin-1"):
+        if not cs:
+            continue
+        try:
+            return raw.decode(cs)
+        except (LookupError, UnicodeDecodeError):
+            continue
+    # Guaranteed to succeed:
+    return raw.decode("latin-1", "replace")
+
+
+def _simplify_with_readability(html: str) -> str:
+    """Run Mozilla Readability (via the Python port) to extract the
+    article-like content of the page. Keeps the original title. Falls
+    back to the input unchanged if the library isn't installed or the
+    extraction produced nothing useful (pages that aren't articles --
+    home pages, search results, login forms -- usually don't)."""
+    try:
+        from readability import Document
+    except ImportError:
+        return html
+    try:
+        doc = Document(html)
+        summary = doc.summary(html_partial=False)
+        title = doc.title() or ""
+    except Exception:
+        return html
+    if not summary or len(summary) < 64:
+        return html
+    # Glue on a head with the original title so the MSX titlebar still
+    # reflects the page the user visited, not an empty string.
+    head = f"<html><head><title>{_html_escape(title)}</title></head>"
+    return head + summary + "</html>"
+
+
+def _preserve_forms(original: str, simplified: str) -> str:
+    """Readability typically strips <form> blocks (they're not article
+    content), which kills interactive pages like search boxes. Find
+    every form in the source HTML and, if any are missing from the
+    simplified version, paste them back in just before </body>."""
+    forms = FORM_BLOCK.findall(original)
+    if not forms:
+        return simplified
+    missing = [f for f in forms if f not in simplified]
+    if not missing:
+        return simplified
+    appendage = "\n" + "\n".join(missing) + "\n"
+    if re.search(r"(?i)</body>", simplified):
+        return re.sub(r"(?i)</body>", appendage + "</body>",
+                      simplified, count=1)
+    return simplified + appendage
+
+
+def _retranscode_query(q: str) -> str:
+    """The MSX URL-encodes form values as raw ISO-8859-6 bytes. The
+    destination site expects UTF-8 (the modern default). Unescape the
+    %XX sequences, reinterpret the bytes as ISO-8859-6, and re-encode
+    to UTF-8 URL form. ASCII-only queries survive unchanged."""
+    pairs = []
+    for pair in q.split("&"):
+        if not pair:
+            continue
+        if "=" in pair:
+            k, v = pair.split("=", 1)
+        else:
+            k, v = pair, ""
+        k_uni = urllib.parse.unquote_to_bytes(k).decode(WIRE_CHARSET, "replace")
+        v_uni = urllib.parse.unquote_to_bytes(v).decode(WIRE_CHARSET, "replace")
+        pairs.append((k_uni, v_uni))
+    return urllib.parse.urlencode(pairs)
 
 
 def _predict_msx_size(declared_w: int, declared_h: int) -> "tuple[int, int]":
@@ -180,11 +277,17 @@ def _pack_2bpp(im: "Image.Image") -> bytes:
 # ----------------------------------------------------------------------------
 
 class BridgeSession:
-    def __init__(self, verbose: bool = False):
+    def __init__(self, verbose: bool = False, simplify: bool = False):
         self.verbose = verbose
+        self.simplify = simplify
         self._img_cache: dict[str, str] = {}
         self._current_base: str | None = None
         self._img_counter = 0
+        # Most recent <form> seen on the rendered page. _handle_submit
+        # uses these to forward the MSX's /submit?... to the real site
+        # instead of echoing locally.
+        self._form_action: str | None = None
+        self._form_method: str = "GET"
 
     # -- public -----------------------------------------------------------
 
@@ -228,77 +331,85 @@ class BridgeSession:
             # and deliver the PCX.
             return self._convert_image_bytes(raw)
 
-        # Everything else we treat as HTML / text. Rewrite img srcs and
-        # a hrefs, then pass the result through.
-        body = self._rewrite_html(raw)
+        # Everything else we treat as HTML / text. Decode upstream's
+        # bytes using whatever charset the server advertises, strip
+        # scripts/styles, optionally run Readability, preserve any
+        # <form> we'd need to submit back, rewrite img srcs + a hrefs
+        # + width/height, and finally re-encode as ISO-8859-6 for the
+        # MSX wire protocol.
+        html = _decode_body(raw, content_type)
+        body = self._rewrite_html(html).encode(WIRE_CHARSET, "replace")
         self._log(f"HTM {len(body)} B (was {len(raw)}) from {final_url}")
         return ("HTM", body)
 
-    def _rewrite_html(self, body: bytes) -> bytes:
-        # Drop <script>/<style>/<noscript> blocks; the MSX parser ignores
-        # them anyway but stripping keeps the wire small.
-        body = re.sub(rb"<script\b[^>]*>.*?</script>", b"",
-                      body, flags=re.I | re.S)
-        body = re.sub(rb"<style\b[^>]*>.*?</style>", b"",
-                      body, flags=re.I | re.S)
-        body = re.sub(rb"<noscript\b[^>]*>.*?</noscript>", b"",
-                      body, flags=re.I | re.S)
+    def _rewrite_html(self, html: str) -> str:
+        # Drop script/style/noscript blocks: the MSX parser ignores
+        # them but stripping keeps the wire small and frees Readability
+        # from parsing JS.
+        html = re.sub(r"(?is)<script\b[^>]*>.*?</script>", "", html)
+        html = re.sub(r"(?is)<style\b[^>]*>.*?</style>", "", html)
+        html = re.sub(r"(?is)<noscript\b[^>]*>.*?</noscript>", "", html)
+
+        # Simplify article-like pages via Readability, then splice any
+        # <form> back in (Readability drops them as non-article chrome).
+        if self.simplify:
+            simplified = _simplify_with_readability(html)
+            html = _preserve_forms(html, simplified)
+
+        # Remember the first <form>'s action + method so _handle_submit
+        # can forward the MSX's GET /submit?... to the real site instead
+        # of echoing. Default to the current page + GET if the tag has
+        # no action attr.
+        self._form_action = None
+        self._form_method = "GET"
+        fm = FORM_TAG.search(html)
+        if fm:
+            attrs = fm.group(1)
+            am = FORM_ACTION.search(attrs)
+            action_val = am.group(1).strip() if am else ""
+            mm = FORM_METHOD.search(attrs)
+            self._form_method = (mm.group(1).upper() if mm else "GET")
+            self._form_action = urllib.parse.urljoin(
+                self._current_base or "", action_val or "")
 
         # Reset per-page image cache.
         self._img_cache = {}
         self._img_counter = 0
 
-        def img_repl(m: re.Match) -> bytes:
+        def img_repl(m: re.Match) -> str:
             tag = m.group(0)
             src_m = IMG_SRC.search(tag)
             if not src_m:
                 return tag
-            src = src_m.group(1).decode("latin-1", "replace").strip()
+            src = src_m.group(1).strip()
             w = _int_or_none(IMG_W.search(tag))
             h = _int_or_none(IMG_H.search(tag))
             handle = self._register_image(src, w, h)
-            new_src = b'src="' + handle.encode("ascii") + b'"'
+            new_src = f'src="{handle}"'
             new_tag = tag[:src_m.start()] + new_src + tag[src_m.end():]
-            # Rewrite width / height to match the dimensions the PCX will
-            # actually have after _resize_for_msx(). The browser's sticky
-            # re-render path (ReserveImgLayout) reads these attributes to
-            # reserve the layout rectangle without re-fetching -- if they
-            # disagree with the rendered PCX, content below the image
-            # shifts on every Tab. Applies only when the author gave
-            # both dimensions; _resize_for_msx() halves height for MSX
-            # 2:1 pixel aspect in that path.
+            # Rewrite width / height to the post-resize PCX dimensions so
+            # the browser's sticky re-render path (ReserveImgLayout)
+            # reserves a rect matching what the PCX actually paints.
             if w and h:
                 tgt_w, tgt_h = _predict_msx_size(w, h)
-                new_tag = IMG_W.sub(
-                    lambda _m, v=tgt_w: b'width="' + str(v).encode() + b'"',
-                    new_tag, count=1)
-                new_tag = IMG_H.sub(
-                    lambda _m, v=tgt_h: b'height="' + str(v).encode() + b'"',
-                    new_tag, count=1)
+                new_tag = IMG_W.sub(f'width="{tgt_w}"', new_tag, count=1)
+                new_tag = IMG_H.sub(f'height="{tgt_h}"', new_tag, count=1)
             return new_tag
 
-        def href_repl(m: re.Match) -> bytes:
+        def href_repl(m: re.Match) -> str:
             prefix = m.group(1)
-            href = m.group(2).decode("latin-1", "replace").strip()
-            # In-page anchors + javascript: links are useless on MSX; leave
-            # them as-is so the click is a no-op rather than a 404.
+            href = m.group(2).strip()
+            # In-page anchors + javascript: are no-ops on MSX; leave
+            # them alone so the click doesn't 404.
             if href.startswith(("#", "javascript:", "mailto:")):
                 return m.group(0)
             absolute = urllib.parse.urljoin(self._current_base or "", href)
-            return prefix + b'"' + absolute.encode("latin-1", "replace") + b'"'
+            return f'{prefix}"{absolute}"'
 
-        body = IMG_TAG.sub(img_repl, body)
-        body = A_HREF_DQ.sub(href_repl, body)
-        body = A_HREF_SQ.sub(href_repl, body)
-
-        # Best-effort encoding: decode as UTF-8 (the modern default) then
-        # re-encode as latin-1 so the MSX font can render ASCII + Latin-1
-        # glyphs it has. Non-encodable chars get '?'.
-        try:
-            text = body.decode("utf-8")
-        except UnicodeDecodeError:
-            text = body.decode("latin-1", "replace")
-        return text.encode("latin-1", "replace")
+        html = IMG_TAG.sub(img_repl, html)
+        html = A_HREF_DQ.sub(href_repl, html)
+        html = A_HREF_SQ.sub(href_repl, html)
+        return html
 
     def _register_image(self, src: str,
                         declared_w: int | None,
@@ -379,17 +490,44 @@ class BridgeSession:
     # -- Form submit echo -------------------------------------------------
 
     def _handle_submit(self, target: str):
+        # target is "/submit?a=1&b=2" (scheme already stripped by handle_get).
         q = target.split("?", 1)[1] if "?" in target else ""
+        # The MSX submitted form values as URL-encoded ISO-8859-6 bytes
+        # (that's what its keyboard produced into FormValue). Transcode
+        # to UTF-8 URL form so remote servers that expect it -- which
+        # is most of them now -- handle non-ASCII correctly.
+        utf8_query = _retranscode_query(q) if q else ""
+        self._log(f"submit: form_action={self._form_action!r} "
+                  f"method={self._form_method} query={utf8_query!r}")
+
+        # If the last rendered page had a <form>, forward the submit to
+        # that site. Otherwise fall back to a tiny local echo so
+        # standalone testing (no page loaded yet) still sees something.
+        if self._form_action:
+            action = self._form_action
+            # Only GET is implemented on the wire; POST maps to a GET
+            # with the fields in the query string. Good enough for the
+            # kind of simple search boxes our MSX can drive.
+            join = "&" if "?" in action else "?"
+            url = action + (join + utf8_query if utf8_query else "")
+            self._log(f"submit -> {url}")
+            return self._fetch_page(url)
+        return self._echo_submit(q)
+
+    def _echo_submit(self, raw_query: str):
         pairs = []
-        if q:
-            for pair in q.split("&"):
+        if raw_query:
+            for pair in raw_query.split("&"):
                 if "=" in pair:
                     k, v = pair.split("=", 1)
                 else:
                     k, v = pair, ""
-                pairs.append((urllib.parse.unquote(k),
-                              urllib.parse.unquote(v)))
-        self._log(f"submit: {pairs}")
+                # Interpret %XX as ISO-8859-6 bytes (matches what the
+                # MSX actually sent) so the echo shows the expected
+                # string back.
+                kb = urllib.parse.unquote_to_bytes(k).decode(WIRE_CHARSET, "replace")
+                vb = urllib.parse.unquote_to_bytes(v).decode(WIRE_CHARSET, "replace")
+                pairs.append((kb, vb))
         rows = "".join(
             f"<tr><td>{_html_escape(k)}</td><td>{_html_escape(v)}</td></tr>"
             for k, v in pairs
@@ -400,7 +538,7 @@ class BridgeSession:
             f"<table>{rows}</table>"
             "</body></html>"
         )
-        return ("HTM", body.encode("iso-8859-6", "replace"))
+        return ("HTM", body.encode(WIRE_CHARSET, "replace"))
 
     # -- helpers ----------------------------------------------------------
 
@@ -466,8 +604,9 @@ def _slow_send(conn: socket.socket, body: bytes, chunk: int = 64,
         time.sleep(gap)
 
 
-def serve_forever(host: str, port: int, verbose: bool) -> None:
-    session = BridgeSession(verbose=verbose)
+def serve_forever(host: str, port: int, verbose: bool,
+                  simplify: bool = False) -> None:
+    session = BridgeSession(verbose=verbose, simplify=simplify)
     srv = socket.socket()
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((host, port))
@@ -501,9 +640,15 @@ def main() -> int:
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=2323)
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--simplify", action="store_true",
+                    help="Run Mozilla Readability on incoming HTML to strip "
+                         "chrome/footers/sidebars. Off by default because it "
+                         "tends to displace or mangle pages where the main "
+                         "content IS a form (search boxes, login pages).")
     args = ap.parse_args()
     try:
-        serve_forever(args.host, args.port, args.verbose)
+        serve_forever(args.host, args.port, args.verbose,
+                      simplify=args.simplify)
     except KeyboardInterrupt:
         print("\nbye.")
         return 0
