@@ -874,12 +874,61 @@ FormStrEq:
 ; renders it as the new content just like any other navigation. No
 ; extra wire format, no extra UART hang paths to worry about.
 DoFormSubmit:
-    ; Build into UrlBuf: "/submit?" + name=value pairs joined by '&'.
+    ; Build UrlBuf = HtmlFormAction + ('?' or '&') + name=value pairs.
+    ; HtmlFormAction holds the absolute URL the bridge rewrote into the
+    ; <form action=...> attr, so the browser sends the request directly
+    ; to the real target (e.g. http://frogfind.com/?q=msx) instead of
+    ; going through a bridge-side /submit indirection. Falls back to
+    ; "/submit?" when no form action was parsed so the form-echo
+    ; helper (tools/form_bridge.py) still works for standalone tests.
+    ld      a, [HtmlFormAction]
+    or      a
+    jr      z, .dfsFallback
+    ld      hl, HtmlFormAction
+    ld      de, UrlBuf
+    ld      b, 0                        ; B = count copied
+.dfsCopy:
+    ld      a, [hl]
+    or      a
+    jr      z, .dfsCopied
+    ld      [de], a
+    inc     hl
+    inc     de
+    inc     b
+    jr      .dfsCopy
+.dfsCopied:
+    ld      a, b
+    ld      [UrlLen], a
+    ; Append the separator between the action and our first key=value.
+    ; '?' if the action has no query yet, '&' otherwise. Either way the
+    ; first .dfsLoop iteration must NOT emit another separator, so
+    ; DfsAmpPending starts at 0.
+    ld      c, '?'
+    ld      hl, HtmlFormAction
+.dfsScanQ:
+    ld      a, [hl]
+    or      a
+    jr      z, .dfsAppendSep            ; end of action, no '?' seen
+    cp      '?'
+    jr      nz, .dfsScanNext
+    ld      c, '&'
+    jr      .dfsAppendSep
+.dfsScanNext:
+    inc     hl
+    jr      .dfsScanQ
+.dfsAppendSep:
+    ld      a, c
+    call    UrlAppendA
+    xor     a
+    ld      [DfsAmpPending], a
+    ld      [DfsIdx], a
+    jr      .dfsLoop
+
+.dfsFallback:
     ld      hl, .dfsPrefix
     ld      de, UrlBuf
     ld      bc, .dfsPrefixEnd - .dfsPrefix
     ldir
-    ; UrlLen = prefix length so far.
     ld      a, .dfsPrefixEnd - .dfsPrefix
     ld      [UrlLen], a
     xor     a
@@ -4637,6 +4686,9 @@ TagNeedsAttrScan:
     ld      de, TnSELECT
     call    TnCompare
     ret     nz
+    ld      de, TnFORM
+    call    TnCompare
+    ret     nz
     xor     a
     ret
 
@@ -4682,6 +4734,7 @@ TnFONT: db "FONT", 0
 TnINPUT: db "INPUT", 0
 TnISINDEX: db "ISINDEX", 0
 TnSELECT: db "SELECT", 0
+TnFORM:  db "FORM", 0
 
 ; ScanBlockAttrs: walks HL from first char after the tag name through '>',
 ; looking for align=<value> and dir=<value> (case-insensitive). Parses
@@ -5291,16 +5344,55 @@ ScanHrefAttr:
     jp      .sh_scan
 
 .sh_tryAlt:
+    ; 'A' starts ALT (<img>) and ACTION (<form>). Dispatch on the second
+    ; letter: L -> ALT, C -> ACTION. Everything else misses.
     push    hl
     inc     hl
     ld      a, [hl]
     and     0xDF
     cp      'L'
-    jp      nz, .sh_noMatch
+    jp      z, .sh_altRest
+    cp      'C'
+    jp      z, .sh_tryAction
+    jp      .sh_noMatch
+.sh_altRest:
     inc     hl
     ld      a, [hl]
     and     0xDF
     cp      'T'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    cp      '='
+    jp      nz, .sh_noMatch
+    inc     hl
+    pop     bc
+    jp      .sh_readValue
+
+.sh_tryAction:
+    ; Already consumed 'A' + 'C'; need "TION=". ACTION values land in
+    ; HtmlCurHref (same slot as HREF/ALT/etc -- no tag uses both) and
+    ; TagForm copies from there into the persistent HtmlFormAction
+    ; buffer before the next tag's scan clobbers HtmlCurHref.
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'T'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'I'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'O'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'N'
     jp      nz, .sh_noMatch
     inc     hl
     ld      a, [hl]
@@ -9213,9 +9305,36 @@ TagA:
 ; ----------------------------------------------------------------------------
 
 ; <form>: no visible chrome of its own; the inputs nested inside do
-; the rendering. action= / method= are still ignored -- DoFormSubmit
-; hard-codes a "/submit?..." path for the bridge.
+; the rendering. On the open tag, copy action= (which ScanHrefAttr
+; dropped into HtmlCurHref) into HtmlFormAction so DoFormSubmit can
+; build the real target URL later -- ScanHrefAttr clobbers HtmlCurHref
+; on every subsequent tag, so we need a persistent stash.
+;
+; We do NOT clear HtmlFormAction on </form>: the user may press Enter
+; or click Submit long after the parser has moved past the closing
+; tag, so the action has to survive. Fresh page loads clear it via
+; FormReset (which runs before each PrintFileContent).
+FORM_ACTION_MAX equ 63
 TagForm:
+    ld      a, [HtmlIsClose]
+    or      a
+    ret     nz                          ; </form>: leave HtmlFormAction alone
+    ld      a, [HtmlCurHref]
+    or      a
+    ret     z                           ; <form> without action=: leave as-is
+    ld      hl, HtmlCurHref
+    ld      de, HtmlFormAction
+    ld      b, FORM_ACTION_MAX
+.tfCopy:
+    ld      a, [hl]
+    ld      [de], a
+    or      a
+    ret     z
+    inc     hl
+    inc     de
+    djnz    .tfCopy
+    xor     a
+    ld      [de], a                     ; NUL-terminate on overrun
     ret
 
 ; Default visible width (inner cells, exclusive of the L/R borders) for a
@@ -9518,6 +9637,7 @@ FormReset:
     xor     a
     ld      [FormCount], a
     ld      [FormSticky], a
+    ld      [HtmlFormAction], a         ; new page: drop previous action URL
     ld      a, 0xFF
     ld      [HtmlFormFocus], a
     ret
@@ -13243,6 +13363,7 @@ HtmlFgDepth:    db 0                    ; current <font> nesting depth
 CurrentFontLUT: dw FontLUT              ; pointer to active LUT (updated by <font>)
 HtmlCurHrefLen: db 0                    ; length of the current href being captured
 HtmlCurHref:    ds LINK_URL_MAX + 1     ; NUL-terminated href of the *open* <a>
+HtmlFormAction: ds FORM_ACTION_MAX + 1  ; action= URL of the open <form>; empty = no form
 HtmlImgWidth:   dw 0                    ; <img width="…"> in pixels (0 = unset)
 HtmlImgHeight:  dw 0                    ; <img height="…"> in pixels (0 = unset)
 HtmlImgOriginY: db 0                    ; TextY at TagImg entry (image-map origin)

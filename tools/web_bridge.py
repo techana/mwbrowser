@@ -65,8 +65,8 @@ IMG_H      = re.compile(r"""\bheight\s*=\s*["']?(\d+)["']?""", re.I)
 A_HREF_DQ  = re.compile(r'(<a\b[^>]*\bhref=)"([^"]*)"', re.I)
 A_HREF_SQ  = re.compile(r"(<a\b[^>]*\bhref=)'([^']*)'", re.I)
 FORM_TAG   = re.compile(r"(?is)<form\b([^>]*)>")
-FORM_ACTION = re.compile(r"""\baction\s*=\s*["']?([^"'\s>]+)""", re.I)
-FORM_METHOD = re.compile(r"""\bmethod\s*=\s*["']?(\w+)""", re.I)
+FORM_ACTION = re.compile(r"""\baction\s*=\s*["']?([^"'\s>]+)["']?""", re.I)
+FORM_METHOD = re.compile(r"""\bmethod\s*=\s*["']?(\w+)["']?""", re.I)
 FORM_BLOCK  = re.compile(r"(?is)<form\b.*?</form\s*>")
 META_CHARSET_B = re.compile(rb"""<meta[^>]*charset\s*=\s*["']?([\w-]+)""", re.I)
 
@@ -277,32 +277,35 @@ def _pack_2bpp(im: "Image.Image") -> bytes:
 # ----------------------------------------------------------------------------
 
 class BridgeSession:
-    def __init__(self, verbose: bool = False, simplify: bool = False):
+    def __init__(self, verbose: bool = False, simplify: bool = False,
+                 no_images: bool = False):
         self.verbose = verbose
         self.simplify = simplify
+        self.no_images = no_images
         self._img_cache: dict[str, str] = {}
         self._current_base: str | None = None
         self._img_counter = 0
-        # Most recent <form> seen on the rendered page. _handle_submit
-        # uses these to forward the MSX's /submit?... to the real site
-        # instead of echoing locally.
-        self._form_action: str | None = None
-        self._form_method: str = "GET"
 
     # -- public -----------------------------------------------------------
 
     def handle_get(self, target: str):
         self._log(f"GET {target!r}")
 
-        # Form submit: "http:/submit?..." is what the MSX side sends (the
-        # http: prefix makes LoadFile pick the remote path). Strip and
-        # hand off to the echo helper.
+        # The MSX used to POST form data to a bridge-local "/submit?..."
+        # shim; the browser now builds the full target URL from the
+        # <form action=...> attribute (which we absolutise during the
+        # HTML rewrite) and sends it as a plain GET. Keep a compatibility
+        # fallback for the form_bridge.py echo server and for pages
+        # whose browser-side action parse failed.
         if target.startswith("http:/submit") or target.startswith("/submit"):
             stripped = target[5:] if target.startswith("http:") else target
-            return self._handle_submit(stripped)
+            return self._echo_submit(
+                stripped.split("?", 1)[1] if "?" in stripped else "")
 
         # Image handle produced by our own HTML rewriter: imNN.pcx.
         if re.fullmatch(r"im\d+\.pcx", target, flags=re.I):
+            if self.no_images:
+                return ("404", None)
             entry = self._img_cache.get(target.lower())
             if not entry:
                 return ("404", None)
@@ -356,27 +359,15 @@ class BridgeSession:
             simplified = _simplify_with_readability(html)
             html = _preserve_forms(html, simplified)
 
-        # Remember the first <form>'s action + method so _handle_submit
-        # can forward the MSX's GET /submit?... to the real site instead
-        # of echoing. Default to the current page + GET if the tag has
-        # no action attr.
-        self._form_action = None
-        self._form_method = "GET"
-        fm = FORM_TAG.search(html)
-        if fm:
-            attrs = fm.group(1)
-            am = FORM_ACTION.search(attrs)
-            action_val = am.group(1).strip() if am else ""
-            mm = FORM_METHOD.search(attrs)
-            self._form_method = (mm.group(1).upper() if mm else "GET")
-            self._form_action = urllib.parse.urljoin(
-                self._current_base or "", action_val or "")
-
         # Reset per-page image cache.
         self._img_cache = {}
         self._img_counter = 0
 
         def img_repl(m: re.Match) -> str:
+            # --no-images: drop every <img> so the MSX never even asks
+            # the bridge for a PCX. Big wall-clock win for test runs.
+            if self.no_images:
+                return ""
             tag = m.group(0)
             src_m = IMG_SRC.search(tag)
             if not src_m:
@@ -406,9 +397,24 @@ class BridgeSession:
             absolute = urllib.parse.urljoin(self._current_base or "", href)
             return f'{prefix}"{absolute}"'
 
+        def form_repl(m: re.Match) -> str:
+            # Absolutise <form action="..."> so the MSX can POST (well,
+            # GET) directly to the real site without having to know its
+            # own base URL. We can't build on IMG_SRC-style regex here
+            # because we need to preserve the rest of the tag verbatim.
+            tag = m.group(0)
+            am = FORM_ACTION.search(tag)
+            if not am:
+                return tag
+            action = am.group(1).strip()
+            absolute = urllib.parse.urljoin(self._current_base or "", action)
+            new_attr = f'action="{absolute}"'
+            return tag[:am.start()] + new_attr + tag[am.end():]
+
         html = IMG_TAG.sub(img_repl, html)
         html = A_HREF_DQ.sub(href_repl, html)
         html = A_HREF_SQ.sub(href_repl, html)
+        html = FORM_TAG.sub(form_repl, html)
         return html
 
     def _register_image(self, src: str,
@@ -489,32 +495,11 @@ class BridgeSession:
 
     # -- Form submit echo -------------------------------------------------
 
-    def _handle_submit(self, target: str):
-        # target is "/submit?a=1&b=2" (scheme already stripped by handle_get).
-        q = target.split("?", 1)[1] if "?" in target else ""
-        # The MSX submitted form values as URL-encoded ISO-8859-6 bytes
-        # (that's what its keyboard produced into FormValue). Transcode
-        # to UTF-8 URL form so remote servers that expect it -- which
-        # is most of them now -- handle non-ASCII correctly.
-        utf8_query = _retranscode_query(q) if q else ""
-        self._log(f"submit: form_action={self._form_action!r} "
-                  f"method={self._form_method} query={utf8_query!r}")
-
-        # If the last rendered page had a <form>, forward the submit to
-        # that site. Otherwise fall back to a tiny local echo so
-        # standalone testing (no page loaded yet) still sees something.
-        if self._form_action:
-            action = self._form_action
-            # Only GET is implemented on the wire; POST maps to a GET
-            # with the fields in the query string. Good enough for the
-            # kind of simple search boxes our MSX can drive.
-            join = "&" if "?" in action else "?"
-            url = action + (join + utf8_query if utf8_query else "")
-            self._log(f"submit -> {url}")
-            return self._fetch_page(url)
-        return self._echo_submit(q)
-
     def _echo_submit(self, raw_query: str):
+        """Tiny local echo for the /submit compat path. The MSX browser
+        builds the real target URL from <form action=...> itself, so
+        this only fires when the author shipped a form with no action
+        attribute (or for standalone tests with form_bridge.py)."""
         pairs = []
         if raw_query:
             for pair in raw_query.split("&"):
@@ -605,8 +590,10 @@ def _slow_send(conn: socket.socket, body: bytes, chunk: int = 64,
 
 
 def serve_forever(host: str, port: int, verbose: bool,
-                  simplify: bool = False) -> None:
-    session = BridgeSession(verbose=verbose, simplify=simplify)
+                  simplify: bool = False,
+                  no_images: bool = False) -> None:
+    session = BridgeSession(verbose=verbose, simplify=simplify,
+                            no_images=no_images)
     srv = socket.socket()
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((host, port))
@@ -645,10 +632,16 @@ def main() -> int:
                          "chrome/footers/sidebars. Off by default because it "
                          "tends to displace or mangle pages where the main "
                          "content IS a form (search boxes, login pages).")
+    ap.add_argument("--no-images", action="store_true",
+                    help="Strip every <img> tag before shipping HTML to the "
+                         "MSX. Handy for test runs -- PCX encode + serial "
+                         "transfer of an image costs real wall-clock time, "
+                         "which drowns out the rest of the render timings.")
     args = ap.parse_args()
     try:
         serve_forever(args.host, args.port, args.verbose,
-                      simplify=args.simplify)
+                      simplify=args.simplify,
+                      no_images=args.no_images)
     except KeyboardInterrupt:
         print("\nbye.")
         return 0
