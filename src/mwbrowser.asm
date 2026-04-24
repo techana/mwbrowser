@@ -148,7 +148,9 @@ KEY_SPACE      equ 0x20
 KEY_UP         equ 0x1E        ; MSX DIRIN returns 0x1E for up arrow
 KEY_DOWN       equ 0x1F        ; 0x1F for down arrow
 KEY_CLS        equ 0x0C        ; MSX CLS / Ctrl+L -- clears address bar
-KEY_F1         equ 0xF1        ; MSX F1 key (opens About popup)
+KEY_F1         equ 0xF1        ; MSX F1 -> toolbar Back
+KEY_F2         equ 0xF2        ; MSX F2 -> toolbar Forward
+KEY_F5         equ 0xF5        ; MSX F5 -> toolbar Refresh / Go
 
 ; ---- URL / file state ----
 URL_MAX        equ 96
@@ -238,11 +240,18 @@ MainLoop:
     cp      KEY_STOP
     jp      z, DoGo
 
-    cp      KEY_F1                      ; F1 opens About popup
-    jr      z, .openAboutFromKey
-    cp      '?'                         ; "?" also opens it
+    ; Function-key shortcuts (F1 / F2 / F5) for the Back / Forward /
+    ; Refresh toolbar buttons. Skip the focused-button "Enter or Space"
+    ; ceremony and fire the action straight from the global dispatch.
+    cp      KEY_F1
+    jp      z, DoBack
+    cp      KEY_F2
+    jp      z, DoForward
+    cp      KEY_F5
+    jp      z, DoGo
+
+    cp      '?'                         ; "?" opens the About popup
     jr      nz, .notOpenAbout
-.openAboutFromKey:
     call    OpenAbout
     jp      MainLoop
 .notOpenAbout:
@@ -1147,17 +1156,28 @@ Screen0Palette:
 ; State
 ; ============================================================================
 
-; BindFnKeys: override the MSX function-key string buffer so F1 injects
-; the single byte 0xF1 into the DIRIN stream (matching KEY_F1 in the
-; dispatch). Without this, F1's default expansion string (e.g., "color")
-; comes through instead and the About popup never opens.
-;   FNKSTR is at 0xF87F with 16 bytes per key (F1..F10).
+; BindFnKeys: override the MSX function-key string buffer so F1, F2,
+; and F5 inject single-byte codes (0xF1, 0xF2, 0xF5) the dispatcher
+; recognises as Back, Forward, and Refresh shortcuts. Without this the
+; default F-key expansion strings ("color", "auto", etc.) leak into
+; the address bar.
+;   FNKSTR sits at 0xF87F, 16 bytes per slot for F1..F10.
 BindFnKeys:
     ld      hl, 0xF87F                  ; F1's slot
     ld      [hl], 0xF1
     inc     hl
     xor     a
-    ld      [hl], a                     ; NUL-terminate
+    ld      [hl], a
+    ld      hl, 0xF87F + 16             ; F2's slot
+    ld      [hl], 0xF2
+    inc     hl
+    xor     a
+    ld      [hl], a
+    ld      hl, 0xF87F + 64             ; F5's slot
+    ld      [hl], 0xF5
+    inc     hl
+    xor     a
+    ld      [hl], a
     ret
 
 ; Initialise Focus / Busy / Url. Called once from Main.
@@ -2715,7 +2735,7 @@ STYLE_FOCUSED   equ 0x10                ; active link -> dotted underline
 
 TITLE_BUF_MAX   equ 31                  ; chars captured from <title>
 LINK_MAX        equ 8                   ; max <a> rects per rendered page
-LINK_URL_MAX    equ 32                  ; max chars per href (plus NUL)
+LINK_URL_MAX    equ 95                  ; max chars per href (plus NUL); matches URL_MAX
 
 PrintFileContent:
     ld      a, [FileLen]
@@ -4753,6 +4773,8 @@ ScanBlockAttrs:
     ld      a, 0xFF
     ld      [HtmlNextAlign], a
     ld      [HtmlNextDir], a
+    xor     a
+    ld      [HtmlNextBorder], a         ; default: no <table> border
 .sba_loop:
     ld      a, [hl]
     cp      '>'
@@ -4764,6 +4786,8 @@ ScanBlockAttrs:
     jr      z, .sba_tryA
     cp      'D'
     jr      z, .sba_tryD
+    cp      'B'
+    jp      z, .sba_tryB
     inc     hl
     jp      .sba_loop
 
@@ -4864,6 +4888,75 @@ ScanBlockAttrs:
     inc     hl
     jp      .sba_loop
 .sba_missD:
+    pop     hl
+    inc     hl
+    jp      .sba_loop
+
+.sba_tryB:
+    ; Match BORDER on <table> (HTML 2.0). Forms accepted:
+    ;   <table border>           -> on
+    ;   <table border=N>         -> on iff N!=0
+    ;   <table border="N">       -> on iff N!=0
+    push    hl
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'O'
+    jp      nz, .sba_missB
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'R'
+    jp      nz, .sba_missB
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'D'
+    jp      nz, .sba_missB
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'E'
+    jp      nz, .sba_missB
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'R'
+    jp      nz, .sba_missB
+    inc     hl
+    ld      a, [hl]
+    cp      '='
+    jr      z, .sba_bEq
+    ; Bare `border` attribute -> treat as border=1.
+    ld      a, 1
+    ld      [HtmlNextBorder], a
+    pop     af
+    jp      .sba_loop
+.sba_bEq:
+    inc     hl
+    ld      a, [hl]
+    cp      0x22                        ; "
+    jr      nz, .sba_bVal
+    inc     hl
+.sba_bVal:
+    ld      a, [hl]
+    cp      '0'
+    jr      z, .sba_bOff
+    ; First digit non-zero -> border on. Anything else (e.g. nothing, '"',
+    ; '>', whitespace) we also treat as on -- minor lie that matches
+    ; legacy browsers' "any value means yes" behaviour for this attr.
+    ld      a, 1
+    ld      [HtmlNextBorder], a
+    pop     af
+    inc     hl
+    jp      .sba_loop
+.sba_bOff:
+    xor     a
+    ld      [HtmlNextBorder], a
+    pop     af
+    inc     hl
+    jp      .sba_loop
+.sba_missB:
     pop     hl
     inc     hl
     jp      .sba_loop
@@ -8604,6 +8697,8 @@ TagTableTag:
     ld      [HtmlTableFirst], a
     xor     a
     ld      [HtmlTableCol], a
+    ld      a, [HtmlNextBorder]
+    ld      [HtmlTableBorder], a        ; latch for the duration of the table
 
     call    DrawTableRuleHere
     ld      a, [TextY]
@@ -8651,6 +8746,9 @@ TagTableTag:
 ; frame the table (left edge, two inner column dividers, right edge).
 ; Each line runs from TableTopY down to the just-drawn bottom rule.
 DrawTableVerticals:
+    ld      a, [HtmlTableBorder]
+    or      a
+    ret     z                           ; border=0 -> no vertical edges either
     ; BorderHeight = bottom - top + 1
     ld      a, [TextY]
     ld      b, a
@@ -8924,6 +9022,12 @@ TableColEndX:
 ; the table's width (from TABLE_LEFT_PX to TABLE_RIGHT_PX). Skipped
 ; while LineSkip is non-zero.
 DrawTableRuleHere:
+    ; HTML 2.0: <table> draws no borders unless border="<n>" with n>=1
+    ; (or a bare `border` attr). HtmlTableBorder gates every horizontal
+    ; rule + vertical edge so default <table>s render plain text grids.
+    ld      a, [HtmlTableBorder]
+    or      a
+    ret     z
     ld      a, [HtmlLineSkip]
     ld      b, a
     ld      a, [HtmlLineSkip + 1]
@@ -8942,6 +9046,9 @@ DrawTableRuleHere:
 ; 1-byte (4 px) DGRAY vertical line at that X across the current row
 ; (HtmlRowTopY for TEXT_LINE_H rows). Skipped while LineSkip is non-zero.
 DrawCellDividerAt_HL:
+    ld      a, [HtmlTableBorder]
+    or      a
+    ret     z                           ; border=0 -> no inner column dividers
     push    hl
     ld      a, [HtmlLineSkip]
     ld      b, a
@@ -13592,6 +13699,8 @@ HtmlDefaultAlign: db 0                  ; inherited default (set by <html>/<body
 HtmlDefaultDir:   db 0                  ; inherited default (set by <html>/<body>)
 HtmlNextAlign:  db 0xFF                 ; scratch: align= parsed on current tag (0xFF = unset)
 HtmlNextDir:    db 0xFF                 ; scratch: dir= parsed on current tag
+HtmlNextBorder: db 0                    ; scratch: border= parsed on current tag (0 = no border)
+HtmlTableBorder: db 0                   ; live border flag for the open <table>
 
 ; ISO-8859-6 -> MSX font mapping + joining flags. Generated from
 ; `ISO-8859-6 font mapping/ISO-8859-6-font-mapping.csv` by
