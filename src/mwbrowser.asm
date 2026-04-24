@@ -140,6 +140,7 @@ FOC_COUNT      equ 5
 
 ; ---- keys ----
 KEY_ESC        equ 0x1B
+KEY_STOP       equ 0x03         ; MSX STOP key (BIOS DIRIN reports as Ctrl-C)
 KEY_BACKSPACE  equ 0x08
 KEY_TAB        equ 0x09
 KEY_ENTER      equ 0x0D
@@ -229,6 +230,13 @@ MainLoop:
     ld      a, b
     cp      KEY_ESC
     jp      z, Shutdown
+
+    ; MSX STOP key: shortcut for the toolbar's X / Refresh button.
+    ; Re-runs the current URL just like a click on the X (or Enter on
+    ; the focused refresh button). Works regardless of where the focus
+    ; currently sits.
+    cp      KEY_STOP
+    jp      z, DoGo
 
     cp      KEY_F1                      ; F1 opens About popup
     jr      z, .openAboutFromKey
@@ -1786,7 +1794,7 @@ PaintToolbar:
     call    SetTextColours
     ld      de, BTN2_X + 12
     ld      c, BTN_Y0 + 4
-    ld      hl, CharX
+    ld      hl, BusyChar
     call    DrawString
 .refDone:
 
@@ -11031,6 +11039,12 @@ NavigateToCurrentUrl:
 
     ld      a, 1
     ld      [Busy], a
+    ; Reset the spinner so each load starts on the same glyph; otherwise
+    ; the X cell might re-paint mid-cycle and look stuttery.
+    xor     a
+    ld      [BusyTick], a
+    ld      a, 'X'
+    ld      [BusyChar], a
     call    PaintToolbar
 
     call    BuildFcbFromUrl
@@ -12531,6 +12545,58 @@ SerialWrite:    ; send byte in A; bounded poll for TxRDY so a stuck
     out     (UART_DATA), a
     ret
 
+; ---------------------------------------------------------------------------
+; BusyHeartbeat: cheap visual "still alive" cue while RemoteLoadFile is
+; chewing through a multi-KB body. Most calls just bump BusyTick and
+; return; every 64 bytes the spinner advances one phase ('|' '/' '-' '\\')
+; and we re-paint the X cell with the new glyph. Caller's registers all
+; preserved, so the body loop can `call BusyHeartbeat` between bytes
+; without bracketing it in extra push/pops.
+;
+; The repaint reuses PaintToolbar's busy-X path: SetTextColours +
+; DrawString of a 1-char string at the X-button cell. DrawString uses
+; BIOS GRPPRT, which is happy to run with VBLANK masked -- no interrupt
+; involvement, just VDP I/O.
+; ---------------------------------------------------------------------------
+BusyHeartbeat:
+    push    af
+    ld      a, [BusyTick]
+    inc     a
+    ld      [BusyTick], a
+    and     0x3F                        ; throttle: act every 64 bytes
+    jr      nz, .bhDone
+    push    bc
+    push    de
+    push    hl
+    ; phase = (BusyTick >> 6) & 3, indexes BusySpinner.
+    ld      a, [BusyTick]
+    rlca
+    rlca
+    and     0x03
+    ld      e, a
+    ld      d, 0
+    ld      hl, BusySpinner
+    add     hl, de
+    ld      a, [hl]
+    ld      [BusyChar], a
+    ld      a, COL_BLACK
+    ld      l, COL_LGRAY
+    call    SetTextColours
+    ld      de, BTN2_X + 12
+    ld      c, BTN_Y0 + 4
+    ld      hl, BusyChar
+    call    DrawString
+    pop     hl
+    pop     de
+    pop     bc
+.bhDone:
+    pop     af
+    ret
+
+BusyTick:       db 0
+BusyChar:       db 'X', 0               ; live char (single byte + NUL term)
+BusySpinner:    db '|', '/', '-', '\\'
+
 SerialRead:     ; Poll for RxRDY and return byte in A. Overrun /
                 ; Parity / Framing errors in status bits 3..5 latch
                 ; until the command register is rewritten with ER=1;
@@ -12734,6 +12800,12 @@ RemoteLoadFile:
     ld      [de], a
     inc     de
     dec     bc
+    ; Heartbeat: every 64 bytes, advance the busy spinner so the user
+    ; sees the X cycle through |/-\ instead of staring at a frozen UI
+    ; for the duration of a multi-KB transfer. Cheap (one inc + and +
+    ; ret z most of the time); the rare path through the actual repaint
+    ; preserves all caller registers.
+    call    BusyHeartbeat
     jr      .rlfBody
 .rlfTail:
     ld      hl, [SerialLen]
