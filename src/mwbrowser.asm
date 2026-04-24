@@ -12800,40 +12800,48 @@ RemoteGet:
     ; Every SerialRead can now time out; CF=1 surfaces as a failure so
     ; a dead / unplugged bridge doesn't hang the browser forever.
     call    SerialRead                  ; 'O' or 'E'
-    jr      c, .rgFail
+    jp      c, .rgFail
     cp      'E'
-    jr      z, .rgDrainErr
+    jp      z, .rgDrainErr
     cp      'O'
-    jr      nz, .rgFail
+    jp      nz, .rgFail
     call    SerialRead                  ; 'K'
-    jr      c, .rgFail
+    jp      c, .rgFail
     cp      'K'
-    jr      nz, .rgFail
+    jp      nz, .rgFail
     call    SerialRead                  ; ' '
-    jr      c, .rgFail
+    jp      c, .rgFail
     call    SerialRead                  ; 'H' or 'P'
-    jr      c, .rgFail
+    jp      c, .rgFail
     ld      b, 1
     cp      'H'
     jr      z, .rgKind
     ld      b, 2
     cp      'P'
-    jr      nz, .rgFail
+    jp      nz, .rgFail
 .rgKind:
     ld      a, b
     ld      [SerialKind], a
     call    SerialRead                  ; second kind char (T/C)
-    jr      c, .rgFail
+    jp      c, .rgFail
     call    SerialRead                  ; third kind char (M/X)
-    jr      c, .rgFail
+    jp      c, .rgFail
     call    SerialRead                  ; space
-    jr      c, .rgFail
+    jp      c, .rgFail
+    ; Default the page-info fields to 1/1 -- the legacy bridge format
+    ; ("OK HTM <bytes>\r\n") doesn't carry pagination, so a non-paginated
+    ; response leaves SerialPage=1, SerialPageTotal=1.
+    ld      a, 1
+    ld      [SerialPage], a
+    ld      [SerialPageTotal], a
     ld      de, 0
 .rgDigit:
     call    SerialRead
     jr      c, .rgFail
     cp      0x0D
     jr      z, .rgEol
+    cp      ' '
+    jr      z, .rgPageInfo              ; "<bytes> <page>/<total>\r\n"
     sub     '0'
     cp      10
     jr      nc, .rgFail
@@ -12853,6 +12861,58 @@ RemoteGet:
     adc     a, 0
     ld      d, a
     jr      .rgDigit
+.rgPageInfo:
+    ; Latch the byte count parsed so far, then read "<page>/<total>".
+    ld      [SerialLen], de
+    ; Page number (1-byte; clamps to 255 on overflow).
+    ld      e, 0
+.rgPageNo:
+    call    SerialRead
+    jr      c, .rgFail
+    cp      '/'
+    jr      z, .rgPageSlash
+    sub     '0'
+    cp      10
+    jr      nc, .rgFail
+    ld      d, a
+    ld      a, e
+    add     a, a
+    ld      c, a
+    add     a, a
+    add     a, a
+    add     a, c                        ; A = E * 10
+    add     a, d
+    ld      e, a
+    jr      .rgPageNo
+.rgPageSlash:
+    ld      a, e
+    ld      [SerialPage], a
+    ld      e, 0
+.rgTotal:
+    call    SerialRead
+    jr      c, .rgFail
+    cp      0x0D
+    jr      z, .rgTotalDone
+    sub     '0'
+    cp      10
+    jr      nc, .rgFail
+    ld      d, a
+    ld      a, e
+    add     a, a
+    ld      c, a
+    add     a, a
+    add     a, a
+    add     a, c
+    add     a, d
+    ld      e, a
+    jr      .rgTotal
+.rgTotalDone:
+    ld      a, e
+    ld      [SerialPageTotal], a
+    call    SerialRead                  ; consume LF
+    jr      c, .rgFail
+    and     a
+    ret
 .rgEol:
     call    SerialRead                  ; consume LF
     jr      c, .rgFail
@@ -13047,6 +13107,8 @@ RemoteImgClose:
 
 SerialKind:     db 0                    ; 0=ERR, 1=HTM, 2=PCX
 SerialLen:      dw 0
+SerialPage:     db 1                    ; 1-indexed page number this response is
+SerialPageTotal: db 1                   ; total pages estimated by the bridge
 IsRemoteSession: db 0                   ; 1 during a bridge-served render
 
 TitleI:         db 0
@@ -13717,15 +13779,20 @@ HtmlTableBorder: db 0                   ; live border flag for the open <table>
 FileEnd:
     SAVEBIN "dist/mwbro.com", 0x0100, FileEnd - 0x0100
 
-; FileBuf / FontBuf / ImgBuf pin at 0x5000. Empirically, letting these
-; float as the .COM grew past ~15565 B on AX-370 and ~15855 B on
+; FileBuf / FontBuf / ImgBuf pin at a fixed address. Empirically, letting
+; these float as the .COM grew past ~15565 B on AX-370 and ~15855 B on
 ; Sony HB-F1XD caused Shutdown's palette-restore block to run via a
 ; spurious jump -- almost certainly stack / return-address corruption
 ; when one of these buffers crossed an address MSX-DOS or the slot
-; handler treats specially. Pinning at 0x5000 leaves 0x4F00 B (~20 KB)
-; for code + inline ds arrays, which is plenty of growth room, and
-; stops the .COM from caring about its own absolute size at all.
-    ORG 0x5800
-FileBuf:        ds FILE_BUF_SIZE        ; 36 KB HTTP/body landing buffer
+; handler treats specially. Pinning here stops the .COM from caring
+; about its own absolute size.
+;
+; The pin must sit ABOVE the last `ds`-allocated global; otherwise
+; FileBuf overlaps live state and serial reads silently overwrite
+; PlainTextMode / HistoryOldest / IsoMap. Last bumped from 0x5800 to
+; 0x6000 when the LINK_URL_MAX raise + new HtmlFormAction / pagination
+; state pushed FileEnd past 0x5C00.
+    ORG 0x6000
+FileBuf:        ds FILE_BUF_SIZE        ; 16 KB HTTP/body landing buffer
 FontBuf:        ds FONT_BUF_SIZE        ; 2 KB MSX font pulled from CGTABL
 ImgBuf:         ds 128                  ; DMA scratch for streaming image loaders

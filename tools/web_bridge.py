@@ -277,6 +277,12 @@ def _pack_2bpp(im: "Image.Image") -> bytes:
 # ----------------------------------------------------------------------------
 
 class BridgeSession:
+    # Bytes the MSX side gets per OK HTM response. The Z80 parser is slow
+    # and the 8251 path can't move many KB without hiccupping, so we
+    # chunk everything and the browser asks "MORE" when it needs the
+    # next slab. Targets ~1 visible MSX viewport's worth of HTML.
+    PAGE_BYTES = 1200
+
     def __init__(self, verbose: bool = False, simplify: bool = False,
                  no_images: bool = False):
         self.verbose = verbose
@@ -285,11 +291,23 @@ class BridgeSession:
         self._img_cache: dict[str, str] = {}
         self._current_base: str | None = None
         self._img_counter = 0
+        # Pagination state for the current page-load. _pending_chunks is
+        # FIFO; first fetch returns chunks[0] and shifts; later "GET MORE"
+        # requests pop the next one. _page_total stays fixed for the
+        # whole session so the page header always reports M/N consistently.
+        self._pending_chunks: list[bytes] = []
+        self._page_total: int = 0
+        self._page_served: int = 0
 
     # -- public -----------------------------------------------------------
 
     def handle_get(self, target: str):
         self._log(f"GET {target!r}")
+
+        # MORE: serve the next chunk of the current paginated page.
+        # See the OK HTM "<bytes> <page>/<total>" header below.
+        if target.upper() == "MORE":
+            return self._serve_next_chunk()
 
         # The MSX used to POST form data to a bridge-local "/submit?..."
         # shim; the browser now builds the full target URL from the
@@ -342,8 +360,59 @@ class BridgeSession:
         # MSX wire protocol.
         html = _decode_body(raw, content_type)
         body = self._rewrite_html(html).encode(WIRE_CHARSET, "replace")
-        self._log(f"HTM {len(body)} B (was {len(raw)}) from {final_url}")
-        return ("HTM", body)
+        # Split the encoded body into PAGE_BYTES-sized chunks at safe
+        # tag boundaries. The first chunk goes out now, the rest sit in
+        # _pending_chunks for "GET MORE".
+        chunks = self._split_into_chunks(body, self.PAGE_BYTES)
+        self._pending_chunks = chunks
+        self._page_total = len(chunks)
+        self._page_served = 0
+        self._log(f"HTM {len(body)} B (was {len(raw)}) -> "
+                  f"{self._page_total} chunk(s) from {final_url}")
+        return self._serve_next_chunk()
+
+    def _serve_next_chunk(self):
+        """Pop the next pending chunk and ship it as 'OK HTM B P/T'."""
+        if not self._pending_chunks:
+            return ("404", None)
+        chunk = self._pending_chunks.pop(0)
+        self._page_served += 1
+        return ("HTMP", (chunk, self._page_served, self._page_total))
+
+    @staticmethod
+    def _split_into_chunks(body: bytes, max_size: int) -> list[bytes]:
+        """Greedy split at safe tag boundaries. Walks forward in
+        windows of `max_size` and cuts at the latest of (</p>, </tr>,
+        </li>, </td>, </div>, </h*>, <br>, <p>) that appears within
+        the window. Falls back to the latest '>' if no recognised
+        boundary fits, which still avoids splitting mid-tag."""
+        if len(body) <= max_size:
+            return [body]
+        markers = (b"</p>", b"</tr>", b"</li>", b"</td>", b"</div>",
+                   b"<br>", b"<br/>", b"<br />",
+                   b"</h1>", b"</h2>", b"</h3>", b"</h4>", b"</h5>", b"</h6>")
+        chunks: list[bytes] = []
+        pos = 0
+        while pos < len(body):
+            end = pos + max_size
+            if end >= len(body):
+                chunks.append(body[pos:])
+                break
+            window = body[pos:end]
+            split_at = -1
+            for m in markers:
+                idx = window.rfind(m)
+                if idx != -1:
+                    split_at = max(split_at, idx + len(m))
+            if split_at == -1:
+                # No tag boundary; cut at last '>' to avoid splitting
+                # inside a tag. If even that fails (huge tag value),
+                # cut hard at max_size -- malformed pages can do that.
+                idx = window.rfind(b">")
+                split_at = idx + 1 if idx != -1 else max_size
+            chunks.append(body[pos:pos + split_at])
+            pos += split_at
+        return chunks
 
     def _rewrite_html(self, html: str) -> str:
         # Drop script/style/noscript blocks: the MSX parser ignores
@@ -575,6 +644,18 @@ def _send_response(conn: socket.socket, kind: str, body):
         header = f"OK {kind} {len(body)}\r\n".encode("ascii")
         conn.sendall(header)
         _slow_send(conn, body)
+    elif kind == "HTMP":
+        # Paginated HTM: body is a (bytes, page, total) tuple. The
+        # extended header "OK HTM <bytes> <page>/<total>\r\n" is only
+        # sent when total > 1, so single-chunk pages keep the legacy
+        # "OK HTM <bytes>\r\n" wire format and old browsers Just Work.
+        chunk, page, total = body
+        if total > 1:
+            header = f"OK HTM {len(chunk)} {page}/{total}\r\n".encode("ascii")
+        else:
+            header = f"OK HTM {len(chunk)}\r\n".encode("ascii")
+        conn.sendall(header)
+        _slow_send(conn, chunk)
     elif kind == "404":
         conn.sendall(b"ERR 404\r\n")
     else:
