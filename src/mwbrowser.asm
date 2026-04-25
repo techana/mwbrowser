@@ -6289,18 +6289,18 @@ TagDt:
 
 ; <dd>: definition description. Render on a new line indented one
 ; tab-stop (16 px, same as <ul> child indent) for the body of the
-; definition. </dd> snaps the indent back. The indent is applied at
-; tag-open time and reverted at tag-close so nested constructs don't
-; pile up.
+; definition. </dd> snaps the indent back. The indent has to be
+; bumped BEFORE EmitNewline -- EmitNewline snaps TextX to the
+; current HtmlIndent for the new line, so adding +16 afterwards
+; would only take effect on the line AFTER this one.
 TagDd:
     ld      a, [HtmlIsClose]
     or      a
     jr      nz, .close
-    call    EmitNewline
     ld      a, [HtmlIndent]
     add     a, 16
     ld      [HtmlIndent], a
-    ret
+    jp      EmitNewline
 .close:
     ld      a, [HtmlIndent]
     sub     16
@@ -9434,6 +9434,15 @@ TagCenter:
     ret
 
 TagHr:
+    ; Inside a <table>: TextY tracks per-cell layout via HtmlRowTopY,
+    ; not the document flow. Drawing the rule here would land on top
+    ; of the next <tr>'s text (mirror.aratab.com puts an <hr> in a
+    ; spanning <th> right above the data rows, which made the rule
+    ; cut through the first directory row). Silently skip.
+    ld      a, [HtmlInTable]
+    or      a
+    ret     nz
+
     call    EmitBlankLine
     ; Only draw the rule when the current pen is actually inside the visible
     ; content band. When ScrollLine > 0 the first HR tags are above the top
