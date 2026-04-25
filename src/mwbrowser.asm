@@ -13236,12 +13236,20 @@ RemoteGet:
     jp      c, .rgFail
     call    SerialRead                  ; space
     jp      c, .rgFail
-    ; Default the page-info fields to 1/1 -- the legacy bridge format
-    ; ("OK HTM <bytes>\r\n") doesn't carry pagination, so a non-paginated
-    ; response leaves SerialPage=1, SerialPageTotal=1.
+    ; Default the page-info fields to 1/1 ONLY for HTM responses --
+    ; the legacy bridge format ("OK HTM <bytes>\r\n") doesn't carry
+    ; pagination, so a non-paginated HTM should default to 1/1. PCX
+    ; responses (image fetches) must leave the HTM-side page state
+    ; alone; otherwise an inline <img> mid-render wipes the
+    ; SerialPage/SerialPageTotal the wiki page just established and
+    ; the scrollbar thinks the doc is single-page.
+    ld      a, [SerialKind]
+    cp      1
+    jr      nz, .rgKeepPageState
     ld      a, 1
     ld      [SerialPage], a
     ld      [SerialPageTotal], a
+.rgKeepPageState:
     ld      de, 0
 .rgDigit:
     call    SerialRead
