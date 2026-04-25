@@ -277,13 +277,16 @@ def _pack_2bpp(im: "Image.Image") -> bytes:
 # ----------------------------------------------------------------------------
 
 class BridgeSession:
-    # Bytes the MSX side gets per OK HTM response. Sized to fit ~1
-    # viewport (22 lines * 60 chars ≈ 1.3 KB of rendered text, plus
-    # ~80% HTML markup overhead). At openMSX's emulated ~120 B/s wire
-    # speed, 2400 B costs the user about 20 s for the first paint --
-    # not great, but the alternative (smaller chunks) leaves the page
-    # half-blank below the fold.
-    PAGE_BYTES = 2400
+    # Page-fitting budget. We cut a chunk when EITHER (a) we've passed
+    # ~LINES_PER_PAGE rendered lines (counted from line-ending tags
+    # the MSX parser treats as a newline) OR (b) the chunk has hit
+    # MAX_CHUNK_BYTES. Picking the line count first keeps each
+    # chunk close to "one MSX viewport's worth of text"; the byte cap
+    # is a safety net for pages with very long lines (data:URL spam,
+    # huge inline SVG, etc.) so the browser's serial timeout doesn't
+    # bite us.
+    LINES_PER_PAGE  = 22
+    MAX_CHUNK_BYTES = 2400
 
     def __init__(self, verbose: bool = False, simplify: bool = False,
                  no_images: bool = False, pagination: bool = False):
@@ -370,12 +373,12 @@ class BridgeSession:
         # MSX wire protocol.
         html = _decode_body(raw, content_type)
         body = self._rewrite_html(html).encode(WIRE_CHARSET, "replace")
-        # Split the encoded body into PAGE_BYTES-sized chunks at safe
+        # Split the encoded body into viewport-sized chunks at safe
         # tag boundaries when --pagination is on; otherwise ship the
         # whole body as one OK HTM frame. Chunking is opt-in because
         # the chunk seams can split tags or links on hostile pages.
         if self.pagination:
-            chunks = self._split_into_chunks(body, self.PAGE_BYTES)
+            chunks = self._split_into_chunks(body)
         else:
             chunks = [body]
         self._pending_chunks = chunks
@@ -393,40 +396,57 @@ class BridgeSession:
         self._page_served += 1
         return ("HTMP", (chunk, self._page_served, self._page_total))
 
-    @staticmethod
-    def _split_into_chunks(body: bytes, max_size: int) -> list[bytes]:
-        """Greedy split at safe tag boundaries. Walks forward in
-        windows of `max_size` and cuts at the latest of (</p>, </tr>,
-        </li>, </td>, </div>, </h*>, <br>, <p>) that appears within
-        the window. Falls back to the latest '>' if no recognised
-        boundary fits, which still avoids splitting mid-tag."""
-        if len(body) <= max_size:
-            return [body]
-        markers = (b"</p>", b"</tr>", b"</li>", b"</td>", b"</div>",
-                   b"<br>", b"<br/>", b"<br />",
-                   b"</h1>", b"</h2>", b"</h3>", b"</h4>", b"</h5>", b"</h6>")
+    # Tags the MSX parser treats as a newline (i.e. they advance TextY
+    # by one rendered row). Each match counts as one visible line for
+    # the page-budget heuristic.
+    _LINE_END_RE = re.compile(
+        rb"(?i)<br\s*/?>|</p>|</tr>|</li>|</h[1-6]>|</div>|</center>")
+
+    def _split_into_chunks(self, body: bytes) -> list[bytes]:
+        """Cut at safe tag boundaries every ~LINES_PER_PAGE rendered
+        lines, falling back to MAX_CHUNK_BYTES as a hard safety cap.
+        Each chunk roughly fills one MSX viewport, so the browser's
+        page count == bridge's chunk count. Pages with very long
+        lines (data: URLs, base64 spam) hit the byte cap first; pages
+        whose markup is mostly newlines (directory listings, search
+        results) hit the line cap first."""
+        line_lim  = self.LINES_PER_PAGE
+        byte_lim  = self.MAX_CHUNK_BYTES
         chunks: list[bytes] = []
-        pos = 0
-        while pos < len(body):
-            end = pos + max_size
-            if end >= len(body):
-                chunks.append(body[pos:])
-                break
+        pos, n = 0, len(body)
+        while pos < n:
+            end = min(pos + byte_lim, n)
             window = body[pos:end]
-            split_at = -1
-            for m in markers:
-                idx = window.rfind(m)
-                if idx != -1:
-                    split_at = max(split_at, idx + len(m))
-            if split_at == -1:
-                # No tag boundary; cut at last '>' to avoid splitting
-                # inside a tag. If even that fails (huge tag value),
-                # cut hard at max_size -- malformed pages can do that.
-                idx = window.rfind(b">")
-                split_at = idx + 1 if idx != -1 else max_size
-            chunks.append(body[pos:pos + split_at])
-            pos += split_at
-        return chunks
+            line_count = 0
+            cut = -1
+            # Walk the line-end markers; first one at/above the line
+            # budget is our split.
+            for m in self._LINE_END_RE.finditer(window):
+                line_count += 1
+                if line_count >= line_lim:
+                    cut = m.end()
+                    break
+            if cut == -1:
+                # Didn't reach the line cap inside the byte budget
+                # (or no markers at all). If the rest fits, take it.
+                if end == n:
+                    chunks.append(body[pos:])
+                    break
+                # Otherwise cut at the LAST line-end inside window so
+                # the next chunk starts on a clean line; if there's no
+                # line-end marker at all, cut at the latest '>' so we
+                # at least don't split mid-tag.
+                last_marker = -1
+                for m in self._LINE_END_RE.finditer(window):
+                    last_marker = m.end()
+                if last_marker > 0:
+                    cut = last_marker
+                else:
+                    gt = window.rfind(b">")
+                    cut = gt + 1 if gt != -1 else len(window)
+            chunks.append(body[pos:pos + cut])
+            pos += cut
+        return chunks if chunks else [body]
 
     def _rewrite_html(self, html: str) -> str:
         # Drop script/style/noscript blocks: the MSX parser ignores

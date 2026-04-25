@@ -1012,16 +1012,18 @@ DoFormSubmit:
 .dfsNoAmp:
     ld      a, 1
     ld      [DfsAmpPending], a
-    ; name=
+    ; name= (percent-encode in case the field name carries spaces or
+    ; reserved chars).
     ld      a, [DfsIdx]
     call    FormGetNamePtr
-    call    UrlAppendZ
+    call    UrlAppendEncZ
     ld      a, '='
     call    UrlAppendA
-    ; value
+    ; value (percent-encode -- without this a typed "msx generation"
+    ; ships as ".../?q=msx generation" and frogfind serves a 404).
     ld      a, [DfsIdx]
     call    FormGetValuePtr
-    call    UrlAppendZ
+    call    UrlAppendEncZ
 .dfsSkip:
     ld      a, [DfsIdx]
     inc     a
@@ -1068,6 +1070,90 @@ UrlAppendA:
 .uaaFull:
     pop     af
     ret
+
+; UrlEncIsSafe: returns Z when A is an "unreserved" URL character per
+; RFC 3986 (A-Z a-z 0-9 - . _ ~), NZ otherwise. Preserves A so the
+; caller can either pass it to UrlAppendA raw or fall through to a
+; %XX percent-encoding path.
+UrlEncIsSafe:
+    cp      '0'
+    jr      c, .checkLowPunct
+    cp      '9' + 1
+    jr      c, .uesYes
+    cp      'A'
+    jr      c, .uesNo
+    cp      'Z' + 1
+    jr      c, .uesYes
+    cp      '_'
+    jr      z, .uesYes
+    cp      'a'
+    jr      c, .uesNo
+    cp      'z' + 1
+    jr      c, .uesYes
+    cp      '~'
+    jr      z, .uesYes
+.uesNo:
+    or      1                           ; NZ
+    ret
+.checkLowPunct:
+    cp      '-'
+    jr      z, .uesYes
+    cp      '.'
+    jr      z, .uesYes
+    jr      .uesNo
+.uesYes:
+    xor     a                           ; Z
+    ret
+
+; UrlAppendEncA: like UrlAppendA, but percent-encodes A when it isn't
+; an unreserved char. Uses HexDigits below for the hex nybbles.
+UrlAppendEncA:
+    push    af
+    call    UrlEncIsSafe
+    jr      nz, .encode
+    pop     af
+    jp      UrlAppendA
+.encode:
+    pop     af
+    push    af                          ; save raw byte
+    ld      c, a                        ; C = byte
+    ld      a, '%'
+    call    UrlAppendA
+    ld      a, c
+    rrca
+    rrca
+    rrca
+    rrca
+    and     0x0F
+    ld      e, a
+    ld      d, 0
+    ld      hl, HexDigits
+    add     hl, de
+    ld      a, [hl]
+    call    UrlAppendA
+    pop     af
+    and     0x0F
+    ld      e, a
+    ld      d, 0
+    ld      hl, HexDigits
+    add     hl, de
+    ld      a, [hl]
+    jp      UrlAppendA
+
+HexDigits:      db "0123456789ABCDEF"
+
+; UrlAppendEncZ: HL -> NUL-terminated string; append each char to
+; UrlBuf percent-encoded as needed (form-field values, names with
+; special characters, etc.).
+UrlAppendEncZ:
+    ld      a, [hl]
+    or      a
+    ret     z
+    push    hl
+    call    UrlAppendEncA
+    pop     hl
+    inc     hl
+    jr      UrlAppendEncZ
 
 ; UrlAppendZ: HL -> NUL-terminated string; append each char to UrlBuf
 ; (stops at NUL or URL_MAX).
@@ -12274,6 +12360,11 @@ DrawAboutPopup:
     call    DrawString
 
     ld      de, ABOUT_X + 8
+    ld      c, ABOUT_Y + 84
+    ld      hl, AboutLine6
+    call    DrawString
+
+    ld      de, ABOUT_X + 8
     ld      c, ABOUT_Y + ABOUT_H - 12
     ld      hl, AboutFooter
     call    DrawString
@@ -13345,8 +13436,9 @@ AboutLine2:     db 0x4D, 0x53, 0x58, 0x32, 0x20
                 db 0xAC, 0xC6, 0xB3, 0xA5, 0xCE, 0
 AboutLine3:     db "github.com/techana/mwbrowser", 0
 AboutLine4:     db "F1 Help  F2 Back  F3 Fwd", 0
-AboutLine5:     db "F4 Clear  F5 Reload  Stop Halt", 0
-AboutFooter:    db "v0.5 demo build", 0
+AboutLine5:     db "F4 Clear  F5 Reload", 0
+AboutLine6:     db "Stop Halt  Esc Quit", 0
+AboutFooter:    db "v0.7 Demo", 0
 
 ; Screen-6 icon bitmaps (4 px/byte, 11=black, 01=bg/lgray).
 
