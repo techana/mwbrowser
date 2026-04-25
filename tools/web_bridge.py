@@ -277,16 +277,27 @@ def _pack_2bpp(im: "Image.Image") -> bytes:
 # ----------------------------------------------------------------------------
 
 class BridgeSession:
-    # Page-fitting budget. We cut a chunk when EITHER (a) we've passed
-    # ~LINES_PER_PAGE rendered lines (counted from line-ending tags
-    # the MSX parser treats as a newline) OR (b) the chunk has hit
-    # MAX_CHUNK_BYTES. Picking the line count first keeps each
-    # chunk close to "one MSX viewport's worth of text"; the byte cap
-    # is a safety net for pages with very long lines (data:URL spam,
-    # huge inline SVG, etc.) so the browser's serial timeout doesn't
-    # bite us.
-    LINES_PER_PAGE  = 22
-    MAX_CHUNK_BYTES = 2400
+    # Viewport simulator parameters. The MSX content area is 492 px /
+    # 8 px-per-glyph = ~61 chars wide and TEXT_MAX_LINES = 22 visible
+    # 8-px rows tall. The simulator walks each chunk like a tiny
+    # browser -- accumulating chars per line, wrapping at LINE_CHARS,
+    # bumping the line counter on block-end tags, doubling cost
+    # inside <h1>/<h2> -- and cuts as soon as the rendered total
+    # would overflow the viewport. MAX_CHUNK_BYTES is a hard
+    # watchdog for pathological pages (huge data: URLs, single
+    # multi-KB <a href> with no whitespace, etc.) so the browser's
+    # serial timeout doesn't bite.
+    LINE_CHARS      = 60
+    # MSX content area is 183 px (CONTENT_Y1 - CONTENT_Y0 + 1) but the
+    # block-level tags the simulator doesn't model (<h1> and <table>
+    # each call EmitBlankLine on open + close, <h1>...</h1> also adds a
+    # half-line gap below) carve out roughly 40 px for typical pages.
+    # Budget against the leftover so the chunk doesn't clip below the
+    # fold even when h1 / table overhead lands.
+    VIEWPORT_PX     = 140
+    TEXT_LINE_PX    = 8       # TEXT_LINE_H
+    TR_LINE_PX      = 10      # TEXT_LINE_H + TABLE_ROW_GAP
+    MAX_CHUNK_BYTES = 6000
 
     def __init__(self, verbose: bool = False, simplify: bool = False,
                  no_images: bool = False, pagination: bool = False):
@@ -396,56 +407,98 @@ class BridgeSession:
         self._page_served += 1
         return ("HTMP", (chunk, self._page_served, self._page_total))
 
-    # Tags the MSX parser treats as a newline (i.e. they advance TextY
-    # by one rendered row). Each match counts as one visible line for
-    # the page-budget heuristic.
+    # Tags the MSX parser treats as a newline. Each row carries the
+    # row's pixel cost so the simulator can sum them against the
+    # viewport's 183-px content area instead of pretending every
+    # tag is exactly 8 px tall. Most lines are TEXT_LINE_H = 8 px;
+    # <tr> rows draw text + TABLE_ROW_GAP (2 px) = 10 px.
     _LINE_END_RE = re.compile(
         rb"(?i)<br\s*/?>|</p>|</tr>|</li>|</h[1-6]>|</div>|</center>")
+    _TR_END_RE   = re.compile(rb"(?i)</tr>")
+    # h1 / h2 render at scale 2 -> their lines count double the height.
+    _SCALE2_OPEN  = re.compile(rb"(?i)<h[12](?:\s[^>]*)?>")
+    _SCALE2_CLOSE = re.compile(rb"(?i)</h[12]>")
 
     def _split_into_chunks(self, body: bytes) -> list[bytes]:
-        """Cut at safe tag boundaries every ~LINES_PER_PAGE rendered
-        lines, falling back to MAX_CHUNK_BYTES as a hard safety cap.
-        Each chunk roughly fills one MSX viewport, so the browser's
-        page count == bridge's chunk count. Pages with very long
-        lines (data: URLs, base64 spam) hit the byte cap first; pages
-        whose markup is mostly newlines (directory listings, search
-        results) hit the line cap first."""
-        line_lim  = self.LINES_PER_PAGE
+        """Walk `body` simulating the MSX renderer in pixels: every
+        block-end marker advances a virtual TextY (8 px standard, 10 px
+        for </tr>, doubled inside <h1>/<h2>); a text run that wraps
+        past LINE_CHARS spills onto another line at the current scale.
+        Cut at the FIRST safe boundary whose advance would push past
+        VIEWPORT_PX. Falls back to MAX_CHUNK_BYTES + last '>' for
+        pathological pages with no usable line markers."""
+        view_px   = self.VIEWPORT_PX
+        line_px   = self.TEXT_LINE_PX
+        tr_px     = self.TR_LINE_PX
+        line_w    = self.LINE_CHARS
         byte_lim  = self.MAX_CHUNK_BYTES
+        line_re   = self._LINE_END_RE
+        tr_re     = self._TR_END_RE
+        h2_open   = self._SCALE2_OPEN
+        h2_close  = self._SCALE2_CLOSE
+
         chunks: list[bytes] = []
         pos, n = 0, len(body)
         while pos < n:
-            end = min(pos + byte_lim, n)
-            window = body[pos:end]
-            line_count = 0
-            cut = -1
-            # Walk the line-end markers; first one at/above the line
-            # budget is our split.
-            for m in self._LINE_END_RE.finditer(window):
-                line_count += 1
-                if line_count >= line_lim:
-                    cut = m.end()
-                    break
-            if cut == -1:
-                # Didn't reach the line cap inside the byte budget
-                # (or no markers at all). If the rest fits, take it.
-                if end == n:
-                    chunks.append(body[pos:])
-                    break
-                # Otherwise cut at the LAST line-end inside window so
-                # the next chunk starts on a clean line; if there's no
-                # line-end marker at all, cut at the latest '>' so we
-                # at least don't split mid-tag.
-                last_marker = -1
-                for m in self._LINE_END_RE.finditer(window):
-                    last_marker = m.end()
-                if last_marker > 0:
-                    cut = last_marker
+            end_limit = min(pos + byte_lim, n)
+            i = pos
+            scale = 1                        # 1 = normal, 2 = inside <h1>/<h2>
+            cur_chars = 0
+            used_px = 0
+            last_safe = -1                   # last clean cut point seen
+            while i < end_limit:
+                if body[i] == 0x3C:          # '<' -> tag
+                    tag_end = body.find(b">", i, end_limit)
+                    if tag_end == -1:
+                        break
+                    tag = body[i:tag_end + 1]
+                    low = tag.lower()
+                    if h2_open.match(low):
+                        scale = 2
+                    elif h2_close.match(low):
+                        scale = 1
+                    if line_re.match(low):
+                        # Flush text wrap then the marker's own row.
+                        per_px = (tr_px if tr_re.match(low) else line_px) * scale
+                        if cur_chars > 0:
+                            wrap_lines = (cur_chars + line_w - 1) // line_w
+                            used_px += wrap_lines * line_px * scale
+                        else:
+                            used_px += per_px
+                        cur_chars = 0
+                        last_safe = tag_end + 1
+                        if used_px >= view_px:
+                            break
+                    i = tag_end + 1
                 else:
-                    gt = window.rfind(b">")
-                    cut = gt + 1 if gt != -1 else len(window)
-            chunks.append(body[pos:pos + cut])
-            pos += cut
+                    b = body[i]
+                    if b in (0x20, 0x09, 0x0A, 0x0D):
+                        if cur_chars > 0:
+                            cur_chars += 1
+                            if cur_chars >= line_w:
+                                used_px += line_px * scale
+                                cur_chars = 0
+                    else:
+                        cur_chars += 1
+                        if cur_chars >= line_w:
+                            used_px += line_px * scale
+                            cur_chars = 0
+                    i += 1
+            # Decide where to cut.
+            if end_limit == n and used_px < view_px:
+                # Whole tail fits in remaining viewport -> ship it.
+                chunks.append(body[pos:])
+                break
+            if last_safe > pos:
+                cut = last_safe
+            else:
+                # No line marker inside the byte budget; cut at the
+                # last '>' so we don't split mid-tag. Hard-cut at the
+                # byte limit if even that fails.
+                gt = body.rfind(b">", pos, end_limit)
+                cut = gt + 1 if gt != -1 else end_limit
+            chunks.append(body[pos:cut])
+            pos = cut
         return chunks if chunks else [body]
 
     def _rewrite_html(self, html: str) -> str:

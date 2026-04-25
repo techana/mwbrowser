@@ -2954,7 +2954,12 @@ STYLE_STRIKE    equ 0x08
 STYLE_FOCUSED   equ 0x10                ; active link -> dotted underline
 
 TITLE_BUF_MAX   equ 31                  ; chars captured from <title>
-LINK_MAX        equ 8                   ; max <a> rects per rendered page
+LINK_MAX        equ 24                  ; max <a> rects per rendered page; sized
+                                        ; for one MSX viewport's worth of links
+                                        ; (a directory listing easily packs 20+
+                                        ; clickable rows). Each slot uses
+                                        ; (LINK_URL_MAX+1) = 96 bytes for the
+                                        ; URL plus 5 for rect data.
 LINK_URL_MAX    equ 95                  ; max chars per href (plus NUL); matches URL_MAX
 
 PrintFileContent:
@@ -6263,6 +6268,44 @@ TagLi:
     ld      a, 1
     ld      [HtmlLiPending], a
     ret
+
+; <dl>: definition-list block. HTML 2.0 (RFC 1866 11.5). Just a blank
+; line above and below; the inner <dt>/<dd> children do the actual
+; layout, similar to <ul>/<li>.
+TagDl:
+    ld      a, [HtmlIsClose]
+    or      a
+    jp      z, EmitBlankLine
+    jp      EmitBlankLine
+
+; <dt>: definition term. Renders flush-left on its own line, no extra
+; indent. </dt> is optional in HTML 2.0; we just close any pending
+; line so the next text starts cleanly.
+TagDt:
+    ld      a, [HtmlIsClose]
+    or      a
+    ret     nz
+    jp      EnsureLineStart
+
+; <dd>: definition description. Render on a new line indented one
+; tab-stop (16 px, same as <ul> child indent) for the body of the
+; definition. </dd> snaps the indent back. The indent is applied at
+; tag-open time and reverted at tag-close so nested constructs don't
+; pile up.
+TagDd:
+    ld      a, [HtmlIsClose]
+    or      a
+    jr      nz, .close
+    call    EmitNewline
+    ld      a, [HtmlIndent]
+    add     a, 16
+    ld      [HtmlIndent], a
+    ret
+.close:
+    ld      a, [HtmlIndent]
+    sub     16
+    ld      [HtmlIndent], a
+    jp      EnsureLineStart
 
 ; <pre>: preformatted block. Whitespace is preserved verbatim; LF drives a
 ; real newline in EmitText. Blank line above/below.
@@ -10811,6 +10854,12 @@ TagTbl:
     dw  TagOl
     db  "LI", 0
     dw  TagLi
+    db  "DL", 0
+    dw  TagDl
+    db  "DT", 0
+    dw  TagDt
+    db  "DD", 0
+    dw  TagDd
     db  "PRE", 0
     dw  TagPre
     db  "BLOCKQUOTE", 0
@@ -14093,10 +14142,13 @@ FileEnd:
 ;
 ; The pin must sit ABOVE the last `ds`-allocated global; otherwise
 ; FileBuf overlaps live state and serial reads silently overwrite
-; PlainTextMode / HistoryOldest / IsoMap. Last bumped from 0x5800 to
-; 0x6000 when the LINK_URL_MAX raise + new HtmlFormAction / pagination
-; state pushed FileEnd past 0x5C00.
-    ORG 0x6000
+; PlainTextMode / HistoryOldest / IsoMap. Bump history:
+;   0x5000 -> 0x5800 -> 0x6000 -> 0x6800
+; The latest jump made room for LINK_MAX=24 (LinkUrls grew 768 -> 2304)
+; plus the URL-encoding helpers + viewport simulator state. After each
+; bump, double-check `grep -E "^(FileEnd|FileBuf):" dist/mwbro.sym` to
+; make sure FileEnd stays below the pinned FileBuf address.
+    ORG 0x6800
 FileBuf:        ds FILE_BUF_SIZE        ; 16 KB HTTP/body landing buffer
 FontBuf:        ds FONT_BUF_SIZE        ; 2 KB MSX font pulled from CGTABL
 ImgBuf:         ds 128                  ; DMA scratch for streaming image loaders
