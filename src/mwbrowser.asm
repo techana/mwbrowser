@@ -13614,6 +13614,14 @@ RemoteImgRefill:
 ; RemoteImgClose: drain any leftover body bytes so the next GET finds
 ; a clean socket. Cheap -- happens rarely since images typically
 ; stream to completion.
+;
+; If RemoteImgByte returns CF=1 (SerialRead timed out -- a byte got
+; lost en route), it does NOT decrement ImgBytesLeft. The old loop
+; would then poll forever on the same byte: an endless body parse
+; hang we hit on https://www.msx.org/wiki/Sakhr_AX-370 right after
+; the header MSX logo rendered. Now we bail out on timeout: the
+; remaining bytes are lost but VBLANK gets unmasked so the keyboard
+; ISR comes back and the parser can resume.
 RemoteImgClose:
 .ricL:
     ld      hl, [ImgBytesLeft]
@@ -13626,7 +13634,8 @@ RemoteImgClose:
     jp      z, SerialUnmaskVblank        ; EOF -> tail-call restores VBLANK
 .ricP:
     call    RemoteImgByte
-    jr      .ricL
+    jr      nc, .ricL                    ; CF=0 -> byte drained, keep going
+    jp      SerialUnmaskVblank           ; CF=1 -> serial timeout, abandon
 
 SerialKind:     db 0                    ; 0=ERR, 1=HTM, 2=PCX
 SerialLen:      dw 0
