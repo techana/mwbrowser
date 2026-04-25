@@ -147,9 +147,12 @@ KEY_ENTER      equ 0x0D
 KEY_SPACE      equ 0x20
 KEY_UP         equ 0x1E        ; MSX DIRIN returns 0x1E for up arrow
 KEY_DOWN       equ 0x1F        ; 0x1F for down arrow
+KEY_LEFT       equ 0x1D        ; left arrow
+KEY_RIGHT      equ 0x1C        ; right arrow
 KEY_CLS        equ 0x0C        ; MSX CLS / Ctrl+L -- clears address bar
 KEY_F1         equ 0xF1        ; MSX F1 -> toolbar Back
 KEY_F2         equ 0xF2        ; MSX F2 -> toolbar Forward
+KEY_F3         equ 0xF3        ; MSX F3 -> clear address bar
 KEY_F5         equ 0xF5        ; MSX F5 -> toolbar Refresh / Go
 
 ; ---- URL / file state ----
@@ -240,13 +243,15 @@ MainLoop:
     cp      KEY_STOP
     jp      z, DoGo
 
-    ; Function-key shortcuts (F1 / F2 / F5) for the Back / Forward /
-    ; Refresh toolbar buttons. Skip the focused-button "Enter or Space"
-    ; ceremony and fire the action straight from the global dispatch.
+    ; Function-key shortcuts (F1/F2/F3/F5) for Back / Forward / clear
+    ; address / Refresh. Fire the action straight from the global
+    ; dispatch -- skips the per-focus "Enter or Space" ceremony.
     cp      KEY_F1
     jp      z, DoBack
     cp      KEY_F2
     jp      z, DoForward
+    cp      KEY_F3
+    jp      z, DoF3Clear
     cp      KEY_F5
     jp      z, DoGo
 
@@ -358,6 +363,16 @@ DoBack:
     call    GoBack
     jp      MainLoop
 
+; F3: clear the address bar from anywhere and shift focus to it so the
+; user can immediately start typing a new URL without aiming the
+; mouse. Same end state as Ctrl+L (KEY_CLS) but globally accessible.
+DoF3Clear:
+    call    UrlClear
+    ld      a, FOC_ADDRESS
+    ld      [Focus], a
+    call    PaintToolbar
+    jp      MainLoop
+
 OnForward:
     ld      a, b
     cp      KEY_ENTER
@@ -393,6 +408,18 @@ NotAddrEnter:
     call    PaintToolbar
     jp      MainLoop
 NotBackspace:
+    cp      KEY_LEFT
+    jr      nz, NotAddrLeft
+    call    UrlCursorLeft
+    call    PaintToolbar
+    jp      MainLoop
+NotAddrLeft:
+    cp      KEY_RIGHT
+    jr      nz, NotAddrRight
+    call    UrlCursorRight
+    call    PaintToolbar
+    jp      MainLoop
+NotAddrRight:
     cp      KEY_CLS                     ; Ctrl+L / MSX CLS
     jr      nz, NotCls
     call    UrlClear
@@ -403,7 +430,7 @@ NotCls:
     jp      c, MainLoop
     cp      0x7F
     jp      nc, MainLoop
-    call    UrlAppend
+    call    UrlInsert
     call    PaintToolbar
     jp      MainLoop
 
@@ -1173,6 +1200,11 @@ BindFnKeys:
     inc     hl
     xor     a
     ld      [hl], a
+    ld      hl, 0xF87F + 32             ; F3's slot
+    ld      [hl], 0xF3
+    inc     hl
+    xor     a
+    ld      [hl], a
     ld      hl, 0xF87F + 64             ; F5's slot
     ld      [hl], 0xF5
     inc     hl
@@ -1201,6 +1233,7 @@ InitState:
 .done:
     ld      a, b
     ld      [UrlLen], a
+    ld      [UrlCursor], a              ; caret at end of seeded URL
     ret
 
 ; Advance Focus by 1 modulo FOC_COUNT.
@@ -1214,45 +1247,123 @@ CycleFocus:
     ld      [Focus], a
     ret
 
-; UrlAppend: A (on entry) = char to append (printable). NUL-terminates.
-UrlAppend:
-    ld      c, a
+; UrlInsert: A (on entry) = char to insert at the current cursor
+; position. Shifts UrlBuf[UrlCursor..UrlLen] right by one byte to make
+; room, drops A in, bumps both UrlLen and UrlCursor, NUL-terminates.
+; No-op when the buffer is full.
+UrlInsert:
+    ld      c, a                          ; C = char to insert
     ld      a, [UrlLen]
     cp      URL_MAX
     ret     nc
+    ; HL = &UrlBuf[len] (position of the trailing NUL). We walk it
+    ; backward, copying [HL] to [HL+1] each step until we land on
+    ; the cursor's slot.
+    ld      a, [UrlLen]
     ld      e, a
     ld      d, 0
     ld      hl, UrlBuf
     add     hl, de
-    ld      [hl], c
+    ; B = len - cursor + 1 (one extra iter so the NUL also shifts).
+    ld      a, [UrlLen]
+    ld      b, a
+    ld      a, [UrlCursor]
+    cpl
+    add     a, 1                          ; A = -cursor
+    add     a, b
+    inc     a
+    ld      b, a
+.uiShift:
+    ld      a, [hl]
     inc     hl
-    xor     a
     ld      [hl], a
+    dec     hl
+    dec     hl
+    djnz    .uiShift
+    ; HL now sits one byte before the cursor slot; +1 to land on it.
+    inc     hl
+    ld      [hl], c
     ld      a, [UrlLen]
     inc     a
     ld      [UrlLen], a
+    ld      a, [UrlCursor]
+    inc     a
+    ld      [UrlCursor], a
     ret
 
-; UrlClear: zero the address bar (UrlLen=0, UrlBuf[0]=NUL).
+; UrlClear: zero the address bar (UrlLen=0, UrlCursor=0, UrlBuf[0]=NUL).
 UrlClear:
     xor     a
     ld      [UrlLen], a
+    ld      [UrlCursor], a
     ld      [UrlBuf], a
     ret
 
-; UrlBackspace: decrement UrlLen, NUL-terminate at new length.
+; UrlBackspace: delete the char immediately before the cursor (DEL-back
+; semantics, like a real text input). Shifts UrlBuf[cursor..len] left
+; by 1 into [cursor-1..len-1], decrements both UrlLen and UrlCursor.
+; No-op when the cursor is already at column 0.
 UrlBackspace:
-    ld      a, [UrlLen]
+    ld      a, [UrlCursor]
     or      a
     ret     z
-    dec     a
-    ld      [UrlLen], a
+    ; Shift UrlBuf[cursor..len] left by 1.
+    ld      a, [UrlCursor]
     ld      e, a
     ld      d, 0
     ld      hl, UrlBuf
-    add     hl, de
-    xor     a
+    add     hl, de                        ; HL -> UrlBuf[cursor]
+    ld      a, [UrlLen]
+    ld      b, a
+    ld      a, [UrlCursor]
+    sub     b
+    neg                                   ; A = len - cursor
+    inc     a                             ; +1 for the trailing NUL
+    ld      b, a
+.ubShift:
+    ld      a, [hl]
+    dec     hl
     ld      [hl], a
+    inc     hl
+    inc     hl
+    djnz    .ubShift
+    ld      a, [UrlLen]
+    dec     a
+    ld      [UrlLen], a
+    ld      a, [UrlCursor]
+    dec     a
+    ld      [UrlCursor], a
+    ret
+
+; UrlCursorLeft: nudge the address-bar caret one column toward the
+; start. No-op when already at column 0.
+UrlCursorLeft:
+    ld      a, [UrlCursor]
+    or      a
+    ret     z
+    dec     a
+    ld      [UrlCursor], a
+    ret
+
+; UrlCursorRight: nudge the caret one column toward the end. No-op
+; when already at UrlLen (just past the last typed char).
+UrlCursorRight:
+    ld      a, [UrlCursor]
+    ld      b, a
+    ld      a, [UrlLen]
+    cp      b
+    ret     z
+    inc     b
+    ld      a, b
+    ld      [UrlCursor], a
+    ret
+
+; UrlCursorEnd: park the caret at UrlLen (after the last char). Used
+; whenever a fresh URL gets dropped into UrlBuf (link click, history
+; nav, init) so the user sees the end of it without scrolling.
+UrlCursorEnd:
+    ld      a, [UrlLen]
+    ld      [UrlCursor], a
     ret
 
 ; ComputeFocusState: A (on entry) = focus index to check.
@@ -2112,58 +2223,72 @@ PaintAddressBar:
     call    DrawRectBorder
 .addrBorderDone:
 
-    ; URL text. If the URL is longer than what fits in the bar, show
-    ; only its last URL_VISIBLE characters so the caret (which always
-    ; tracks the string's end) stays visible. The chars before the
-    ; window scroll off the left -- DrawString is happy to start from
-    ; any offset inside UrlBuf and stops at the existing NUL.
+    ; URL text. Show URL_VISIBLE chars starting at WindowStart so the
+    ; caret (UrlCursor) is always inside the visible window. We pick
+    ; WindowStart so:
+    ;   - if UrlLen fits, WindowStart = 0
+    ;   - else, end-anchor (WindowStart = UrlLen - URL_VISIBLE) by
+    ;     default; if the caret moved left past WindowStart we slide
+    ;     the window left (WindowStart = UrlCursor) so it stays in view
     ld      a, COL_BLACK
     ld      l, COL_WHITE
     call    SetTextColours
-    ld      hl, UrlBuf
     ld      a, [UrlLen]
     cp      URL_VISIBLE + 1
-    jr      c, .urlDraw
-    sub     URL_VISIBLE                 ; A = start offset
+    jr      c, .urlNoScroll
+    sub     URL_VISIBLE                 ; A = end-anchored start
+    ld      b, a
+    ld      a, [UrlCursor]
+    cp      b
+    jr      nc, .urlStartHave
+    ld      b, a                        ; cursor scrolled past window: slide left
+.urlStartHave:
+    ld      a, b
+    jr      .urlStartReady
+.urlNoScroll:
+    xor     a
+.urlStartReady:
+    ld      [.urlVisStart], a           ; cache for caret math below
     ld      e, a
     ld      d, 0
+    ld      hl, UrlBuf
     add     hl, de
-.urlDraw:
-    ld      de, ADDR_X0 + 5              ; 1 empty pixel between border and text
+    ld      de, ADDR_X0 + 5             ; 1 px gap between border and text
     ld      c, BTN_Y0 + 4
     call    DrawString
 
-    ; Text caret: a 4-px-wide black column just past the URL when the
-    ; address bar has focus. Cap visible_len at URL_VISIBLE so the
-    ; caret stays inside the bar once the display starts scrolling.
-    ; Use 16-bit math for the *8 step -- visible_len * 8 can reach
-    ; 45 * 8 = 360 which overflows an 8-bit accumulator.
+    ; Text caret: 4-px-wide black column at (UrlCursor - VisStart) * 8
+    ; when the address bar has focus.
     ld      a, [ButtonState]
     and     BTN_FOCUSED
     jr      z, .noCaret
-    ld      a, [UrlLen]
-    cp      URL_VISIBLE + 1
-    jr      c, .caretLen
-    ld      a, URL_VISIBLE              ; visible-length cap
-.caretLen:
+    ld      a, [UrlCursor]
+    ld      b, a
+    ld      a, [.urlVisStart]
+    cpl
+    add     a, 1                        ; -VisStart
+    add     a, b                        ; A = UrlCursor - VisStart
     ld      l, a
     ld      h, 0
     add     hl, hl
     add     hl, hl
-    add     hl, hl                       ; HL = visible_len * 8
-    ld      de, ADDR_X0 + 5              ; matches URL's text origin
-    add     hl, de                       ; HL = caret pixel X
+    add     hl, hl                       ; HL = (cursor - start) * 8
+    ld      de, ADDR_X0 + 5
+    add     hl, de
     srl     h
     rr      l
     srl     h
     rr      l                            ; HL = byte col
-    ld      b, l                         ; B = byteCol
+    ld      b, l
     ld      c, BTN_Y0 + 3
-    ld      d, 1                         ; 1 byte wide = 4 px
+    ld      d, 1                         ; 1 byte = 4 px wide
     ld      e, BTN_H - 6
     ld      a, COL_BLACK
     call    FillRect
 .noCaret:
+    jr      .caretSkipData
+.urlVisStart:   db 0                    ; scratch: window-start cache
+.caretSkipData:
 
     ; Clear-button glyph at right edge of the address bar (visual hint for
     ; Ctrl+L = MSX CLS). Dark-gray so it doesn't compete with the URL.
@@ -2631,13 +2756,14 @@ ResetFcbTail:
     ret
 
 LoadFile:
-    ; URL shape routes the load. "http://..." (or any "scheme:/" prefix)
-    ; goes to the serial bridge; anything else is opened as a local
-    ; file via MSX-DOS. IsRemoteSession stays set through the render so
-    ; <img src="pgNN.pcx"> loads also land on the UART.
+    ; URL shape routes the load. Drive-letter paths ("C:..." etc.) go
+    ; through MSX-DOS; everything else (schemed or bare hostnames /
+    ; paths) is handed to the bridge, which auto-prefixes http:// when
+    ; the scheme is missing. IsRemoteSession stays set through the
+    ; render so <img src="imNN.pcx"> loads also land on the UART.
     ld      hl, UrlBuf
-    call    HasScheme
-    jr      nz, .lfLocal
+    call    IsLocalUrl
+    jr      z, .lfLocal
     ld      a, 1
     ld      [IsRemoteSession], a
     jp      RemoteLoadFile
@@ -11112,7 +11238,7 @@ CopyHrefToUrlBuf:
     ld      a, [hl]
     ld      [de], a
     or      a
-    ret     z
+    jr      z, .chb_done
     inc     hl
     inc     de
     ld      a, [UrlLen]
@@ -11121,6 +11247,11 @@ CopyHrefToUrlBuf:
     djnz    .chb_loop
     xor     a
     ld      [de], a                     ; ensure NUL terminator on overflow
+.chb_done:
+    ; Park the address-bar caret at the end of the URL so the user
+    ; can immediately edit (Backspace pops chars from the right).
+    ld      a, [UrlLen]
+    ld      [UrlCursor], a
     ret
 
 ; ============================================================================
@@ -12757,8 +12888,9 @@ SerialWriteZ:   ; HL -> NUL-terminated string.
     inc     hl
     jr      SerialWriteZ
 
-; HasScheme: HL -> NUL string. Z set when ":/" occurs. Rough "http://"
-; detector; any URL shape works, bare filenames don't.
+; HasScheme (legacy): kept around for the few places that still want the
+; "any ':/' anywhere in the URL" answer. New routing decisions go
+; through IsLocalUrl below.
 HasScheme:
     push    hl
 .hs:
@@ -12776,6 +12908,39 @@ HasScheme:
     ret
 .hsNo:
     pop     hl
+    or      1
+    ret
+
+; IsLocalUrl: HL -> NUL URL. Returns Z when the URL looks like an
+; MSX-DOS drive-letter path (single letter then ':'), NZ otherwise.
+; Used by LoadFile to route "C:HOME.HTM" through MSX-DOS while sending
+; bare hostnames like "frogfind.com" or schemed URLs to the bridge.
+IsLocalUrl:
+    ld      a, [hl]
+    or      a
+    jr      z, .iulNo                   ; empty -> not local
+    push    hl
+    inc     hl
+    ld      c, [hl]                     ; C = second char
+    pop     hl
+    ld      a, [hl]                     ; A = first char
+    ; First char must be A..Z or a..z.
+    cp      'a'
+    jr      c, .iulCheckUpper
+    cp      'z' + 1
+    jr      nc, .iulNo
+    jr      .iulFirstOk
+.iulCheckUpper:
+    cp      'A'
+    jr      c, .iulNo
+    cp      'Z' + 1
+    jr      nc, .iulNo
+.iulFirstOk:
+    ; Second char must be ':' to count as a drive letter.
+    ld      a, c
+    cp      ':'
+    ret     z                           ; Z = local
+.iulNo:
     or      1
     ret
 
@@ -13145,8 +13310,8 @@ AboutLine2:     db 0x4D, 0x53, 0x58, 0x32, 0x20
                 db 0xA6, 0xD0, 0xE7, 0xA5, 0xD0, 0xE0, 0x20
                 db 0xAC, 0xC6, 0xB3, 0xA5, 0xCE, 0
 AboutLine3:     db "github.com/techana/mwbrowser", 0
-AboutLine4:     db "F1 shows this dialog.", 0
-AboutLine5:     db "Esc closes / quits.", 0
+AboutLine4:     db "F1 Back  F2 Fwd  F5 Reload", 0
+AboutLine5:     db "F3 Clear  Stop Halt  Esc Quit", 0
 AboutFooter:    db "v0.5 demo build", 0
 
 ; Screen-6 icon bitmaps (4 px/byte, 11=black, 01=bg/lgray).
@@ -13526,6 +13691,7 @@ IconUpArrow:
 Focus:          db 0
 Busy:           db 0
 UrlLen:         db 0
+UrlCursor:      db 0                    ; caret column inside UrlBuf, 0..UrlLen
 UrlBuf:         ds URL_MAX + 1          ; 96 chars + NUL
 
 ; Mouse state -- driven by PSG reg 14/15 via ports 0xA0/0xA1/0xA2. Port A

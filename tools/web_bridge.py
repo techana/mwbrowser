@@ -284,10 +284,11 @@ class BridgeSession:
     PAGE_BYTES = 1200
 
     def __init__(self, verbose: bool = False, simplify: bool = False,
-                 no_images: bool = False):
+                 no_images: bool = False, pagination: bool = False):
         self.verbose = verbose
         self.simplify = simplify
         self.no_images = no_images
+        self.pagination = pagination
         self._img_cache: dict[str, str] = {}
         self._current_base: str | None = None
         self._img_counter = 0
@@ -334,6 +335,13 @@ class BridgeSession:
         if target.lower().startswith(("http://", "https://")):
             return self._fetch_page(target)
 
+        # Bare hostname / path -- the user typed "frogfind.com" or
+        # "msx.org/foo" without a scheme. Prepend http:// and fetch.
+        # Reject anything that doesn't even contain a '.' (most
+        # mistypes / bookmarklets).
+        if "." in target or target.startswith("/"):
+            return self._fetch_page("http://" + target.lstrip("/"))
+
         return ("404", None)
 
     # -- HTML passthrough -------------------------------------------------
@@ -361,9 +369,13 @@ class BridgeSession:
         html = _decode_body(raw, content_type)
         body = self._rewrite_html(html).encode(WIRE_CHARSET, "replace")
         # Split the encoded body into PAGE_BYTES-sized chunks at safe
-        # tag boundaries. The first chunk goes out now, the rest sit in
-        # _pending_chunks for "GET MORE".
-        chunks = self._split_into_chunks(body, self.PAGE_BYTES)
+        # tag boundaries when --pagination is on; otherwise ship the
+        # whole body as one OK HTM frame. Chunking is opt-in because
+        # the chunk seams can split tags or links on hostile pages.
+        if self.pagination:
+            chunks = self._split_into_chunks(body, self.PAGE_BYTES)
+        else:
+            chunks = [body]
         self._pending_chunks = chunks
         self._page_total = len(chunks)
         self._page_served = 0
@@ -672,9 +684,10 @@ def _slow_send(conn: socket.socket, body: bytes, chunk: int = 64,
 
 def serve_forever(host: str, port: int, verbose: bool,
                   simplify: bool = False,
-                  no_images: bool = False) -> None:
+                  no_images: bool = False,
+                  pagination: bool = False) -> None:
     session = BridgeSession(verbose=verbose, simplify=simplify,
-                            no_images=no_images)
+                            no_images=no_images, pagination=pagination)
     srv = socket.socket()
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((host, port))
@@ -718,11 +731,17 @@ def main() -> int:
                          "MSX. Handy for test runs -- PCX encode + serial "
                          "transfer of an image costs real wall-clock time, "
                          "which drowns out the rest of the render timings.")
+    ap.add_argument("--pagination", action="store_true",
+                    help="Chunk the body into ~1.2 KB OK HTM frames at safe "
+                         "tag boundaries. Off by default because the chunk "
+                         "boundaries can break tags and links on some pages; "
+                         "enable when a page is too big to ship in one go.")
     args = ap.parse_args()
     try:
         serve_forever(args.host, args.port, args.verbose,
                       simplify=args.simplify,
-                      no_images=args.no_images)
+                      no_images=args.no_images,
+                      pagination=args.pagination)
     except KeyboardInterrupt:
         print("\nbye.")
         return 0
