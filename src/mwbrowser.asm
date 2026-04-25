@@ -9434,15 +9434,29 @@ TagCenter:
     ret
 
 TagHr:
-    ; Inside a <table>: TextY tracks per-cell layout via HtmlRowTopY,
-    ; not the document flow. Drawing the rule here would land on top
-    ; of the next <tr>'s text (mirror.aratab.com puts an <hr> in a
-    ; spanning <th> right above the data rows, which made the rule
-    ; cut through the first directory row). Silently skip.
+    ; Inside a <table> (e.g. <tr><th colspan="5"><hr></th></tr> as a
+    ; spacer row between the header and data rows): draw the rule at
+    ; HtmlRowTopY -- the document-flow EmitBlankLine + TextY+3 path
+    ; would land on top of the NEXT <tr>'s text, since TextY tracks
+    ; per-cell layout in table context, not row spacing. The row
+    ; itself still advances normally on its </tr>.
     ld      a, [HtmlInTable]
     or      a
+    jr      z, .hrBlock
+    ld      a, [HtmlLineSkip]
+    ld      b, a
+    ld      a, [HtmlLineSkip + 1]
+    or      b
     ret     nz
+    ld      a, [HtmlRowTopY]
+    add     a, 4                        ; middle of the 10-px row band
+    ld      c, a
+    ld      b, 0
+    ld      d, (CONTENT_X_END + 1) / 4
+    ld      a, COL_DGRAY
+    jp      DrawHLine
 
+.hrBlock:
     call    EmitBlankLine
     ; Only draw the rule when the current pen is actually inside the visible
     ; content band. When ScrollLine > 0 the first HR tags are above the top
@@ -11473,8 +11487,7 @@ NavigateToCurrentUrl:
     ld      [ScrollLine], hl
     call    ClearContentArea
     call    PrintFileContent
-    ld      hl, [HtmlLineCount]
-    ld      [TotalLines], hl
+    call    StoreTotalLinesWithPages
     call    ComputeThumb
     call    DrawScrollbar
     xor     a
@@ -11585,8 +11598,7 @@ ReloadCurrent:
     ld      [ScrollLine], hl
     call    ClearContentArea
     call    PrintFileContent
-    ld      hl, [HtmlLineCount]
-    ld      [TotalLines], hl
+    call    StoreTotalLinesWithPages
     call    ComputeThumb
     call    DrawScrollbar
     xor     a
@@ -11812,7 +11824,9 @@ PageDown:
     ; Already at the bottom of the buffered content. If the bridge
     ; has more pages waiting, pull one chunk, advance ScrollLine over
     ; the now-stale current viewport, and refresh. The render will
-    ; recount HtmlLineCount which we latch back into TotalLines.
+    ; recount HtmlLineCount which we latch back into TotalLines plus
+    ; the remaining-pages estimate so the scrollbar shrinks as we
+    ; fetch the rest of the document.
     call    TryFetchMore
     ret     c
     ld      hl, [ScrollLine]
@@ -11820,8 +11834,7 @@ PageDown:
     add     hl, bc
     ld      [ScrollLine], hl
     call    RefreshAfterScroll
-    ld      hl, [HtmlLineCount]
-    ld      [TotalLines], hl
+    call    StoreTotalLinesWithPages
     ret
 
 ; ScrollDown: if there's more content below the viewport, bump ScrollLine
@@ -11853,8 +11866,7 @@ ScrollDown:
     inc     hl
     ld      [ScrollLine], hl
     call    RefreshAfterScroll
-    ld      hl, [HtmlLineCount]
-    ld      [TotalLines], hl
+    call    StoreTotalLinesWithPages
     ret
 
 ; ============================================================================
@@ -13392,6 +13404,41 @@ RemoteLoadFile:
     call    SerialUnmaskVblank
     ld      a, 1
     ret                                  ; caller's 404 handler paints via DrawString
+
+; StoreTotalLinesWithPages: TotalLines = HtmlLineCount + (chunks the
+; bridge still has queued) * TEXT_MAX_LINES. The estimate lets the
+; scrollbar thumb size against the FULL document instead of just the
+; chunks already in FileBuf, so the user sees there's more to scroll
+; before the auto-MORE fetch fires. When SerialPage == SerialPageTotal
+; the multiplier collapses to 0 and TotalLines = HtmlLineCount exactly.
+StoreTotalLinesWithPages:
+    push    bc
+    push    de
+    ; remaining = SerialPageTotal - SerialPage  (0 when no more chunks)
+    ld      a, [SerialPageTotal]
+    ld      c, a
+    ld      a, [SerialPage]
+    cpl
+    add     a, 1                        ; A = -SerialPage
+    add     a, c                        ; A = remaining (>= 0 by construction)
+    ld      h, 0
+    ld      l, a                        ; HL = remaining
+    add     hl, hl                      ; *2
+    ld      d, h
+    ld      e, l                        ; DE = remaining * 2
+    add     hl, hl                      ; *4
+    ld      b, h
+    ld      c, l                        ; BC = remaining * 4
+    add     hl, hl                      ; *8
+    add     hl, hl                      ; *16
+    add     hl, bc                      ; *20
+    add     hl, de                      ; *22 (TEXT_MAX_LINES)
+    ld      de, [HtmlLineCount]
+    add     hl, de                      ; HL = HtmlLineCount + remaining*22
+    ld      [TotalLines], hl
+    pop     de
+    pop     bc
+    ret
 
 ; TryFetchMore: pulls the next paginated chunk from the bridge ("GET
 ; MORE\r\n"), appends the body to FileBuf at the current FileLen, and
