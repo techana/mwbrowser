@@ -12948,6 +12948,24 @@ SerialWriteR1:
 ; cartridge ROM leaves the receiver disabled so raw I/O code hangs on
 ; the first status poll. Sequence: three dummy writes to flush any
 ; pending mode-byte expectation, software reset, mode, command.
+; Generic MSX RS-232 cartridges put an i8253 timer at I/O 0x84..0x87
+; alongside the i8251 USART at 0x80..0x81. In theory, reprogramming
+; the timer's counters 0 (Rx clock) and 1 (Tx clock) for divisor 12
+; off the 115.2 kHz BCLK should yield 9600 baud when the 8251 mode
+; register selects the /1 prescale (see resources/openMSX RS-232
+; speed.md). In practice on openMSX, doing both made the 8251's
+; receiver hang -- the status-line "OK HTM ..." came back fine but
+; body bytes never arrived (RxRDY stayed low), even after slowing
+; the bridge to 32 B every 20 ms. Likely an emulation gap in how
+; openMSX wires the i8253 output to the 8251 BCLK input. So we keep
+; the BIOS default (1200 baud, mode /16), trade speed for
+; reliability, and let the pagination + page-on-demand fetch keep
+; per-fetch sizes manageable.
+;
+; If this gets revisited: try patching openMSX (or test on real
+; hardware where the timer cascade is real silicon).
+PIT_CTRL        equ 0x87                ; (kept for the future attempt)
+
 SerialInit:
     xor     a
     out     (UART_STATUS), a
