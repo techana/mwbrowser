@@ -11791,7 +11791,12 @@ PageUp:
 PAGE_SCROLL_STEP equ TEXT_MAX_LINES - 1
 
 PageDown:
-    ld      hl, [TotalLines]
+    ; Max-check uses HtmlLineCount (the real rendered line count of
+    ; what's currently in FileBuf) NOT TotalLines -- TotalLines is
+    ; inflated with the remaining-pages estimate so the scrollbar
+    ; thumb sizes the full document, but the scroll-clamp must stop
+    ; at the actual rendered tail or .pdMaybeFetch never fires.
+    ld      hl, [HtmlLineCount]
     ld      a, h
     or      l
     jr      z, .pdMaybeFetch            ; zero-line doc -> maybe MORE
@@ -11841,7 +11846,9 @@ PageDown:
 ; and refresh. Clamps at max(0, TotalLines - TEXT_MAX_LINES) so the
 ; viewport never bottoms out with a mostly-blank canvas.
 ScrollDown:
-    ld      hl, [TotalLines]
+    ; Same TotalLines-vs-HtmlLineCount distinction as PageDown -- the
+    ; clamp must use real rendered lines, not the inflated estimate.
+    ld      hl, [HtmlLineCount]
     ld      de, TEXT_MAX_LINES + 1
     and     a
     sbc     hl, de
