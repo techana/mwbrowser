@@ -277,11 +277,13 @@ def _pack_2bpp(im: "Image.Image") -> bytes:
 # ----------------------------------------------------------------------------
 
 class BridgeSession:
-    # Bytes the MSX side gets per OK HTM response. The Z80 parser is slow
-    # and the 8251 path can't move many KB without hiccupping, so we
-    # chunk everything and the browser asks "MORE" when it needs the
-    # next slab. Targets ~1 visible MSX viewport's worth of HTML.
-    PAGE_BYTES = 1200
+    # Bytes the MSX side gets per OK HTM response. Sized to fit ~1
+    # viewport (22 lines * 60 chars ≈ 1.3 KB of rendered text, plus
+    # ~80% HTML markup overhead). At openMSX's emulated ~120 B/s wire
+    # speed, 2400 B costs the user about 20 s for the first paint --
+    # not great, but the alternative (smaller chunks) leaves the page
+    # half-blank below the fold.
+    PAGE_BYTES = 2400
 
     def __init__(self, verbose: bool = False, simplify: bool = False,
                  no_images: bool = False, pagination: bool = False):
@@ -433,6 +435,29 @@ class BridgeSession:
         html = re.sub(r"(?is)<script\b[^>]*>.*?</script>", "", html)
         html = re.sub(r"(?is)<style\b[^>]*>.*?</style>", "", html)
         html = re.sub(r"(?is)<noscript\b[^>]*>.*?</noscript>", "", html)
+        # Drop HTML comments. The MSX parser doesn't render them, and
+        # they often hide entire blocks of dead markup that still
+        # consume wire budget.
+        html = re.sub(r"(?is)<!--.*?-->", "", html)
+        # Collapse runs of whitespace in TEXT positions to a single
+        # space; collapse multiple inter-tag newlines to one. The MSX
+        # renderer normalises whitespace anyway, so the source-side
+        # pretty-printing just wastes serial budget. Don't touch the
+        # contents of <pre> -- preserved whitespace matters there.
+        # Cheap heuristic: protect <pre>...</pre> blocks behind a
+        # placeholder, compress everything else, then restore.
+        pre_blocks: list[str] = []
+        def _stash_pre(m):
+            pre_blocks.append(m.group(0))
+            return f"\x00PRE{len(pre_blocks)-1}\x00"
+        html = re.sub(r"(?is)<pre\b.*?</pre>", _stash_pre, html)
+        # Strip whitespace-only runs between '>' and '<'.
+        html = re.sub(r">\s+<", "><", html)
+        # Collapse remaining consecutive whitespace to a single space.
+        html = re.sub(r"[ \t\r\n]{2,}", " ", html)
+        # Restore <pre>.
+        html = re.sub(r"\x00PRE(\d+)\x00",
+                      lambda m: pre_blocks[int(m.group(1))], html)
 
         # Simplify article-like pages via Readability, then splice any
         # <form> back in (Readability drops them as non-article chrome).

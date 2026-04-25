@@ -150,9 +150,10 @@ KEY_DOWN       equ 0x1F        ; 0x1F for down arrow
 KEY_LEFT       equ 0x1D        ; left arrow
 KEY_RIGHT      equ 0x1C        ; right arrow
 KEY_CLS        equ 0x0C        ; MSX CLS / Ctrl+L -- clears address bar
-KEY_F1         equ 0xF1        ; MSX F1 -> toolbar Back
-KEY_F2         equ 0xF2        ; MSX F2 -> toolbar Forward
-KEY_F3         equ 0xF3        ; MSX F3 -> clear address bar
+KEY_F1         equ 0xF1        ; MSX F1 -> About / help popup
+KEY_F2         equ 0xF2        ; MSX F2 -> toolbar Back
+KEY_F3         equ 0xF3        ; MSX F3 -> toolbar Forward
+KEY_F4         equ 0xF4        ; MSX F4 -> clear address bar
 KEY_F5         equ 0xF5        ; MSX F5 -> toolbar Refresh / Go
 
 ; ---- URL / file state ----
@@ -243,19 +244,21 @@ MainLoop:
     cp      KEY_STOP
     jp      z, DoGo
 
-    ; Function-key shortcuts (F1/F2/F3/F5) for Back / Forward / clear
-    ; address / Refresh. Fire the action straight from the global
-    ; dispatch -- skips the per-focus "Enter or Space" ceremony.
-    cp      KEY_F1
-    jp      z, DoBack
+    ; Function-key shortcuts: F2 Back, F3 Forward, F4 clear address,
+    ; F5 Refresh. F1 is About (handled above). Fired straight from the
+    ; global dispatch -- skips the per-focus "Enter or Space" ceremony.
     cp      KEY_F2
-    jp      z, DoForward
+    jp      z, DoBack
     cp      KEY_F3
-    jp      z, DoF3Clear
+    jp      z, DoForward
+    cp      KEY_F4
+    jp      z, DoF4Clear
     cp      KEY_F5
     jp      z, DoGo
 
-    cp      '?'                         ; "?" opens the About popup
+    ; About popup now lives behind F1 only -- '?' is a typeable URL
+    ; character (query strings!) so it can't double as a shortcut.
+    cp      KEY_F1
     jr      nz, .notOpenAbout
     call    OpenAbout
     jp      MainLoop
@@ -363,10 +366,10 @@ DoBack:
     call    GoBack
     jp      MainLoop
 
-; F3: clear the address bar from anywhere and shift focus to it so the
+; F4: clear the address bar from anywhere and shift focus to it so the
 ; user can immediately start typing a new URL without aiming the
 ; mouse. Same end state as Ctrl+L (KEY_CLS) but globally accessible.
-DoF3Clear:
+DoF4Clear:
     call    UrlClear
     ld      a, FOC_ADDRESS
     ld      [Focus], a
@@ -1202,6 +1205,11 @@ BindFnKeys:
     ld      [hl], a
     ld      hl, 0xF87F + 32             ; F3's slot
     ld      [hl], 0xF3
+    inc     hl
+    xor     a
+    ld      [hl], a
+    ld      hl, 0xF87F + 48             ; F4's slot
+    ld      [hl], 0xF4
     inc     hl
     xor     a
     ld      [hl], a
@@ -2864,6 +2872,8 @@ LINK_MAX        equ 8                   ; max <a> rects per rendered page
 LINK_URL_MAX    equ 95                  ; max chars per href (plus NUL); matches URL_MAX
 
 PrintFileContent:
+    ld      a, 4
+    ld      [LoadPhase], a              ; phase 4: parser entered
     ld      a, [FileLen]
     ld      b, a
     ld      a, [FileLen + 1]
@@ -3017,6 +3027,8 @@ PrintFileContent:
     call    ArFlush
     call    LineFlush
     call    FormEndRender               ; flip FormSticky on
+    ld      a, 5
+    ld      [LoadPhase], a              ; phase 5: parser hit EOF (render done)
     jp      SerialUnmaskVblank
 
 .tag:
@@ -6401,18 +6413,20 @@ TagArea:
     ld      a, [AreaCoords + 6]
     ld      [hl], a
 
-    ; Copy href into the slot's url buffer. Offset = index * (L+1).
+    ; Copy href into the slot's url buffer. Offset = index * (L+1)
+    ; = idx * 96 (LINK_URL_MAX = 95). Matches .apSlotOff below.
     ld      a, [PendingAreaCount]
     ld      l, a
     ld      h, 0
-    ld      d, h
-    ld      e, l
     add     hl, hl
     add     hl, hl
     add     hl, hl
     add     hl, hl
     add     hl, hl                      ; * 32
-    add     hl, de                      ; * 33 (LINK_URL_MAX = 32)
+    ld      d, h
+    ld      e, l                        ; DE = idx * 32
+    add     hl, hl                      ; * 64
+    add     hl, de                      ; * 96
     ld      de, PendingAreaUrl
     add     hl, de
     ex      de, hl                      ; DE = dest
@@ -6601,19 +6615,20 @@ AttachPendingAreas:
     ld      [PendingAreaCount], a
     ret
 
-; Helper: A -> HL = A * (LINK_URL_MAX + 1) = A * 33. Matches the
+; Helper: A -> HL = A * (LINK_URL_MAX + 1) = A * 96. Matches the
 ; stride used by TagA's url copy (see LINK_URL_MAX definition).
 .apSlotOff:
     ld      l, a
     ld      h, 0
-    ld      d, h
-    ld      e, l
     add     hl, hl
     add     hl, hl
     add     hl, hl
     add     hl, hl
     add     hl, hl                      ; * 32
-    add     hl, de                      ; * 33
+    ld      d, h
+    ld      e, l                        ; DE = idx * 32
+    add     hl, hl                      ; * 64
+    add     hl, de                      ; * 96
     ret
 
 ApIndex:     db 0
@@ -9476,17 +9491,20 @@ TagA:
 
     ; Copy HtmlCurHref into the slot's url buffer.
     ld      a, [LinkCount]
-    ; URL offset = LinkCount * (LINK_URL_MAX + 1). Multiply by 33 via adds.
+    ; URL offset = LinkCount * (LINK_URL_MAX + 1) = idx * 96.
+    ; idx*96 = idx*64 + idx*32. Cap is 8 slots, so the worst-case
+    ; product (7 * 96 = 672) fits in 16 bits easily.
     ld      l, a
     ld      h, 0
-    ld      d, h
-    ld      e, l
     add     hl, hl                      ; *2
     add     hl, hl                      ; *4
     add     hl, hl                      ; *8
     add     hl, hl                      ; *16
     add     hl, hl                      ; *32
-    add     hl, de                      ; *33
+    ld      d, h
+    ld      e, l                        ; DE = idx*32
+    add     hl, hl                      ; *64
+    add     hl, de                      ; *96
     ld      de, LinkUrls
     add     hl, de
     ex      de, hl                      ; DE = dest
@@ -11213,16 +11231,22 @@ CheckLinkHit:
 
 ; GetLinkUrlPtr: A = link index -> HL = pointer to url string in LinkUrls.
 GetLinkUrlPtr:
+    ; idx * (LINK_URL_MAX + 1) = idx * 96 = idx*64 + idx*32.
+    ; Bumped from the old idx*33 when LINK_URL_MAX rose 32 -> 95;
+    ; without this, slots stride 33 in a buffer the writer expects to
+    ; stride 96, so neighbouring URLs overwrite each other and clicks
+    ; navigate to garbage (404s on mirror.aratab.com etc).
     ld      l, a
     ld      h, 0
-    ld      d, h
-    ld      e, l
     add     hl, hl                      ; *2
     add     hl, hl                      ; *4
     add     hl, hl                      ; *8
     add     hl, hl                      ; *16
     add     hl, hl                      ; *32
-    add     hl, de                      ; *33 (LINK_URL_MAX + 1)
+    ld      d, h
+    ld      e, l                        ; DE = idx*32
+    add     hl, hl                      ; *64
+    add     hl, de                      ; *96
     ld      de, LinkUrls
     add     hl, de
     ret
@@ -11271,6 +11295,8 @@ NavigateAndFocusContent:
 ; it onto the ring-buffered history. Uses Busy to flip the toolbar to
 ; "stop" while the file is streaming in.
 NavigateToCurrentUrl:
+    ld      a, 1
+    ld      [LoadPhase], a                  ; phase 1: navigate started
     ld      a, 0xFF
     ld      [HtmlFocusLink], a
     call    FormReset                       ; new page -> rebuild form table fresh
@@ -11309,6 +11335,8 @@ NavigateToCurrentUrl:
     call    DrawScrollbar
     xor     a
     ld      [Busy], a
+    ld      a, 6
+    ld      [LoadPhase], a                  ; phase 6: navigate done
     jp      PaintToolbar
 
 .err:
@@ -12966,6 +12994,10 @@ RemoteGet:
     ; a dead / unplugged bridge doesn't hang the browser forever.
     call    SerialRead                  ; 'O' or 'E'
     jp      c, .rgFail
+    push    af
+    ld      a, 2
+    ld      [LoadPhase], a              ; phase 2: bridge talking back
+    pop     af
     cp      'E'
     jp      z, .rgDrainErr
     cp      'O'
@@ -13158,6 +13190,8 @@ RemoteLoadFile:
     jr      .rlfDrain
 .rlfDone:
     call    SerialUnmaskVblank
+    ld      a, 3
+    ld      [LoadPhase], a              ; phase 3: body fully streamed
     xor     a
     ret
 .rlfFail:
@@ -13310,8 +13344,8 @@ AboutLine2:     db 0x4D, 0x53, 0x58, 0x32, 0x20
                 db 0xA6, 0xD0, 0xE7, 0xA5, 0xD0, 0xE0, 0x20
                 db 0xAC, 0xC6, 0xB3, 0xA5, 0xCE, 0
 AboutLine3:     db "github.com/techana/mwbrowser", 0
-AboutLine4:     db "F1 Back  F2 Fwd  F5 Reload", 0
-AboutLine5:     db "F3 Clear  Stop Halt  Esc Quit", 0
+AboutLine4:     db "F1 Help  F2 Back  F3 Fwd", 0
+AboutLine5:     db "F4 Clear  F5 Reload  Stop Halt", 0
 AboutFooter:    db "v0.5 demo build", 0
 
 ; Screen-6 icon bitmaps (4 px/byte, 11=black, 01=bg/lgray).
@@ -13690,6 +13724,18 @@ IconUpArrow:
 ; Mutable state (initialised by InitState).
 Focus:          db 0
 Busy:           db 0
+; Phase marker the openMSX TCL polls to time the load->render pipeline.
+; Bumped at well-known points by NavigateToCurrentUrl / RemoteLoadFile /
+; PrintFileContent so an external observer can see "got status line"
+; vs "got body" vs "render done" without tracing every byte. Values:
+;   0 = idle
+;   1 = navigate started (UrlBuf locked in, Busy=1)
+;   2 = OK HTM header parsed (first useful bytes back from bridge)
+;   3 = body fully streamed into FileBuf
+;   4 = parser entered (PrintFileContent)
+;   5 = parser hit EOF (render done)
+;   6 = navigate done (toolbar repainted)
+LoadPhase:      db 0
 UrlLen:         db 0
 UrlCursor:      db 0                    ; caret column inside UrlBuf, 0..UrlLen
 UrlBuf:         ds URL_MAX + 1          ; 96 chars + NUL
