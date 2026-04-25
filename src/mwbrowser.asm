@@ -11782,11 +11782,11 @@ PageDown:
     ld      hl, [TotalLines]
     ld      a, h
     or      l
-    ret     z                           ; zero-line doc -> nothing to scroll
+    jr      z, .pdMaybeFetch            ; zero-line doc -> maybe MORE
     ld      de, TEXT_MAX_LINES + 1
     and     a
     sbc     hl, de
-    ret     c                           ; TotalLines <= TEXT_MAX_LINES
+    jr      c, .pdMaybeFetch            ; everything fits -> maybe MORE
     ; HL = TotalLines - TEXT_MAX_LINES - 1; add 1 back so HL = max ScrollLine.
     inc     hl
     ex      de, hl                      ; DE = max ScrollLine
@@ -11808,6 +11808,20 @@ PageDown:
     ld      [ScrollLine], hl
     jp      RefreshAfterScroll
 .pdAtMax:
+.pdMaybeFetch:
+    ; Already at the bottom of the buffered content. If the bridge
+    ; has more pages waiting, pull one chunk, advance ScrollLine over
+    ; the now-stale current viewport, and refresh. The render will
+    ; recount HtmlLineCount which we latch back into TotalLines.
+    call    TryFetchMore
+    ret     c
+    ld      hl, [ScrollLine]
+    ld      bc, PAGE_SCROLL_STEP
+    add     hl, bc
+    ld      [ScrollLine], hl
+    call    RefreshAfterScroll
+    ld      hl, [HtmlLineCount]
+    ld      [TotalLines], hl
     ret
 
 ; ScrollDown: if there's more content below the viewport, bump ScrollLine
@@ -11818,7 +11832,7 @@ ScrollDown:
     ld      de, TEXT_MAX_LINES + 1
     and     a
     sbc     hl, de
-    ret     c                           ; everything fits
+    jr      c, .sdAtMax                 ; everything fits -> maybe MORE on bridge?
     inc     hl                          ; HL = max ScrollLine
     ex      de, hl                      ; DE = max ScrollLine
     ld      hl, [ScrollLine]
@@ -11830,6 +11844,17 @@ ScrollDown:
     ld      [ScrollLine], hl
     jp      RefreshAfterScroll
 .sdAtMax:
+    ; Bottom of buffered content. If the bridge has more pages queued,
+    ; pull the next chunk, advance ScrollLine over the fresh content,
+    ; and re-render. Otherwise this is genuinely the end of the doc.
+    call    TryFetchMore
+    ret     c
+    ld      hl, [ScrollLine]
+    inc     hl
+    ld      [ScrollLine], hl
+    call    RefreshAfterScroll
+    ld      hl, [HtmlLineCount]
+    ld      [TotalLines], hl
     ret
 
 ; ============================================================================
@@ -13349,6 +13374,84 @@ RemoteLoadFile:
     call    SerialUnmaskVblank
     ld      a, 1
     ret                                  ; caller's 404 handler paints via DrawString
+
+; TryFetchMore: pulls the next paginated chunk from the bridge ("GET
+; MORE\r\n"), appends the body to FileBuf at the current FileLen, and
+; bumps FileLen. Returns CF=0 on success (new bytes appended), CF=1
+; when there's nothing more to fetch (only one page on the server,
+; already at the last page, or the bridge has no remote session).
+; Caller is responsible for re-rendering after a successful append.
+RgMore:         db "MORE", 0
+TryFetchMore:
+    ; Bail if we're not in a remote session at all (local file load).
+    ld      a, [IsRemoteSession]
+    or      a
+    jp      z, .tfmNone
+
+    ; Bail if we've already pulled the last page.
+    ld      a, [SerialPage]
+    ld      b, a
+    ld      a, [SerialPageTotal]
+    cp      b
+    jp      z, .tfmNone                  ; SerialPage == total -> done
+    jp      c, .tfmNone                  ; SerialPage > total (paranoia)
+
+    call    SerialMaskVblank
+    ld      hl, RgMore
+    call    RemoteGet
+    jp      c, .tfmFail
+    ld      a, [SerialKind]
+    cp      1
+    jp      nz, .tfmFail
+
+    ; Cap the chunk against remaining FileBuf headroom so a runaway
+    ; bridge can't blow past FILE_BUF_SIZE.
+    ld      hl, FILE_BUF_SIZE
+    ld      de, [FileLen]
+    and     a
+    sbc     hl, de                       ; HL = remaining bytes
+    ld      de, [SerialLen]
+    push    hl
+    sbc     hl, de                       ; HL = remaining - SerialLen
+    pop     hl
+    jr      nc, .tfmReadAll              ; remaining >= SerialLen
+    ; clamp SerialLen to remaining
+    ld      [SerialLen], hl
+.tfmReadAll:
+    ld      bc, [SerialLen]
+    ld      hl, FileBuf
+    ld      de, [FileLen]
+    add     hl, de
+    ex      de, hl                       ; DE = FileBuf + FileLen
+.tfmBody:
+    ld      a, b
+    or      c
+    jr      z, .tfmAppendDone
+    push    bc
+    push    de
+    call    SerialRead
+    pop     de
+    pop     bc
+    jr      c, .tfmFail
+    ld      [de], a
+    inc     de
+    dec     bc
+    call    BusyHeartbeat
+    jr      .tfmBody
+.tfmAppendDone:
+    ; FileLen += SerialLen
+    ld      hl, [FileLen]
+    ld      de, [SerialLen]
+    add     hl, de
+    ld      [FileLen], hl
+    call    SerialUnmaskVblank
+    and     a                            ; CF=0 -> appended
+    ret
+.tfmFail:
+    call    SerialUnmaskVblank
+.tfmNone:
+    scf
+    ret
 
 ; RemoteImgOpen: filename is in ImgNameBuf. Expects OK PCX; saves body
 ; length into ImgBytesLeft so ImgStreamByte can pull from the UART.
