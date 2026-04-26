@@ -72,31 +72,22 @@ except Exception as _e:
     print("Warning: cairosvg installed but failed to load ({}); "
           "SVG conversion disabled.".format(_e))
 
-try:
-    from selenium import webdriver
-    from selenium.webdriver.chrome.options import Options as ChromeOptions
-    from selenium.webdriver.chrome.service import Service as ChromeService
-    HAS_SELENIUM = True
-except ImportError:
-    HAS_SELENIUM = False
-    print("Warning: Selenium not installed — screenshots disabled.")
-
-try:
-    from webdriver_manager.chrome import ChromeDriverManager
-    from webdriver_manager.core.os_manager import ChromeType
-    HAS_WDM = True
-except ImportError:
-    HAS_WDM = False
+# Selenium / headless Chrome support has been removed in the MSX
+# fork: we never produce screenshots and the JS-render fallback isn't
+# reachable from the MSX-side wire protocol. Stub the flags so the
+# upstream code paths that test HAS_SELENIUM short-circuit cleanly.
+HAS_SELENIUM = False
+HAS_WDM = False
 
 # ── Configuration ──────────────────────────────────────────────────────────
 PORT               = 8888
 FETCH_TIMEOUT      = 20
-MAX_IMG_W          = 640
-MAX_IMG_H          = 480
+# MSX content area is 492 x 366 source pixels (Screen-6, 2:1 vertical
+# pair). Pre-resize images to fit before PCX conversion so the on-MSX
+# decoder doesn't see oversize headers.
+MAX_IMG_W          = 492
+MAX_IMG_H          = 366
 MAX_HISTORY        = 30
-SCREENSHOT_W       = 800
-SCREENSHOT_H       = 600
-SCREENSHOT_QUALITY = 70     # JPEG quality (1-100)
 
 def _detect_lan_ip():
     """Detect the server's LAN IP for use when browsers omit Host header."""
@@ -3858,7 +3849,11 @@ def _is_arabic_page(url):
 
 
 # ── Landing page logo (generated once at startup) ────────────────────────
-_LOGO_GIF = b""  # populated by _generate_logo()
+_LOGO_GIF = b""  # populated by _generate_logo() -- still kept for callers
+                 # outside the MSX path; the MSX landing page uses _LOGO_PCX.
+_LOGO_PCX = b""  # populated by _generate_logo() once the PCX encoder lands;
+                 # for now an empty bytes object so /wb-logo.pcx returns a
+                 # 404 instead of NameError-ing.
 
 def _generate_logo():
     """Load the logo GIF from disk (wb-logo.gif next to this script)."""
@@ -3875,91 +3870,53 @@ def _generate_logo():
 
 
 def _landing_html(ip, user_agent=""):
-    legacy_os = _detect_legacy_os(user_agent)
+    """Minimal HTML-2 landing page for the MSX browser.
+
+    The CP-1256 hidden field, legacy-OS Arabic warning and Windows 3.x
+    charset workaround are gone — the on-MSX renderer eats ISO-8859-6
+    / ASCII directly. Logo is served as 2-bpp PCX from /wb-logo.pcx so
+    the MSX can decode it natively without a JPEG round-trip.
+    The user_agent argument is preserved for call-site compatibility."""
     hist_opts = _history_options(ip)
     hist_html = ""
     if hist_opts:
         hist_html = (
             '  <tr>\n'
-            '    <td><font face="Arial,Helvetica" size="2"><b>History:</b></font></td>\n'
+            '    <td><b>History:</b></td>\n'
             '    <td><select name="hist"><option value="">-- choose --</option>'
             '{}</select></td>\n'
             '  </tr>\n'.format(hist_opts)
         )
-    meta_charset = ""
-    cp1256_hidden = ""
-    if legacy_os == "Windows 3.x":
-        # IE5 on Windows 3.x shows blank pages with Arabic default encoding;
-        # force Western charset to work around the bug.
-        meta_charset = \
-            '\n<meta http-equiv="Content-Type" content="text/html; charset=iso-8859-1">'
-    elif legacy_os:
-        meta_charset = \
-            '\n<meta http-equiv="Content-Type" content="text/html; charset=windows-1256">'
-        cp1256_hidden = '\n  <input type="hidden" name="cp1256" value="1">'
-    arabic_warning = ""
     return """\
-<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2 Final//EN">
+<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 2.0//EN">
 <html>
-<head><title>Web Bridge for Old Browsers</title>{meta_charset}</head>
-<body bgcolor="#d1d1d1" text="#000000" link="#000080" vlink="#800080">
-<br><br>
+<head><title>MSX Web Bridge</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8"></head>
+<body bgcolor="#ffffff" text="#000000" link="#000080" vlink="#800080">
 <center>
-<table width="440" border="2" cellpadding="0" cellspacing="2">
-<tr><td>
-<table width="100%" border="0">
-<tr><td align="center" bgcolor="#d1d1d1">
-  <img src="/wb-logo.gif" width="440" height="110" border="0"
-       alt="Web Bridge for classic browsers">
-</td></tr>
-<tr><td bgcolor="#ffffff">
-  <br>
-  <font face="Arial,Helvetica,sans-serif" size="2">
-    Search for something, type a web address, or pick from the history list.
-    <br><br>
-  </font>
-  <form method="GET" action="/get">
-  <input type="hidden" name="typed" value="1">{cp1256_hidden}
-  <table border="0" cellpadding="4" cellspacing="0">
-  <tr>
-    <td><font face="Arial,Helvetica" size="2"><b>Navigate:</b></font></td>
-    <td><input type="text" name="url" size="50" value=""></td>
-  </tr>
-{hist_html}\
-  <tr>
-    <td colspan="2" align="right">
-      <input type="submit" value="  Go  ">
-    </td>
-  </tr>
-  </table>
-  </form>
-</td></tr>
-</table>
-</td></tr>
-</table>
-<br>
-<font face="Arial,Helvetica,sans-serif" size="2" color="#666666">
-  Strips JavaScript * CSS * Video * SVG * Modern layout
-  -- Returns HTML&nbsp;3.2
-</font>
+<img src="/wb-logo.pcx" alt="MSX Web Bridge">
 <br><br>
-<table width="440" border="0" cellpadding="6" cellspacing="0">
-<tr><td>
-<font face="Arial,Helvetica,sans-serif" size="1" color="#cc0000">
-  <b>Warning:</b> This web bridge fetches and processes remote web pages
-  on your behalf.  Do not expose it to the open internet --
-  it could be abused to access internal networks, consume
-  excessive bandwidth and CPU, or relay malicious content.
-  Run it only on a trusted local network.
-</font>
-</td></tr>
+<form method="GET" action="/get">
+<input type="hidden" name="typed" value="1">
+<table border="0" cellpadding="4" cellspacing="0">
+<tr>
+  <td><b>Navigate:</b></td>
+  <td><input type="text" name="url" size="40" value=""></td>
+</tr>
+{hist_html}\
+<tr>
+  <td colspan="2" align="right">
+    <input type="submit" value="  Go  ">
+  </td>
+</tr>
 </table>
-{arabic_warning}
+</form>
+<br>
+<small>Strips JavaScript, CSS, video, SVG, modern layout. Returns HTML&nbsp;2.</small>
 </center>
 </body>
 </html>
-""".format(meta_charset=meta_charset, cp1256_hidden=cp1256_hidden,
-           hist_html=hist_html, arabic_warning=arabic_warning)
+""".format(hist_html=hist_html)
 
 
 # ── Error page ─────────────────────────────────────────────────────────────
@@ -3986,7 +3943,18 @@ def _page_shell(title, current_url, content_html, proxy_host,
                 is_rtl=False, cp1256=False, client_ip="",
                 body_bg_img=None, body_bgcolor=None, body_attrs=None,
                 client_ua="", reader=False):
-    escaped_url = current_url.replace('"', "%22").replace("'", "%27")
+    """Wrap the simplified <body> in a minimal HTML 2-friendly shell.
+
+    The original upstream shell painted a chrome row (address bar,
+    history dropdown, CP-1256 / Reader / Screenshot toggles) above
+    every proxied page. The MSX renderer paints its own toolbar in
+    VRAM and has no use for that chrome — it just steals viewport
+    rows. The shell is now title + body only; navigation / mode
+    toggles live on the MSX side.
+
+    The cp1256, client_ip, client_ua, hist_select, reader_checked
+    arguments are kept in the signature so existing call-sites
+    don't have to change in lock-step; they're ignored."""
     safe_title = (
         title
         .replace("&", "&amp;")
@@ -3994,271 +3962,40 @@ def _page_shell(title, current_url, content_html, proxy_host,
         .replace(">", "&gt;")
     )
     if is_rtl:
-        html_dir    = ' dir="rtl"'
-        body_dir    = ' dir="rtl"'
-        content_dir = ' dir="rtl" align="right"'
+        html_dir = ' dir="rtl"'
+        body_dir = ' dir="rtl"'
     else:
-        html_dir    = ''
-        body_dir    = ''
-        content_dir = ''
-    hist_opts = _history_options(client_ip)
-    hist_select = ""
-    if hist_opts:
-        hist_select = (
-            ' <select name="hist"><option value="">recent...</option>'
-            '{}</select>'.format(hist_opts)
-        )
-    cp_checked = " checked" if cp1256 else ""
-    reader_checked = " checked" if reader else ""
-    meta_charset = ""
-    _is_win3x = _detect_legacy_os(client_ua) == "Windows 3.x"
-    if cp1256 and not _is_win3x:
-        meta_charset = '\n    <meta http-equiv="Content-Type" content="text/html; charset=windows-1256">'
-    elif _is_win3x:
-        # IE5 on Windows 3.x shows blank pages with Arabic/non-Western
-        # default encoding; force Western charset to work around the bug.
-        meta_charset = '\n    <meta http-equiv="Content-Type" content="text/html; charset=iso-8859-1">'
+        html_dir = ''
+        body_dir = ''
     return """\
-<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2 Final//EN">
+<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 2.0//EN">
 <html{html_dir}>
 <head>
-<title>{title} -- Web Bridge</title>{meta_charset}
+<title>{title}</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
 </head>
-<body bgcolor="{body_bgcolor}" text="{body_text}" link="{body_link}" vlink="{body_vlink}" alink="{body_alink}" topmargin="0" marginheight="0"{body_bg}{body_dir}>
-
-<table width="100%" border="0" cellpadding="3" cellspacing="0" bgcolor="#c0c0c0" dir="ltr">
-<tr>
-<td>
-  <form method="GET" action="/get" style="margin: 0;">
-  <input type="hidden" name="typed" value="1">
-  <input type="text" name="url" value="{url}" size="40" dir="ltr">{hist_select}
-  <input type="submit" value="Web Bridge">
-  <font face="Arial,Helvetica" size="1">
-  <input type="checkbox" name="cp1256" value="1"{cp_checked}> CP-1256
-  &nbsp;
-  <input type="checkbox" name="reader" value="1"{reader_checked}> Reader</font>
-  </form>
-</td>
-<td nowrap>
-  <form method="GET" action="/screenshot" style="margin: 0;">
-  <input type="hidden" name="url" value="{url}">
-  <font face="Arial,Helvetica" size="1">
-  <select name="res">
-  <option value="">Screenshot...</option>
-  <option value="640x480">640x480</option>
-  <option value="800x600">800x600</option>
-  <option value="1024x768">1024x768</option>
-  <option value="1280x1024">1280x1024</option>
-  <option value="1600x1200">1600x1200</option>
-  </select>
-  <input type="submit" value="&gt;">
-  </font>
-  </form>
-</td>
-<td align="right" valign="top" nowrap>
-  &nbsp;
-  <a href="http://{proxy_host}/"><font face="Arial,Helvetica" size="1">[ Home ]</font></a>
-  &nbsp;
-</td>
-</tr>
-</table>
-
-
+<body bgcolor="{body_bgcolor}" text="{body_text}" link="{body_link}" vlink="{body_vlink}"{body_bg}{body_dir}>
 {content}
-
 </body>
 </html>
-""".format(title=safe_title, url=escaped_url, content=content_html,
+""".format(title=safe_title, content=content_html,
            html_dir=html_dir, body_dir=body_dir,
            body_bgcolor=body_bgcolor or "#ffffff",
            body_text=(body_attrs or {}).get("text", "#000000"),
            body_link=(body_attrs or {}).get("link", "#0000cc"),
            body_vlink=(body_attrs or {}).get("vlink", "#551a8b"),
-           body_alink=(body_attrs or {}).get("alink", "#ff0000"),
-           body_bg=' background="{}"'.format(body_bg_img) if body_bg_img else "",
-           hist_select=hist_select, cp_checked=cp_checked,
-           reader_checked=reader_checked,
-           proxy_host=proxy_host, meta_charset=meta_charset)
+           body_bg=' background="{}"'.format(body_bg_img) if body_bg_img else "")
 
 
-# ── Headless Chrome driver factory ────────────────────────────────────────
-
-def _make_chrome_driver(opts):
-    """Construct a webdriver.Chrome with the most-likely-to-work driver
-    resolver, then progressively fall back.
-
-    Order:
-      1. Selenium Manager (built into Selenium >= 4.6).  No service
-         argument → Selenium auto-downloads a matching chromedriver.
-         Works for both Chrome and Chromium installs.
-      2. webdriver-manager with Chromium-typed lookup (legacy path).
-         Newer Chrome-for-Testing endpoints sometimes return None for
-         Chromium-type entries, in which case .install() raises
-         AttributeError("'NoneType' object has no attribute 'get'") —
-         we catch and try the next path.
-      3. webdriver-manager default lookup (Chrome-type).
-      4. Plain ChromeService() — relies on chromedriver in PATH.
-
-    The first attempt that returns a driver wins.  If all fail, the
-    last exception is re-raised so the caller's logging path can
-    surface it."""
-    last_exc = None
-    # 1. Selenium Manager — modern Selenium handles this transparently
-    try:
-        return webdriver.Chrome(options=opts)
-    except Exception as exc:
-        last_exc = exc
-    if HAS_WDM:
-        # 2. webdriver-manager, Chromium type
-        try:
-            svc = ChromeService(ChromeDriverManager(
-                chrome_type=ChromeType.CHROMIUM).install())
-            return webdriver.Chrome(service=svc, options=opts)
-        except Exception as exc:
-            last_exc = exc
-        # 3. webdriver-manager, default (Chrome) type
-        try:
-            svc = ChromeService(ChromeDriverManager().install())
-            return webdriver.Chrome(service=svc, options=opts)
-        except Exception as exc:
-            last_exc = exc
-    # 4. Plain — rely on chromedriver in PATH
-    try:
-        return webdriver.Chrome(service=ChromeService(), options=opts)
-    except Exception as exc:
-        last_exc = exc
-    raise last_exc
-
-
-# ── Screenshot ─────────────────────────────────────────────────────────────
-
-def _take_screenshot(url, width=SCREENSHOT_W, height=SCREENSHOT_H):
-    """Launch headless Chromium, navigate to url, return JPEG bytes."""
-    opts = ChromeOptions()
-    opts.add_argument("--headless=new")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--disable-gpu")
-    opts.add_argument("--window-size={},{}".format(width, height))
-
-    driver = _make_chrome_driver(opts)
-    try:
-        driver.set_page_load_timeout(FETCH_TIMEOUT)
-        driver.get(url)
-        png_bytes = driver.get_screenshot_as_png()
-    finally:
-        driver.quit()
-
-    # Convert PNG → JPEG (smaller, universally supported by old browsers)
-    img = Image.open(io.BytesIO(png_bytes))
-    img = img.convert("RGB")
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=SCREENSHOT_QUALITY)
-    return buf.getvalue()
-
-
-# ── Image proxy ────────────────────────────────────────────────────────────
-
-# Hosts whose image URLs reject plain `requests` (typically because Akamai /
-# Cloudflare bot-fingerprinting blocks Python's TLS handshake from non-Saudi
-# IPs).  For these, fetch images via the same headless Chromium that already
-# renders the parent page — same TLS fingerprint, same session.
-_SELENIUM_IMAGE_HOSTS = frozenset({
-    "saudiexchange.sa", "www.saudiexchange.sa",
-})
-
-# Per-origin shared driver pool — one persistent headless Chromium per
-# distinct origin, reused across image fetches so we don't pay the
-# 2-3 s startup cost per image.  Drivers live until process exit.
-_image_driver_pool = {}              # origin → webdriver.Chrome
-_image_driver_lock = threading.Lock()
-
-# JS run inside the driver to fetch a URL and return its bytes as a
-# base64 string.  Uses FileReader.readAsDataURL so it works for any size
-# blob (no JS string-build overflow).
-_SE_FETCH_JS = """
-const url = arguments[0];
-const cb = arguments[arguments.length - 1];
-fetch(url, {credentials: "include"}).then(r => {
-    const ctype = r.headers.get("content-type") || "";
-    return r.blob().then(blob => {
-        const fr = new FileReader();
-        fr.onloadend = () => {
-            const s = fr.result;
-            const c = s.indexOf(",");
-            cb({ok: r.ok, status: r.status, ctype: ctype,
-                body: c >= 0 ? s.slice(c + 1) : ""});
-        };
-        fr.onerror = () => cb({ok: false, error: "FileReader error"});
-        fr.readAsDataURL(blob);
-    });
-}).catch(e => cb({ok: false, error: String(e)}));
-"""
+# Selenium-fetched images and headless screenshot helpers were removed
+# along with the rest of the Chrome integration. We expose harmless
+# stubs so any leftover references (e.g. inside _serve_page below)
+# resolve to a no-op rather than NameError.
+_SELENIUM_IMAGE_HOSTS = frozenset()
 
 
 def _selenium_fetch_image(url):
-    """Fetch `url` from inside a headless Chromium scoped to the same
-    origin.  Returns (bytes, content_type).  Raises on failure.
-
-    A driver is created lazily per-origin and reused for every
-    subsequent call to that origin.  The driver navigates to the
-    origin's root page once so the fetch() call below runs same-origin
-    (cookies, CSP) instead of opaque-origin from data:."""
-    if not HAS_SELENIUM:
-        raise RuntimeError("Selenium not available")
-    parsed = urlparse(url)
-    origin = "{}://{}".format(parsed.scheme, parsed.hostname)
-    with _image_driver_lock:
-        driver = _image_driver_pool.get(origin)
-        if driver is None:
-            opts = ChromeOptions()
-            opts.add_argument("--headless=new")
-            opts.add_argument("--no-sandbox")
-            opts.add_argument("--disable-dev-shm-usage")
-            opts.add_argument("--disable-gpu")
-            opts.add_argument("--window-size=400,300")
-            opts.add_argument(
-                "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64;"
-                " x64) AppleWebKit/537.36 (KHTML, like Gecko)"
-                " Chrome/120.0.0.0 Safari/537.36")
-            driver = _make_chrome_driver(opts)
-            driver.set_page_load_timeout(FETCH_TIMEOUT + 10)
-            driver.set_script_timeout(FETCH_TIMEOUT + 10)
-            try:
-                driver.get(origin + "/")
-            except Exception:
-                # Navigation timeout is fine — the page has loaded enough
-                # to give us a same-origin context for fetch().
-                pass
-            _image_driver_pool[origin] = driver
-            print("  [Selenium-img] driver ready for {}".format(origin),
-                  flush=True)
-        try:
-            result = driver.execute_async_script(_SE_FETCH_JS, url)
-        except Exception:
-            # Driver may be wedged — drop it so the next call rebuilds.
-            try:
-                driver.quit()
-            except Exception:
-                pass
-            _image_driver_pool.pop(origin, None)
-            raise
-    if not result:
-        raise RuntimeError("Selenium image fetch returned no result")
-    if not result.get("ok"):
-        # Surface enough to diagnose: HTTP status from upstream, JS error, or
-        # both.  Akamai-on-non-Saudi-IP returns 403 here too, in which case
-        # there's nothing the bridge can do — the host needs a Saudi egress.
-        err = result.get("error")
-        status = result.get("status")
-        if err:
-            raise RuntimeError("Selenium image fetch error: {}".format(err))
-        raise RuntimeError(
-            "Selenium image fetch HTTP {}".format(status or "?"))
-    import base64 as _b64
-    raw = _b64.b64decode(result.get("body", "") or "")
-    ctype = (result.get("ctype") or "image/jpeg").split(";")[0].strip()
-    return raw, ctype
+    raise RuntimeError("Selenium image fetch is not available in MSX fork")
 
 
 # Pre-compiled patterns for the SVG white-fill recolor pass.  Operates
@@ -4540,50 +4277,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path   = parsed.path
         params = urllib.parse.parse_qs(parsed.query)
 
-        # CP-1256 form encoding: when a page was served as CP-1256, the
-        # browser encodes ALL form submissions (GET query strings AND POST
-        # bodies) in CP-1256.  parse_qs defaults to UTF-8, which turns
-        # the CP-1256 bytes into U+FFFD replacement characters.
-        # Detect cp1256=1 in the raw query and re-parse if needed.
-        # Also detect legacy OS browsers that may send CP-1256 without
-        # the explicit flag (e.g. YouTube search form on auto-detected
-        # CP-1256 pages).
-        _force_cp1256 = "cp1256=1" in parsed.query
-        if not _force_cp1256:
-            client_ua = self.headers.get("User-Agent", "")
-            if _detect_legacy_os(client_ua):
-                # Check if the query string has non-UTF-8 percent-encoded
-                # bytes (high bytes 0x80-0xFF that don't form valid UTF-8)
-                try:
-                    urllib.parse.unquote(parsed.query, encoding="utf-8",
-                                        errors="strict")
-                except (UnicodeDecodeError, ValueError):
-                    _force_cp1256 = True
-        if _force_cp1256:
-            params = urllib.parse.parse_qs(parsed.query, encoding="cp1256")
+        # CP-1256 detection (legacy-OS, /p1/, /r1/) was removed in the
+        # MSX fork: the on-MSX renderer eats ISO-8859-6 / ASCII, and we
+        # transcode at the wire boundary rather than serving CP-1256 to
+        # the browser. parse_qs defaults to UTF-8 which is what every
+        # remaining caller expects.
 
         # For POST requests, merge body parameters into params
         if self.command == "POST":
             try:
                 length = int(self.headers.get("Content-Length", 0))
                 raw_body = self.rfile.read(length)
-                # If cp1256 mode is active or Content-Type says so,
-                # decode body as CP-1256.  Check both the query string
-                # AND the raw POST body for cp1256=1 (the hidden field
-                # may be in the body when the form method is POST).
-                is_cp1256 = (b"cp1256=1" in raw_body
-                             or "cp1256=1" in parsed.query)
-                # The POST body is ASCII with percent-encoded values.
-                # parse_qs URL-decodes %XX sequences and interprets the
-                # resulting bytes using its encoding parameter.  When
-                # CP-1256 is active the browser percent-encodes CP-1256
-                # bytes, so we must tell parse_qs to decode them as
-                # CP-1256, not UTF-8.
                 body = raw_body.decode("ascii", errors="replace")
-                if is_cp1256:
-                    post_params = urllib.parse.parse_qs(body, encoding="cp1256")
-                else:
-                    post_params = urllib.parse.parse_qs(body)
+                post_params = urllib.parse.parse_qs(body)
                 for k, v in post_params.items():
                     if k in params:
                         params[k].extend(v)
@@ -4598,18 +4304,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "Host", "{}:{}".format(SERVER_IP, PORT))
 
         if path == "/":
-            client_ua = self.headers.get("User-Agent", "")
-            landing = _landing_html(self.client_address[0], client_ua)
-            if _detect_legacy_os(client_ua):
-                self._send(200, "text/html; charset=windows-1256",
-                           landing.encode("cp1256", errors="xmlcharrefreplace"))
-            else:
-                self._send(200, "text/html; charset=utf-8",
-                           landing.encode("utf-8"))
+            landing = _landing_html(self.client_address[0])
+            self._send(200, "text/html; charset=utf-8",
+                       landing.encode("utf-8"))
 
-        elif path == "/wb-logo.gif":
-            if _LOGO_GIF:
-                self._send(200, "image/gif", _LOGO_GIF)
+        elif path == "/wb-logo.pcx":
+            # Landing-page logo as 2-bpp PCX (492 px wide max, four-colour
+            # palette matching the on-MSX UI). PCX bytes are pre-rendered
+            # at startup; falls through to a tiny placeholder when the
+            # source GIF couldn't be loaded.
+            if _LOGO_PCX:
+                self._send(200, "image/x-pcx", _LOGO_PCX)
             else:
                 self._send(404, "text/plain", b"logo not available")
 
@@ -4658,34 +4363,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             typed = params.get("typed", [""])[0]
             if typed == "1" and not from_history and not is_search:
                 _get_history(self.client_address[0]).add(url)
-            # CP-1256: explicit checkbox, forced by encoding detection,
-            # or auto-detect (legacy OS + Arabic URL)
-            use_cp1256 = (params.get("cp1256", [""])[0] == "1"
-                          or _force_cp1256)
-            if not use_cp1256:
-                client_ua = self.headers.get("User-Agent", "")
-                if _detect_legacy_os(client_ua) and _is_arabic_page(url):
-                    use_cp1256 = True
+            # Reader mode is opt-in via a future MSX-side toggle; for
+            # now it stays off by default and the caller can flip it on
+            # by appending &reader=1 to the URL. We don't expose a
+            # checkbox in the HTML chrome any more.
             use_reader = params.get("reader", [""])[0] == "1"
-            self._serve_page(url, proxy_host, use_cp1256,
+            self._serve_page(url, proxy_host, False,
                              post_data=post_data, reader=use_reader)
 
-        elif path.startswith("/r/") or path.startswith("/r1/"):
-            # /r/http://…  — Reader mode: force Mozilla Readability extraction
-            # /r1/http://… — Reader mode, CP-1256 encoding
-            if path.startswith("/r1/"):
-                url = self.path[4:]
-                use_cp1256 = True
-                try:
-                    url = url.encode("latin-1").decode("cp1256")
-                except (UnicodeDecodeError, UnicodeEncodeError):
-                    pass
-            else:
-                url = self.path[3:]
-                use_cp1256 = False
-                client_ua = self.headers.get("User-Agent", "")
-                if _detect_legacy_os(client_ua) and _is_arabic_page(url):
-                    use_cp1256 = True
+        elif path.startswith("/r/"):
+            # /r/http://… — Reader mode: force Mozilla Readability
+            # extraction. The /r1/ CP-1256 variant has been removed.
+            url = self.path[3:]
             if not url:
                 self._send(302, location="/")
                 return
@@ -4693,30 +4382,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 url = "https://" + url
             url = _google_to_ddg(url)
             url = _resolve_ddg_redirect(url)
-            self._serve_page(url, proxy_host, use_cp1256, reader=True)
+            self._serve_page(url, proxy_host, False, reader=True)
 
-        elif path.startswith("/p/") or path.startswith("/p1/"):
-            # /p/http://…  — path-based proxy link (no %-encoding)
-            # /p1/http://… — same but with CP-1256 mode enabled
-            if path.startswith("/p1/"):
-                url = self.path[4:]      # everything after "/p1/"
-                use_cp1256 = True
-                # The page was served as CP-1256, so the browser sends
-                # Arabic chars as CP-1256 bytes.  Python's HTTP server
-                # decodes the request line as Latin-1, so we must
-                # reverse that: encode back to Latin-1 (raw bytes),
-                # then decode as CP-1256 to recover proper Unicode.
-                try:
-                    url = url.encode("latin-1").decode("cp1256")
-                except (UnicodeDecodeError, UnicodeEncodeError):
-                    pass
-            else:
-                url = self.path[3:]      # everything after "/p/"
-                use_cp1256 = False
-                # Auto-detect: legacy OS + Arabic page → CP-1256
-                client_ua = self.headers.get("User-Agent", "")
-                if _detect_legacy_os(client_ua) and _is_arabic_page(url):
-                    use_cp1256 = True
+        elif path.startswith("/p/"):
+            # /p/http://… — path-based proxy link (no %-encoding).
+            # The /p1/ CP-1256 variant has been removed.
+            url = self.path[3:]
             if not url:
                 self._send(302, location="/")
                 return
@@ -4724,7 +4395,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 url = "https://" + url
             url = _google_to_ddg(url)
             url = _resolve_ddg_redirect(url)
-            self._serve_page(url, proxy_host, use_cp1256)
+            self._serve_page(url, proxy_host, False)
 
         elif path.startswith("/svg/"):
             # /svg/<hash>.jpg — serve rasterized inline SVG from cache.
@@ -4772,37 +4443,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._send(404, "text/plain; charset=utf-8", b"No URL")
                 return
             self._serve_image(url)
-
-        elif path == "/screenshot":
-            url = params.get("url", [""])[0].strip()
-            if not url:
-                self._send(404, "text/plain; charset=utf-8", b"No URL")
-                return
-            if not HAS_SELENIUM:
-                body = _error_page(
-                    "Screenshots not available",
-                    "Selenium is not installed on the server.<br>"
-                    "Run: <b>pip install selenium webdriver-manager</b><br>"
-                    "and install Chromium on the system.")
-                self._send(200, "text/html; charset=utf-8", body)
-                return
-            # Parse resolution from "WxH" string
-            res = params.get("res", [""])[0]
-            s_w, s_h = SCREENSHOT_W, SCREENSHOT_H
-            if "x" in res:
-                try:
-                    s_w, s_h = (int(v) for v in res.split("x", 1))
-                except ValueError:
-                    pass
-            try:
-                jpeg_bytes = _take_screenshot(url, s_w, s_h)
-                self._send(200, "image/jpeg", jpeg_bytes)
-            except Exception as exc:
-                body = _error_page(
-                    "Screenshot failed",
-                    "Could not capture screenshot of <b>{}</b><br><br>"
-                    "Reason: {}".format(url, exc))
-                self._send(200, "text/html; charset=utf-8", body)
 
         else:
             if path.startswith("/http"):
@@ -5092,104 +4732,34 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 # inside transform_html.
                 pass
 
-        # YouTube: extract content from embedded JSON (the page is 100% JS)
-        yt = _youtube_extract(raw, url, proxy_host, cp1256)
+        # YouTube: extract from embedded JSON (page is 100% JS).
+        # CP-1256 detection / re-extraction was dropped; output is
+        # always UTF-8 -- the on-MSX renderer transcodes the Arabic
+        # range to ISO-8859-6 at byte-emit time.
+        yt = _youtube_extract(raw, url, proxy_host, False)
         if yt:
             yt_title, yt_content = yt
-            # Auto-detect Arabic content on legacy OS
-            yt_cp1256 = cp1256
-            if not yt_cp1256:
-                client_ua = self.headers.get("User-Agent", "")
-                if _detect_legacy_os(client_ua):
-                    # Always enable cp1256 for legacy OS on YouTube
-                    # (search form needs it even without Arabic content)
-                    yt_cp1256 = True
-                    yt2 = _youtube_extract(raw, url, proxy_host, True)
-                    if yt2:
-                        yt_title, yt_content = yt2
-            # Detect RTL from the title (not nav bar which always has Arabic)
             _yt_rtl = any("\u0600" <= ch <= "\u06FF" for ch in yt_title)
             html = _page_shell(yt_title, url, yt_content, proxy_host,
-                               is_rtl=_yt_rtl, cp1256=yt_cp1256,
-                               client_ip=self.client_address[0],
-                               client_ua=self.headers.get("User-Agent", ""),
-                               reader=reader)
-            if yt_cp1256:
-                self._send(200, "text/html; charset=windows-1256",
-                           html.encode("cp1256", errors="xmlcharrefreplace"))
-            else:
-                self._send(200, "text/html; charset=utf-8",
-                           html.encode("utf-8", errors="replace"))
+                               is_rtl=_yt_rtl, reader=reader)
+            self._send(200, "text/html; charset=utf-8",
+                       html.encode("utf-8", errors="replace"))
             return
 
-        # Sabq.org: extract content from embedded JSON (JS SPA)
-        sabq = _sabq_extract(raw, url, proxy_host, cp1256)
+        # Sabq.org: extract from embedded JSON (JS SPA).
+        sabq = _sabq_extract(raw, url, proxy_host, False)
         if sabq:
             sabq_title, sabq_content = sabq
-            # sabq.org is always Arabic, auto-enable CP-1256 on legacy OS
-            sabq_cp1256 = cp1256
-            if not sabq_cp1256:
-                client_ua = self.headers.get("User-Agent", "")
-                if _detect_legacy_os(client_ua):
-                    sabq_cp1256 = True
-                    # Re-extract with cp1256 links
-                    sabq2 = _sabq_extract(raw, url, proxy_host, True)
-                    if sabq2:
-                        sabq_title, sabq_content = sabq2
             html = _page_shell(sabq_title, url, sabq_content, proxy_host,
-                               is_rtl=True, cp1256=sabq_cp1256,
-                               client_ip=self.client_address[0],
-                               client_ua=self.headers.get("User-Agent", ""),
-                               reader=reader)
-            if sabq_cp1256:
-                self._send(200, "text/html; charset=windows-1256",
-                           html.encode("cp1256", errors="xmlcharrefreplace"))
-            else:
-                self._send(200, "text/html; charset=utf-8",
-                           html.encode("utf-8", errors="replace"))
+                               is_rtl=True, reader=reader)
+            self._send(200, "text/html; charset=utf-8",
+                       html.encode("utf-8", errors="replace"))
             return
 
-        # Saudi Exchange: stock data is loaded via JS after page load.
-        # Use headless Chromium to render the full page if available.
-        _se_host = urlparse(url).hostname or ""
-        if "saudiexchange.sa" in _se_host and HAS_SELENIUM:
-            print("  [Saudi Exchange] attempting JS render…",
-                  flush=True)
-            try:
-                _se_opts = ChromeOptions()
-                _se_opts.add_argument("--headless=new")
-                _se_opts.add_argument("--no-sandbox")
-                _se_opts.add_argument("--disable-dev-shm-usage")
-                _se_opts.add_argument("--disable-gpu")
-                _se_opts.add_argument("--window-size=1280,900")
-                # Disguise headless Chrome from bot detection
-                _se_opts.add_argument(
-                    "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64;"
-                    " x64) AppleWebKit/537.36 (KHTML, like Gecko)"
-                    " Chrome/120.0.0.0 Safari/537.36")
-                _se_driver = _make_chrome_driver(_se_opts)
-                try:
-                    import time as _tmod
-                    _se_driver.set_page_load_timeout(FETCH_TIMEOUT + 15)
-                    _se_driver.get(url)
-                    _tmod.sleep(8)  # wait for AJAX stock data to load
-                    _se_html = _se_driver.page_source
-                finally:
-                    _se_driver.quit()
-                _se_raw = _se_html.encode("utf-8", errors="replace")
-                print("  [Saudi Exchange] JS render got {} bytes "
-                      "(original {} bytes)".format(
-                          len(_se_raw), len(raw)), flush=True)
-                if len(_se_raw) > len(raw):
-                    raw = _se_raw
-                    print("  [Saudi Exchange] using JS-rendered version",
-                          flush=True)
-                else:
-                    print("  [Saudi Exchange] JS render too small, "
-                          "keeping original", flush=True)
-            except Exception as exc:
-                print("  [Saudi Exchange] JS render failed: {}".format(exc),
-                      flush=True)
+        # Saudi Exchange JS-render fallback was dropped along with the
+        # rest of the Selenium / headless-Chromium integration. Pages
+        # that need a JS render now fall through to the normal HTML
+        # path; the stock data simply won't appear.
 
         # Detect frameset pages — serve them directly with proxied frame URLs
         raw_lower = raw[:2000].lower()
@@ -5207,36 +4777,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         try:
             title, content, is_rtl, js_only, bg_img, bg_color, b_attrs = \
-                transform_html(raw, resp.url, proxy_host, cp1256)
-            # Auto-detect Arabic content on legacy OS: if the response
-            # contains Arabic characters, switch to CP-1256 even if the
-            # URL didn't look Arabic (e.g. google.com with Arabic locale).
-            if not cp1256:
-                client_ua = self.headers.get("User-Agent", "")
-                if _detect_legacy_os(client_ua):
-                    # Check for Arabic Unicode range (U+0600–U+06FF)
-                    _sample = content[:5000]
-                    if any("\u0600" <= ch <= "\u06FF" for ch in _sample):
-                        cp1256 = True
-                        # Re-transform with cp1256 links (/p1/ prefix)
-                        title, content, is_rtl, js_only, bg_img, \
-                            bg_color, b_attrs = transform_html(
-                                raw, resp.url, proxy_host, cp1256)
+                transform_html(raw, resp.url, proxy_host, False)
             html = _page_shell(title, resp.url, content, proxy_host,
-                               is_rtl, cp1256,
-                               client_ip=self.client_address[0],
+                               is_rtl, False,
                                body_bg_img=bg_img,
                                body_bgcolor=bg_color,
                                body_attrs=b_attrs,
-                               client_ua=self.headers.get("User-Agent", ""),
                                reader=reader)
-            if cp1256:
-                charset = "windows-1256"
-                html_bytes = html.encode("cp1256", errors="xmlcharrefreplace")
-            else:
-                charset = "utf-8"
-                html_bytes = html.encode("utf-8", errors="replace")
-            self._send(200, "text/html; charset=" + charset, html_bytes)
+            html_bytes = html.encode("utf-8", errors="replace")
+            self._send(200, "text/html; charset=utf-8", html_bytes)
         except Exception as exc:
             import traceback
             traceback.print_exc()
