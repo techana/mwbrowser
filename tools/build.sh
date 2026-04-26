@@ -23,6 +23,28 @@ if [[ ! -x "$SJASMPLUS" ]]; then
     fi
 fi
 
+# Optional baud-rate override. SERIAL_DIVISOR is a build-time symbol
+# the SerialInit code reads; SERIAL_BAUD is a friendlier env var that
+# we translate to the matching divisor. If neither is set we use the
+# in-source default (currently divisor 1 = 115200 baud).
+DEFINES=()
+if [[ -n "${SERIAL_DIVISOR:-}" ]]; then
+    DEFINES+=(-DSERIAL_DIVISOR="$SERIAL_DIVISOR")
+elif [[ -n "${SERIAL_BAUD:-}" ]]; then
+    case "$SERIAL_BAUD" in
+        1200)   DEFINES+=(-DSERIAL_DIVISOR=96) ;;
+        2400)   DEFINES+=(-DSERIAL_DIVISOR=48) ;;
+        4800)   DEFINES+=(-DSERIAL_DIVISOR=24) ;;
+        9600)   DEFINES+=(-DSERIAL_DIVISOR=12) ;;
+        19200)  DEFINES+=(-DSERIAL_DIVISOR=6)  ;;
+        38400)  DEFINES+=(-DSERIAL_DIVISOR=3)  ;;
+        57600)  DEFINES+=(-DSERIAL_DIVISOR=2)  ;;
+        115200) DEFINES+=(-DSERIAL_DIVISOR=1)  ;;
+        *) echo "build.sh: unsupported SERIAL_BAUD=$SERIAL_BAUD" >&2; exit 2 ;;
+    esac
+fi
+
 # -I src tells sjasmplus where to find iso8859_6.inc / logo.inc; --sym
 # writes dist/mwbro.sym so tools/*.tcl can resolve labels by name.
-"$SJASMPLUS" -I src --sym=dist/mwbro.sym src/mwbrowser.asm
+# The `+` expansion guards against `set -u` tripping on an empty array.
+"$SJASMPLUS" -I src --sym=dist/mwbro.sym ${DEFINES[@]+"${DEFINES[@]}"} src/mwbrowser.asm

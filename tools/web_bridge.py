@@ -115,12 +115,32 @@ def _decode_body(raw: bytes, content_type: str) -> str:
     return raw.decode("latin-1", "replace")
 
 
+_RTL_HINT_RE = re.compile(
+    r"""(?ix)
+    \bdir\s*=\s*["']?\s*rtl\b      # explicit dir="rtl" anywhere
+  | \blang\s*=\s*["']?\s*           # ...or lang="ar/he/fa/ur/yi/ji/ku/ps/sd"
+        (?: ar | he | iw | fa | ur | yi | ji | ku | ps | sd )
+        [-"'\s>]                    # subtag boundary so "ari" doesn't match
+    """,
+)
+
+
 def _simplify_with_readability(html: str) -> str:
     """Run Mozilla Readability (via the Python port) to extract the
     article-like content of the page. Keeps the original title. Falls
     back to the input unchanged if the library isn't installed or the
     extraction produced nothing useful (pages that aren't articles --
-    home pages, search results, login forms -- usually don't)."""
+    home pages, search results, login forms -- usually don't).
+
+    Direction preservation: Readability strips attributes from the
+    article body, including `dir="rtl"` and `lang="ar"`, so an Arabic
+    page would come back to the MSX without the BiDi/alignment hint
+    and render left-to-right. Sniff the original markup once for any
+    RTL hint (explicit `dir="rtl"` or a Semitic / Indo-Iranian
+    `lang=` code on any element) and, if found, set `dir="rtl"` on
+    the synthesised `<html>` root so the renderer's per-document
+    direction propagates to every block.
+    """
     try:
         from readability import Document
     except ImportError:
@@ -133,9 +153,11 @@ def _simplify_with_readability(html: str) -> str:
         return html
     if not summary or len(summary) < 64:
         return html
+    html_attrs = ' dir="rtl"' if _RTL_HINT_RE.search(html) else ""
     # Glue on a head with the original title so the MSX titlebar still
     # reflects the page the user visited, not an empty string.
-    head = f"<html><head><title>{_html_escape(title)}</title></head>"
+    head = (f'<html{html_attrs}><head>'
+            f'<title>{_html_escape(title)}</title></head>')
     return head + summary + "</html>"
 
 
@@ -240,35 +262,88 @@ def _resize_for_msx(im: "Image.Image",
     return im
 
 
+# Browser palette (CLAUDE.md / SetPalette) -- the four Screen-6 slots in
+# luminance order. The MSX side renders these as fixed RGB values:
+#   slot 3 -> black  (Y=0),   slot 0 -> dgray (Y=73),
+#   slot 1 -> lgray (Y=182),  slot 2 -> white (Y=255).
+# We dither against these targets and pack the resulting slot indices.
+_DITHER_LEVELS = (0, 73, 182, 255)
+_LEVEL_TO_SLOT = {0: 3, 73: 0, 182: 1, 255: 2}
+
+
 def _pack_2bpp(im: "Image.Image") -> bytes:
-    """Quantise to the MSX Screen-6 4-colour palette and pack 4 pixels
-    per byte (MSB-first). Uses a simple luminance bucketing since the
-    content-image pipeline doesn't need the full dither-to-pair logic
-    the full-page screenshot pipeline had."""
+    """Floyd-Steinberg dither into the 4-level Screen-6 palette and pack
+    4 pixels per byte (MSB-first). Each output slot index lands at the
+    same offset its luminance bucket used to take in the old nearest-
+    level quantiser, so the on-disk PCX format and the browser's PCX
+    reader don't need any change.
+
+    FS error diffusion gives noticeably better gradients on photos and
+    logos than the previous luminance bucketing -- a sky that used to
+    band into 4 visible stripes now reads as a smooth gradient at the
+    cost of a tasteful checker pattern at slot boundaries.
+    """
     if im.mode != "L":
         im = im.convert("L")
     w, h = im.size
     row_bytes = w // 4
-    px = im.tobytes()
+
+    # Mutable working buffer: int per pixel so error diffusion can push
+    # values briefly outside [0,255] without truncating mid-row.
+    buf = list(im.tobytes())
+
+    # Result rows (slot indices 0..3) -- packed at the end so the inner
+    # loop is purely arithmetic.
+    slot_rows = [bytearray(w) for _ in range(h)]
+
+    levels = _DITHER_LEVELS
+    lvl_to_slot = _LEVEL_TO_SLOT
+
+    for y in range(h):
+        row_off = y * w
+        next_off = row_off + w if y + 1 < h else None
+        for x in range(w):
+            old = buf[row_off + x]
+            # Clamp before nearest-level pick so massive negative carry
+            # from a hard edge doesn't pin every following pixel to 0.
+            if old < 0:
+                old = 0
+            elif old > 255:
+                old = 255
+            # Closest of the four target luminances.
+            best = levels[0]
+            best_d = abs(old - best)
+            for L in levels[1:]:
+                d = abs(old - L)
+                if d < best_d:
+                    best = L
+                    best_d = d
+            err = old - best
+            slot_rows[y][x] = lvl_to_slot[best]
+            # Standard Floyd-Steinberg coefficients: 7 right, 3 below-left,
+            # 5 below, 1 below-right (out of 16). Skip diffusion that
+            # would cross row/column edges.
+            if x + 1 < w:
+                buf[row_off + x + 1] += err * 7 // 16
+            if next_off is not None:
+                if x > 0:
+                    buf[next_off + x - 1] += err * 3 // 16
+                buf[next_off + x] += err * 5 // 16
+                if x + 1 < w:
+                    buf[next_off + x + 1] += err * 1 // 16
+
+    # Pack 4 slot indices per byte, MSB-first.
     out = bytearray(h * row_bytes)
     for y in range(h):
-        row_start = y * w
+        row = slot_rows[y]
         for xb in range(row_bytes):
-            b = 0
-            for i in range(4):
-                v = px[row_start + xb * 4 + i]
-                # Four buckets: black(3) / dgray(0) / lgray(1) / white(2).
-                # Map luminance -> a pair-friendly nybble.
-                if v < 64:
-                    p = 3
-                elif v < 128:
-                    p = 0
-                elif v < 192:
-                    p = 1
-                else:
-                    p = 2
-                b |= (p & 3) << (6 - i * 2)
-            out[y * row_bytes + xb] = b
+            base = xb * 4
+            out[y * row_bytes + xb] = (
+                ((row[base    ] & 3) << 6) |
+                ((row[base + 1] & 3) << 4) |
+                ((row[base + 2] & 3) << 2) |
+                ( row[base + 3] & 3)
+            )
     return bytes(out)
 
 
@@ -288,23 +363,28 @@ class BridgeSession:
     # multi-KB <a href> with no whitespace, etc.) so the browser's
     # serial timeout doesn't bite.
     LINE_CHARS      = 60
-    # MSX content area is 183 px (CONTENT_Y1 - CONTENT_Y0 + 1) but the
-    # block-level tags the simulator doesn't model (<h1> and <table>
-    # each call EmitBlankLine on open + close, <h1>...</h1> also adds a
-    # half-line gap below) carve out roughly 40 px for typical pages.
-    # Budget against the leftover so the chunk doesn't clip below the
-    # fold even when h1 / table overhead lands.
-    VIEWPORT_PX     = 140
+    # MSX content area is 183 px (CONTENT_Y1 - CONTENT_Y0 + 1). Real
+    # pages were landing ~75% full because the simulator counts every
+    # block-end tag (</p>, </tr>, </li>, </h*>, </div>, </center>)
+    # as one whole row, but the renderer often emits no actual line
+    # for inline-empty close tags (e.g. </div> after a paragraph that
+    # already ended). Budget closer to the real 22-row viewport (~176
+    # px) so each chunk paints to the bottom of the canvas; the seam
+    # may overshoot by one row, which is far less jarring than half a
+    # screen of trailing whitespace.
+    VIEWPORT_PX     = 175
     TEXT_LINE_PX    = 8       # TEXT_LINE_H
     TR_LINE_PX      = 10      # TEXT_LINE_H + TABLE_ROW_GAP
     MAX_CHUNK_BYTES = 6000
 
     def __init__(self, verbose: bool = False, simplify: bool = False,
-                 no_images: bool = False, pagination: bool = False):
+                 no_images: bool = True, pagination: bool = False,
+                 passthrough: bool = False):
         self.verbose = verbose
         self.simplify = simplify
         self.no_images = no_images
         self.pagination = pagination
+        self.passthrough = passthrough
         self._img_cache: dict[str, str] = {}
         self._current_base: str | None = None
         self._img_counter = 0
@@ -325,6 +405,33 @@ class BridgeSession:
         # See the OK HTM "<bytes> <page>/<total>" header below.
         if target.upper() == "MORE":
             return self._serve_next_chunk()
+
+        # PROBE: the browser's auto-rate negotiation probe. SerialAutoProbe
+        # walks the i8253 divisor table and sends one "GET PROBE\r\n" at
+        # each candidate baud, looking for the first reply that starts
+        # with 'O'. We answer with the same empty OK HTM frame as IMG
+        # ON/OFF so the browser's parser is happy, and log it distinctly
+        # so the operator can see the link speed being negotiated rather
+        # than mistaking the probe for a stray IMG OFF.
+        if target.upper() == "PROBE":
+            self._log("link-rate probe -> OK HTM 0")
+            return ("HTM", b"")
+
+        # IMG ON / IMG OFF: browser-driven toggle of inline image support.
+        # When OFF (the default), <img> tags are stripped during HTML
+        # rewrite -- nothing on the MSX side ever requests an imNN.pcx,
+        # which keeps the wire small for low-baud browsing. When ON, the
+        # rewriter mints imNN.pcx handles and serves them lazily. Reply
+        # with an empty OK HTM so the browser's RemoteGet parser stays
+        # happy and treats the call as a no-op acknowledgement.
+        if target.upper() == "IMG ON":
+            self.no_images = False
+            self._log("images ON")
+            return ("HTM", b"")
+        if target.upper() == "IMG OFF":
+            self.no_images = True
+            self._log("images OFF")
+            return ("HTM", b"")
 
         # The MSX used to POST form data to a bridge-local "/submit?..."
         # shim; the browser now builds the full target URL from the
@@ -363,6 +470,16 @@ class BridgeSession:
     # -- HTML passthrough -------------------------------------------------
 
     def _fetch_page(self, url: str):
+        # Drop any pending chunks / image handles from the previous page
+        # *before* hitting the network. Otherwise a failed fetch (404,
+        # DNS, timeout) would leave the prior page's buffer in place,
+        # and the next "GET MORE" the browser issues against the new
+        # page would return stale content from the old one.
+        self._pending_chunks = []
+        self._page_total = 0
+        self._page_served = 0
+        self._img_cache = {}
+        self._img_counter = 0
         try:
             raw, final_url, content_type = _fetch(url)
         except Exception as exc:
@@ -502,41 +619,52 @@ class BridgeSession:
         return chunks if chunks else [body]
 
     def _rewrite_html(self, html: str) -> str:
-        # Drop script/style/noscript blocks: the MSX parser ignores
-        # them but stripping keeps the wire small and frees Readability
-        # from parsing JS.
-        html = re.sub(r"(?is)<script\b[^>]*>.*?</script>", "", html)
-        html = re.sub(r"(?is)<style\b[^>]*>.*?</style>", "", html)
-        html = re.sub(r"(?is)<noscript\b[^>]*>.*?</noscript>", "", html)
-        # Drop HTML comments. The MSX parser doesn't render them, and
-        # they often hide entire blocks of dead markup that still
-        # consume wire budget.
-        html = re.sub(r"(?is)<!--.*?-->", "", html)
-        # Collapse runs of whitespace in TEXT positions to a single
-        # space; collapse multiple inter-tag newlines to one. The MSX
-        # renderer normalises whitespace anyway, so the source-side
-        # pretty-printing just wastes serial budget. Don't touch the
-        # contents of <pre> -- preserved whitespace matters there.
-        # Cheap heuristic: protect <pre>...</pre> blocks behind a
-        # placeholder, compress everything else, then restore.
-        pre_blocks: list[str] = []
-        def _stash_pre(m):
-            pre_blocks.append(m.group(0))
-            return f"\x00PRE{len(pre_blocks)-1}\x00"
-        html = re.sub(r"(?is)<pre\b.*?</pre>", _stash_pre, html)
-        # Strip whitespace-only runs between '>' and '<'.
-        html = re.sub(r">\s+<", "><", html)
-        # Collapse remaining consecutive whitespace to a single space.
-        html = re.sub(r"[ \t\r\n]{2,}", " ", html)
-        # Restore <pre>.
-        html = re.sub(r"\x00PRE(\d+)\x00",
-                      lambda m: pre_blocks[int(m.group(1))], html)
+        # --passthrough: ship the source HTML to the MSX verbatim,
+        # skipping every cosmetic rewrite (script/style/noscript/comment
+        # strip, whitespace collapse, Readability). The img -> imNN.pcx
+        # handle minting and href/form absolutization below STILL run --
+        # the former because the browser only knows how to decode our
+        # PCX format (so raw http://.../foo.png src= attrs would 404),
+        # the latter because relative URLs break navigation when the
+        # MSX has no notion of the source base. Use this when you want
+        # to compare what our parser does with the *real* upstream HTML
+        # rather than the cleaned-up version.
+        if not self.passthrough:
+            # Drop script/style/noscript blocks: the MSX parser ignores
+            # them but stripping keeps the wire small and frees Readability
+            # from parsing JS.
+            html = re.sub(r"(?is)<script\b[^>]*>.*?</script>", "", html)
+            html = re.sub(r"(?is)<style\b[^>]*>.*?</style>", "", html)
+            html = re.sub(r"(?is)<noscript\b[^>]*>.*?</noscript>", "", html)
+            # Drop HTML comments. The MSX parser doesn't render them, and
+            # they often hide entire blocks of dead markup that still
+            # consume wire budget.
+            html = re.sub(r"(?is)<!--.*?-->", "", html)
+            # Collapse runs of whitespace in TEXT positions to a single
+            # space; collapse multiple inter-tag newlines to one. The MSX
+            # renderer normalises whitespace anyway, so the source-side
+            # pretty-printing just wastes serial budget. Don't touch the
+            # contents of <pre> -- preserved whitespace matters there.
+            # Cheap heuristic: protect <pre>...</pre> blocks behind a
+            # placeholder, compress everything else, then restore.
+            pre_blocks: list[str] = []
+            def _stash_pre(m):
+                pre_blocks.append(m.group(0))
+                return f"\x00PRE{len(pre_blocks)-1}\x00"
+            html = re.sub(r"(?is)<pre\b.*?</pre>", _stash_pre, html)
+            # Strip whitespace-only runs between '>' and '<'.
+            html = re.sub(r">\s+<", "><", html)
+            # Collapse remaining consecutive whitespace to a single space.
+            html = re.sub(r"[ \t\r\n]{2,}", " ", html)
+            # Restore <pre>.
+            html = re.sub(r"\x00PRE(\d+)\x00",
+                          lambda m: pre_blocks[int(m.group(1))], html)
 
-        # Simplify article-like pages via Readability, then splice any
-        # <form> back in (Readability drops them as non-article chrome).
-        if self.simplify:
-            simplified = _simplify_with_readability(html)
-            html = _preserve_forms(html, simplified)
+            # Simplify article-like pages via Readability, then splice any
+            # <form> back in (Readability drops them as non-article chrome).
+            if self.simplify:
+                simplified = _simplify_with_readability(html)
+                html = _preserve_forms(html, simplified)
 
         # Reset per-page image cache.
         self._img_cache = {}
@@ -552,8 +680,22 @@ class BridgeSession:
             if not src_m:
                 return tag
             src = src_m.group(1).strip()
+            # Apache directory listings emit <img src=".../blank.gif"
+            # alt="[ICO]"> in the header row purely to align the column
+            # with the file rows (which do carry real folder/text icons).
+            # Real browsers render the 1x1 transparent GIF as empty
+            # space; ours falls through to the "[ICO]" alt-text since
+            # we don't decode GIFs, leaving a stray label visible. Drop
+            # those tags outright. Same idea for any bare 1x1 spacer.
+            low = src.lower()
+            if low.endswith("blank.gif") or low.endswith("/spacer.gif") \
+                    or low.endswith("/pixel.gif") \
+                    or low.endswith("transparent.gif"):
+                return ""
             w = _int_or_none(IMG_W.search(tag))
             h = _int_or_none(IMG_H.search(tag))
+            if w == 1 and h == 1:
+                return ""
             handle = self._register_image(src, w, h)
             new_src = f'src="{handle}"'
             new_tag = tag[:src_m.start()] + new_src + tag[src_m.end():]
@@ -711,9 +853,58 @@ class BridgeSession:
             print(f"[bridge] {msg}", flush=True)
 
 
+def _transcode_iso6_to_utf8(url: str) -> str:
+    """Re-encode any percent-escapes in the URL's query string from
+    ISO-8859-6 (the MSX wire encoding) into UTF-8.
+
+    Why: when the user types Arabic into a form field on the MSX side
+    the browser percent-encodes the raw ISO-8859-6 bytes for each
+    character (e.g. ا = 0xC7 -> %C7). Modern HTTP servers (frogfind,
+    Wikipedia, ...) expect UTF-8 there, so a query like
+    ?q=%C7%E4%E4%DA%C9 looks like garbage to them and the search
+    returns nothing. Decode the ISO-8859-6 bytes back to Unicode and
+    re-quote as UTF-8 (?q=%D8%A7%D9%84%D9%84%D8%BA%D8%A9 ...).
+
+    A query whose %XX bytes don't decode strictly as ISO-8859-6 (i.e.
+    real UTF-8 sequences from a bridge-rewritten link, or anything
+    using bytes 0x80..0xBF that ISO-8859-6 leaves undefined) is left
+    alone -- we only rewrite when the source bytes plausibly came
+    from an MSX keyboard.
+    """
+    if "?" not in url:
+        return url
+    base, _, query = url.partition("?")
+
+    def _recode(piece: str) -> str:
+        raw = urllib.parse.unquote_to_bytes(piece)
+        try:
+            text = raw.decode("iso-8859-6", errors="strict")
+        except UnicodeDecodeError:
+            return piece                          # not ISO-8859-6: keep verbatim
+        if all(ord(ch) < 0x80 for ch in text):
+            return piece                          # pure ASCII: nothing to retranscode
+        # The AX-370 BIOS returns 0xA0 (ISO-8859-6 NBSP) for the space
+        # key while in Arabic / CODE mode. Search engines treat NBSP
+        # as a literal character, not a word separator, so a query
+        # like "اللغة العربية" would otherwise miss every match.
+        # Fold NBSP to plain space here so the upstream sees %20.
+        text = text.replace(" ", " ")
+        return urllib.parse.quote(text, safe="")
+
+    new_pairs = []
+    for pair in query.split("&"):
+        if "=" in pair:
+            k, _, v = pair.partition("=")
+            new_pairs.append(f"{_recode(k)}={_recode(v)}")
+        else:
+            new_pairs.append(_recode(pair))
+    return f"{base}?{'&'.join(new_pairs)}"
+
+
 def _fetch(url: str) -> tuple[bytes, str, str]:
     """HTTP GET with a realistic User-Agent. Returns (bytes, final URL
     after redirects, lower-cased Content-Type)."""
+    url = _transcode_iso6_to_utf8(url)
     req = urllib.request.Request(url, headers={
         "User-Agent": USER_AGENT,
         "Accept":     "text/html, image/*;q=0.8, */*;q=0.1",
@@ -783,9 +974,11 @@ def _slow_send(conn: socket.socket, body: bytes, chunk: int = 64,
 def serve_forever(host: str, port: int, verbose: bool,
                   simplify: bool = False,
                   no_images: bool = False,
-                  pagination: bool = False) -> None:
+                  pagination: bool = False,
+                  passthrough: bool = False) -> None:
     session = BridgeSession(verbose=verbose, simplify=simplify,
-                            no_images=no_images, pagination=pagination)
+                            no_images=no_images, pagination=pagination,
+                            passthrough=passthrough)
     srv = socket.socket()
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((host, port))
@@ -824,22 +1017,37 @@ def main() -> int:
                          "chrome/footers/sidebars. Off by default because it "
                          "tends to displace or mangle pages where the main "
                          "content IS a form (search boxes, login pages).")
-    ap.add_argument("--no-images", action="store_true",
-                    help="Strip every <img> tag before shipping HTML to the "
-                         "MSX. Handy for test runs -- PCX encode + serial "
-                         "transfer of an image costs real wall-clock time, "
-                         "which drowns out the rest of the render timings.")
+    ap.add_argument("--no-images", action="store_true", default=True,
+                    help="(default) Strip every <img> tag before shipping "
+                         "HTML to the MSX -- the browser starts in this "
+                         "mode and toggles to images-on via the Help "
+                         "popup's checkbox, which sends a runtime IMG ON "
+                         "command over the wire.")
+    ap.add_argument("--images", dest="no_images", action="store_false",
+                    help="Start with images enabled instead of the default "
+                         "stripped mode. The browser's checkbox can still "
+                         "override this at runtime via IMG ON/IMG OFF.")
     ap.add_argument("--pagination", action="store_true",
                     help="Chunk the body into ~1.2 KB OK HTM frames at safe "
                          "tag boundaries. Off by default because the chunk "
                          "boundaries can break tags and links on some pages; "
                          "enable when a page is too big to ship in one go.")
+    ap.add_argument("--passthrough", action="store_true",
+                    help="Ship upstream HTML to the MSX verbatim: skip the "
+                         "script/style/comment/whitespace strip and the "
+                         "Readability pass. Image conversion to PCX still "
+                         "runs (the browser only decodes our PCX format), "
+                         "and href/form URLs are still absolutised so "
+                         "relative links resolve. Useful for diagnosing "
+                         "what the on-MSX parser actually receives versus "
+                         "the cleaned-up wire copy.")
     args = ap.parse_args()
     try:
         serve_forever(args.host, args.port, args.verbose,
                       simplify=args.simplify,
                       no_images=args.no_images,
-                      pagination=args.pagination)
+                      pagination=args.pagination,
+                      passthrough=args.passthrough)
     except KeyboardInterrupt:
         print("\nbye.")
         return 0
