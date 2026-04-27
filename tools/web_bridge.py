@@ -3847,6 +3847,144 @@ _MSX_ATTRS_PER_TAG = {
 }
 
 
+# ── Per-host passthrough ──────────────────────────────────────────────────
+
+# Hosts whose own markup is already close enough to HTML 2 that running
+# transform_html's CSS-grid-to-table layout pass + Sabq/XenForo/YouTube
+# extractors is pure overhead (and occasionally drops content). For
+# these we take a thin route: absolutise links, mint imNN.pcx handles,
+# whitelist-filter to the MSX-supported subset, ship. Override at the
+# CLI with --passthrough-host (repeatable).
+_PASSTHROUGH_HOSTS = {"frogfind.com", "www.frogfind.com"}
+
+
+def _is_passthrough_host(hostname):
+    if not hostname:
+        return False
+    h = hostname.lower()
+    extra = CFG.get("passthrough_hosts") or set()
+    if h in _PASSTHROUGH_HOSTS or h in extra:
+        return True
+    # Honour bare-domain entries: a config of "frogfind.com" matches
+    # any subdomain (search.frogfind.com etc.).
+    for entry in (_PASSTHROUGH_HOSTS | extra):
+        if h == entry or h.endswith("." + entry):
+            return True
+    return False
+
+
+def _passthrough_html(raw, page_url, proxy_host):
+    """Minimal HTML-rewrite path for trusted-clean hosts. Returns the
+    same 6-of-7 tuple slice transform_html exposes downstream
+    (title, content, is_rtl, bg_img, bg_color, b_attrs); js_only is
+    fixed False because we don't run the heuristic detector here.
+
+    Operations performed (everything else is pass-through):
+      • Decode upstream bytes via response charset / html_parser auto.
+      • Drop <script>, <style>, <noscript>, comments.
+      • Absolutise <a href>, <img src>, <form action> against page_url.
+      • Mint imNN.pcx handles for <img src> the same way the upstream
+        HTML rewriter does, so the on-MSX TagImg only ever asks the
+        bridge for our PCX format.
+      • Run _filter_to_msx_subset to drop any tags / attrs the
+        renderer doesn't read."""
+    try:
+        # Try the response's declared charset if it's annotated; else
+        # let BeautifulSoup sniff (it falls through to UTF-8).
+        if isinstance(raw, bytes):
+            soup = BeautifulSoup(raw, "html.parser")
+        else:
+            soup = BeautifulSoup(raw, "html.parser")
+    except Exception:
+        return ("", "", False, None, None, None)
+
+    # Title.
+    title = ""
+    t = soup.find("title")
+    if t:
+        title = t.get_text(" ", strip=True)
+
+    # Drop scripts / styles / comments outright. The whitelist filter
+    # would do the same later, but doing it here means BeautifulSoup
+    # doesn't have to walk a thousand <script> children.
+    for tag in soup.find_all(["script", "style", "noscript"]):
+        tag.decompose()
+    for c in soup.find_all(string=lambda s: isinstance(s, Comment)):
+        c.extract()
+
+    # Absolutise <a href>.
+    for a in soup.find_all("a", href=True):
+        a["href"] = urljoin(page_url, a["href"])
+
+    # Absolutise <form action> (or default to the page URL).
+    for f in soup.find_all("form"):
+        action = f.get("action", "").strip()
+        f["action"] = urljoin(page_url, action) if action else page_url
+
+    # Mint imNN.pcx handles for <img src=...>. Reuses the per-handler
+    # dict that the future serial path's image fetch reads from. When
+    # the simplifier path runs later, it uses its own _img_cache via
+    # _register_image; we share the same module-level cache.
+    counter = [0]
+    def _next_handle(absolute, w, h):
+        counter[0] += 1
+        handle = "im{:02d}.pcx".format(counter[0])
+        # Stash in the module-level cache used by the serial path's
+        # imNN.pcx fetcher (defined in the upcoming task 11). The cache
+        # is best-effort here: if the serial layer hasn't been
+        # initialised, _IMG_HANDLE_CACHE just collects entries that
+        # will never be requested -- harmless.
+        _IMG_HANDLE_CACHE[handle] = (absolute, w, h)
+        return handle
+
+    for img in soup.find_all("img", src=True):
+        src = img["src"].strip()
+        if not src:
+            continue
+        absolute = urljoin(page_url, src)
+        try:
+            w = int(img.get("width", "0") or 0)
+        except ValueError:
+            w = 0
+        try:
+            h = int(img.get("height", "0") or 0)
+        except ValueError:
+            h = 0
+        img["src"] = _next_handle(absolute, w or None, h or None)
+        # Update declared dimensions to what the PCX will actually be.
+        if w and h:
+            tw, th = _predict_msx_size(w, h)
+            img["width"]  = str(tw)
+            img["height"] = str(th)
+
+    # RTL: any character in the Arabic Unicode block triggers the doc
+    # direction. Cheap text scan over the body.
+    is_rtl = False
+    body = soup.find("body")
+    text_sample = (body.get_text(" ", strip=True)[:5000] if body
+                   else soup.get_text(" ", strip=True)[:5000])
+    if any("؀" <= ch <= "ۿ" for ch in text_sample):
+        is_rtl = True
+
+    # Body content only; the shell wraps the rest.
+    if body:
+        content = "".join(str(c) for c in body.contents)
+    else:
+        content = str(soup)
+    content = _filter_to_msx_subset(content)
+    return title, content, is_rtl, None, None, None
+
+
+# ── Image-handle cache (shared by passthrough + simplifier paths) ─────────
+
+# Maps minted "imNN.pcx" handles back to their original URL + declared
+# width/height. The serial path's GET imNN.pcx handler reads from here
+# (see task 11). The HTTP path doesn't need it -- /img/<URL> resolves
+# directly -- but populating the cache during passthrough keeps the
+# serial fetcher functional regardless of which path produced the page.
+_IMG_HANDLE_CACHE = {}
+
+
 def _filter_to_msx_subset(html_str):
     """Walk the rendered HTML and prune everything the on-MSX parser
     can't render. Unknown block-level tags are *unwrapped* (children
@@ -4995,8 +5133,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 pass  # fall through to normal transform
 
         try:
-            title, content, is_rtl, js_only, bg_img, bg_color, b_attrs = \
-                transform_html(raw, resp.url, proxy_host, False)
+            # Per-host passthrough: hostnames in CFG["passthrough_hosts"]
+            # already serve clean, near-HTML-2 markup (frogfind, gemini
+            # mirrors, ...) so running them through transform_html's
+            # CSS-grid-to-table layout reconstruction and forum
+            # extractors is wasted work and sometimes drops content.
+            # _passthrough_html does the bare minimum: link / img / form
+            # absolutisation, the MSX-subset whitelist filter, and the
+            # img -> imNN.pcx handle minting; nothing else.
+            host = (urlparse(resp.url).hostname or "").lower()
+            if _is_passthrough_host(host):
+                title, content, is_rtl, bg_img, bg_color, b_attrs = \
+                    _passthrough_html(raw, resp.url, proxy_host)
+                js_only = False
+            else:
+                title, content, is_rtl, js_only, bg_img, bg_color, b_attrs = \
+                    transform_html(raw, resp.url, proxy_host, False)
             html = _page_shell(title, resp.url, content, proxy_host,
                                is_rtl, False,
                                body_bg_img=bg_img,
@@ -5100,9 +5252,20 @@ def main():
                          "FileBuf can't hold a full wikipedia-class page. "
                          "Use --no-pagination for diagnostic runs where "
                          "you want a single frame to inspect.")
+    ap.add_argument("--passthrough-host", dest="passthrough_hosts",
+                    action="append", default=[], metavar="HOST",
+                    help="Add HOST (or one of its subdomains) to the list "
+                         "of sites that bypass the heavy simplifier. The "
+                         "passthrough path still mints imNN.pcx handles "
+                         "and absolutises links; it just skips the "
+                         "CSS-grid-to-table layout pass and the "
+                         "Sabq/XenForo/YouTube extractors. Repeatable. "
+                         "frogfind.com is included by default.")
     args = ap.parse_args()
     CFG["no_images"] = bool(args.no_images)
     CFG["paginate"]  = not bool(args.no_pagination)
+    CFG["passthrough_hosts"] = {h.lower().strip() for h in args.passthrough_hosts
+                                if h.strip()}
     return args
 
 
