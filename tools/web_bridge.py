@@ -3772,13 +3772,116 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
     # 16. Append a warning if the page required JavaScript to render.
     if js_only:
         content_html += (
-            '<hr><p><font face="Arial,Helvetica" size="2" color="#cc0000">'
-            '<b>Note:</b> This page requires JavaScript to display its full '
-            'content. The text shown above may be incomplete or a summary only.'
-            '</font></p>'
+            '<hr><p><font color="#cc0000"><b>Note:</b> This page requires '
+            'JavaScript to display its full content. The text shown above '
+            'may be incomplete or a summary only.</font></p>'
         )
 
+    # 17. Final whitelist pass against the on-MSX parser's TagTbl.
+    #     Drops every tag the renderer doesn't recognise and every
+    #     attribute its scanner doesn't read, so the wire never carries
+    #     bytes the .COM is just going to ignore.
+    content_html = _filter_to_msx_subset(content_html)
+
     return title, content_html, is_rtl, js_only, body_bg_img, body_bgcolor, body_attrs
+
+
+# ── MSX-subset whitelist ──────────────────────────────────────────────────
+
+# Tags the on-MSX parser recognises (src/mwbrowser.asm: TagTbl). Anything
+# outside this set is unwrapped (children kept) or dropped (script/style
+# bodies, frame chrome). The list mirrors the assembly source 1:1; if
+# you add a TagFoo handler over there, add "foo" here too.
+_MSX_TAGS = frozenset({
+    "html", "head", "body", "title", "script", "style",
+    "p", "br", "center", "hr",
+    "h1", "h2", "h3", "h4", "h5", "h6",
+    "pre", "blockquote",
+    "ul", "ol", "li", "dl", "dt", "dd",
+    "table", "tr", "td", "th",
+    "b", "strong", "i", "em", "u", "s", "strike", "del",
+    "a", "font",
+    "img", "map", "area",
+    "form", "input", "select", "option", "textarea", "isindex",
+})
+
+# Tags whose body is source code / unsupported media we drop wholesale.
+# The on-MSX parser handles <script>/<style> by setting HtmlInScript and
+# eating their text via EmitSink, but stripping them here saves wire
+# bytes and keeps the chunk math honest. <iframe>, <video>, <audio>,
+# <canvas>, <object>, <embed>, <picture>, <noscript>, <svg> are content
+# the renderer can't display at all.
+_MSX_DROP_TAGS = frozenset({
+    "script", "style", "noscript", "iframe", "video", "audio",
+    "canvas", "object", "embed", "picture", "svg", "math",
+    "template", "slot", "link", "meta",
+})
+
+# Per-tag whitelisted attributes. Anything not listed here is dropped on
+# that tag. Sourced from src/mwbrowser.asm:ScanHrefAttr — the scanner
+# only consumes these names; everything else is silently ignored on the
+# MSX side anyway, so stripping at the bridge purely saves wire bytes.
+_MSX_ATTRS_GLOBAL = frozenset({"align", "dir"})
+_MSX_ATTRS_PER_TAG = {
+    "a":        {"href", "name"},
+    "img":      {"src", "alt", "width", "height"},
+    "font":     {"color"},
+    "input":    {"type", "name", "value", "checked"},
+    "form":     {"action", "method"},
+    "select":   {"name"},
+    "option":   {"value", "selected"},
+    "textarea": {"name", "rows", "cols"},
+    "table":    {"border", "cellpadding", "cellspacing", "bgcolor"},
+    "td":       {"colspan", "rowspan", "bgcolor", "nowrap", "valign"},
+    "th":       {"colspan", "rowspan", "bgcolor", "nowrap", "valign"},
+    "tr":       {"bgcolor", "valign"},
+    "body":     {"bgcolor", "text", "link", "vlink", "alink",
+                 "background"},
+    "html":     set(),
+    "head":     set(),
+    "title":    set(),
+    "br":       set(),
+    "hr":       set(),
+    "isindex":  {"prompt"},
+}
+
+
+def _filter_to_msx_subset(html_str):
+    """Walk the rendered HTML and prune everything the on-MSX parser
+    can't render. Unknown block-level tags are *unwrapped* (children
+    inlined into the parent so their text content survives); a small
+    blacklist of source-code / media tags (script/style/iframe/etc.)
+    is dropped wholesale. Per-tag attribute whitelists drop inline
+    styles, event handlers and any other attribute the MSX scanner
+    doesn't read.
+
+    The pass is best-effort: a malformed input that BeautifulSoup
+    can't reparse falls back to returning the original string."""
+    try:
+        soup = BeautifulSoup(html_str, "html.parser")
+    except Exception:
+        return html_str
+
+    # Phase 1: drop blacklisted-tag subtrees outright.
+    for tag in soup.find_all(_MSX_DROP_TAGS):
+        tag.decompose()
+
+    # Phase 2: walk every remaining tag, unwrap unknown ones (keep
+    # children) and strip non-whitelisted attributes from known ones.
+    for tag in list(soup.find_all(True)):
+        name = tag.name.lower() if tag.name else ""
+        if name not in _MSX_TAGS:
+            tag.unwrap()
+            continue
+        allowed = _MSX_ATTRS_GLOBAL | _MSX_ATTRS_PER_TAG.get(name, set())
+        for attr in list(tag.attrs):
+            attr_low = attr.lower()
+            # Drop event-handler attrs (onclick, onload, ...) defensively
+            # even if a tag's whitelist accidentally allows them.
+            if attr_low.startswith("on") or attr_low not in allowed:
+                del tag.attrs[attr]
+
+    return str(soup)
 
 
 # ── Landing page HTML ──────────────────────────────────────────────────────
