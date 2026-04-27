@@ -25,6 +25,7 @@ import io
 import re
 import sys
 import base64
+import struct
 import threading
 import http.server
 import socketserver
@@ -3959,17 +3960,32 @@ _LOGO_PCX = b""  # populated by _generate_logo() once the PCX encoder lands;
                  # 404 instead of NameError-ing.
 
 def _generate_logo():
-    """Load the logo GIF from disk (wb-logo.gif next to this script)."""
-    global _LOGO_GIF
+    """Load the landing-page logo GIF from disk and bake a 2-bpp PCX
+    copy at startup. The GIF is kept too in case we ever serve it to
+    a non-MSX client; the PCX is what /wb-logo.pcx returns."""
+    global _LOGO_GIF, _LOGO_PCX
     try:
         import os as _los
         _logo_path = _los.path.join(
             _los.path.dirname(_los.path.abspath(__file__)), "wb-logo.gif")
         with open(_logo_path, "rb") as _f:
             _LOGO_GIF = _f.read()
-        print("  Logo   : loaded ({} bytes)".format(len(_LOGO_GIF)))
+        print("  Logo   : GIF loaded ({} bytes)".format(len(_LOGO_GIF)))
     except Exception as exc:
-        print("  Logo   : load failed ({})".format(exc))
+        print("  Logo   : GIF load failed ({})".format(exc))
+        return
+    if not HAS_PIL:
+        print("  Logo   : Pillow not installed; PCX skipped")
+        return
+    try:
+        # Run the logo through the same PCX pipeline real images use,
+        # so any tweak to _resize_for_msx / _pack_2bpp / _to_pcx
+        # automatically applies here too.
+        _LOGO_PCX, _ = _process_image_bytes(_LOGO_GIF, "image/gif",
+                                            "wb-logo.gif")
+        print("  Logo   : PCX baked ({} bytes)".format(len(_LOGO_PCX)))
+    except Exception as exc:
+        print("  Logo   : PCX bake failed ({})".format(exc))
 
 
 def _landing_html(ip, user_agent=""):
@@ -4158,112 +4174,212 @@ def _fetch_and_convert_image(url, target_w=0, target_h=0):
     return _process_image_bytes(raw, ctype, url, target_w, target_h)
 
 
+# ── PCX encoder (Screen-6, 2 bpp, 1 plane, RLE) ───────────────────────────
+
+# Browser palette (CLAUDE.md / SetPalette): the four Screen-6 slots in
+# luminance order. The MSX side renders these as fixed RGB values:
+#   slot 3 -> black  (Y=0),   slot 0 -> dgray (Y=73),
+#   slot 1 -> lgray (Y=182),  slot 2 -> white (Y=255).
+# Floyd-Steinberg dithering quantises a luminance channel into one of
+# these four levels; the slot index is what gets packed into the PCX.
+_PCX_DITHER_LEVELS = (0, 73, 182, 255)
+_PCX_LEVEL_TO_SLOT = {0: 3, 73: 0, 182: 1, 255: 2}
+
+
+def _predict_msx_size(declared_w, declared_h):
+    """Mirror _resize_for_msx so the HTML rewriter can update <img>
+    width/height attrs to what the PCX will actually be. If the math
+    in _resize_for_msx changes, change this in lock-step."""
+    tgt_w = declared_w
+    tgt_h = max(1, declared_h // 2)
+    MAX_W, MAX_H = 492, 183
+    tgt_w = min(MAX_W, max(4, tgt_w))
+    tgt_w = (tgt_w + 3) & ~3
+    tgt_h = min(MAX_H, max(1, tgt_h))
+    return tgt_w, tgt_h
+
+
+def _resize_for_msx(im, declared_w, declared_h):
+    """Pick a target size for the PCX we'll ship. Screen 6 has a 2:1
+    pixel aspect ratio, so we halve the source row count before
+    encoding -- the renderer paints each packed row once and the
+    resulting image looks proportional. Width is rounded up to a
+    multiple of 4 so 2 bpp packs evenly."""
+    src_w, src_h = im.size
+    MAX_W = 492
+    MAX_H = 183
+    if declared_w and declared_h:
+        tgt_w, tgt_h = declared_w, declared_h
+    else:
+        tgt_w, tgt_h = src_w, src_h
+        if tgt_w > MAX_W:
+            tgt_h = max(1, round(tgt_h * MAX_W / tgt_w))
+            tgt_w = MAX_W
+        vh_budget = MAX_H * 2
+        if tgt_h > vh_budget:
+            tgt_w = max(1, round(tgt_w * vh_budget / tgt_h))
+            tgt_h = vh_budget
+    tgt_h = max(1, tgt_h // 2)
+    tgt_w = min(MAX_W, max(4, tgt_w))
+    tgt_w = (tgt_w + 3) & ~3
+    tgt_h = min(MAX_H, max(1, tgt_h))
+    if (tgt_w, tgt_h) != (src_w, src_h):
+        im = im.resize((tgt_w, tgt_h), Image.BOX)
+    return im
+
+
+def _pack_2bpp(im):
+    """Floyd-Steinberg dither into the 4-level Screen-6 palette and
+    pack 4 pixels per byte (MSB first). Each output slot index lands
+    at the same offset its luminance bucket used to take in the old
+    nearest-level quantiser, so the on-MSX PCX reader needs no change.
+
+    FS error diffusion gives noticeably better gradients on photos
+    and logos than plain bucketing -- a sky that used to band into
+    four visible stripes reads as a smooth gradient at the cost of a
+    tasteful checker pattern at slot boundaries."""
+    if im.mode != "L":
+        im = im.convert("L")
+    w, h = im.size
+    row_bytes = w // 4
+    buf = list(im.tobytes())
+    slot_rows = [bytearray(w) for _ in range(h)]
+    levels = _PCX_DITHER_LEVELS
+    lvl_to_slot = _PCX_LEVEL_TO_SLOT
+    for y in range(h):
+        row_off = y * w
+        next_off = row_off + w if y + 1 < h else None
+        for x in range(w):
+            old = buf[row_off + x]
+            if old < 0:
+                old = 0
+            elif old > 255:
+                old = 255
+            best = levels[0]
+            best_d = abs(old - best)
+            for L in levels[1:]:
+                d = abs(old - L)
+                if d < best_d:
+                    best = L
+                    best_d = d
+            err = old - best
+            slot_rows[y][x] = lvl_to_slot[best]
+            if x + 1 < w:
+                buf[row_off + x + 1] += err * 7 // 16
+            if next_off is not None:
+                if x > 0:
+                    buf[next_off + x - 1] += err * 3 // 16
+                buf[next_off + x] += err * 5 // 16
+                if x + 1 < w:
+                    buf[next_off + x + 1] += err * 1 // 16
+    out = bytearray(h * row_bytes)
+    for y in range(h):
+        row = slot_rows[y]
+        for xb in range(row_bytes):
+            base = xb * 4
+            out[y * row_bytes + xb] = (
+                ((row[base    ] & 3) << 6) |
+                ((row[base + 1] & 3) << 4) |
+                ((row[base + 2] & 3) << 2) |
+                ( row[base + 3] & 3)
+            )
+    return bytes(out)
+
+
+def _to_pcx(im):
+    """Wrap the dithered + packed pixels in a 128-byte PCX header (2
+    bpp, 1 plane, RLE on) plus the standard run-length-encoded body.
+    This is the on-disk format the MSX-side TagImg PCX decoder eats."""
+    width_px = im.size[0]
+    rows = im.size[1]
+    row_bytes = width_px // 4
+    raw = _pack_2bpp(im)
+    hdr = bytearray(128)
+    hdr[0] = 0x0A                                # ZSoft signature
+    hdr[1] = 5                                   # PC Paintbrush 3.0
+    hdr[2] = 1                                   # RLE on
+    hdr[3] = 2                                   # 2 bpp
+    struct.pack_into("<HHHH", hdr, 4, 0, 0, width_px - 1, rows - 1)
+    struct.pack_into("<HH",   hdr, 12, 75, 75)
+    hdr[65] = 1                                  # planes
+    struct.pack_into("<H", hdr, 66, row_bytes)
+    hdr[68] = 1                                  # palette interp = colour
+    out = bytearray(hdr)
+    for y in range(rows):
+        row = raw[y * row_bytes : (y + 1) * row_bytes]
+        x = 0
+        while x < len(row):
+            v = row[x]
+            run = 1
+            while x + run < len(row) and row[x + run] == v and run < 63:
+                run += 1
+            if run > 1 or (v & 0xC0) == 0xC0:
+                out.append(0xC0 | run)
+                out.append(v)
+            else:
+                out.append(v)
+            x += run
+    return bytes(out)
+
+
 def _process_image_bytes(raw, ctype, url, target_w=0, target_h=0):
-    """Convert raw image bytes to a format old browsers can render.
+    """Convert raw image bytes (any format Pillow can decode + SVG via
+    cairosvg) into the on-MSX 2 bpp PCX format. Branches:
 
-    Branches on content type / extension:
-      • SVG  → rasterize via cairosvg → JPEG (or PNG if Pillow missing).
-      • GIF  → pass through (natively supported back to IE 2).
-      • else → decode with Pillow, composite alpha, resize, JPEG.
+      • SVG  → cairosvg → PIL → resize_for_msx → 2 bpp PCX.
+      • else → PIL → composite alpha → resize_for_msx → 2 bpp PCX.
 
-    Shared between the plain `requests` path and the Selenium-fetched
-    path so both produce identical output."""
-    # SVG: old browsers can't render these at all
+    Returns (bytes, "image/x-pcx"). Pre-PCX output (JPEG / GIF
+    passthrough) is gone -- the only client of this bridge is the
+    MSX renderer, which only knows how to decode our PCX format."""
+    # SVG: rasterise via cairosvg, then convert through the PCX path
+    # like everything else. White-fill recolour stays so icons painted
+    # for dark UIs don't disappear into the white canvas.
     is_svg = "svg" in ctype or url.rstrip("/").lower().endswith(".svg")
     if is_svg:
         if not HAS_CAIROSVG:
-            print("  [SVG] cairosvg not installed; serving placeholder for "
-                  "{}".format(url), flush=True)
             raise ValueError("SVG cannot be converted (cairosvg missing)")
-        # Try cairosvg → PNG → JPEG.  Pre-process to recolor white fills
-        # (parity with the inline-SVG handler in transform_html): SVG
-        # icons designed for dark UI backgrounds use fill="#fff", which
-        # composited onto our white JPEG background becomes invisible.
+        if not HAS_PIL:
+            raise ValueError("SVG cannot be converted (Pillow missing)")
         try:
             import cairosvg
             svg_in = _recolor_white_svg_fills(raw)
-            # Use target width for rasterization if available
             render_w = target_w if target_w else 200
             png_data = cairosvg.svg2png(bytestring=svg_in,
                                          output_width=render_w)
-            if HAS_PIL:
-                img = Image.open(io.BytesIO(png_data))
-                # Composite onto white background (SVGs often have transparency)
-                _has_alpha = (img.mode in ("RGBA", "LA", "PA")
-                              or (img.mode == "P"
-                                  and "transparency" in img.info))
-                if _has_alpha:
-                    img = img.convert("RGBA")
-                    bg = Image.new("RGB", img.size, (255, 255, 255))
-                    bg.paste(img, mask=img.split()[3])
-                    img = bg
-                elif img.mode not in ("RGB", "L"):
-                    img = img.convert("RGB")
-                # Apply target size if specified
-                if target_w or target_h:
-                    img = _resize_to_target(img, target_w, target_h)
-                buf = io.BytesIO()
-                img.save(buf, format="JPEG", quality=75)
-                return buf.getvalue(), "image/jpeg"
-            return png_data, "image/png"
+            img = Image.open(io.BytesIO(png_data))
         except Exception as exc:
-            print("  [SVG] cairosvg failed for {} ({}); serving "
-                  "placeholder".format(url, exc), flush=True)
-            raise ValueError("SVG cannot be converted")
-
-    # GIF: natively supported by all old browsers — pass through as-is
-    is_gif = "gif" in ctype or url.rstrip("/").lower().endswith(".gif")
-    if is_gif:
-        return raw, "image/gif"
-
-    if not HAS_PIL:
-        return raw, ctype
-
-    try:
-        img = Image.open(io.BytesIO(raw))
-        _has_alpha = (img.mode in ("RGBA", "LA", "PA")
-                      or (img.mode == "P" and "transparency" in img.info))
-        if _has_alpha:
-            # Composite onto white background to avoid black areas in JPEG
-            img = img.convert("RGBA")
-            bg = Image.new("RGB", img.size, (255, 255, 255))
-            bg.paste(img, mask=img.split()[3])
-            img = bg
-        elif img.mode not in ("RGB", "L"):
-            img = img.convert("RGB")
-        # Apply target size from HTML (pre-resize for IE2 compatibility)
-        if target_w or target_h:
-            img = _resize_to_target(img, target_w, target_h)
-        elif img.width > MAX_IMG_W or img.height > MAX_IMG_H:
-            img.thumbnail((MAX_IMG_W, MAX_IMG_H), Image.LANCZOS)
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=75, optimize=True)
-        return buf.getvalue(), "image/jpeg"
-    except Exception:
-        return raw, ctype
-
-
-def _resize_to_target(img, target_w, target_h):
-    """Resize a PIL Image to target dimensions, preserving aspect ratio.
-    If only one dimension is given, the other is calculated from the
-    image's natural aspect ratio."""
-    orig_w, orig_h = img.size
-    if target_w and target_h:
-        w, h = target_w, target_h
-    elif target_w:
-        ratio = target_w / orig_w if orig_w else 1
-        w, h = target_w, max(1, int(orig_h * ratio))
-    elif target_h:
-        ratio = target_h / orig_h if orig_h else 1
-        w, h = max(1, int(orig_w * ratio)), target_h
+            raise ValueError(
+                "SVG cannot be converted ({})".format(exc))
     else:
-        return img
-    w = min(w, MAX_IMG_W)
-    h = min(h, MAX_IMG_H)
-    if w >= orig_w and h >= orig_h:
-        return img  # don't upscale
-    img.thumbnail((w, h), Image.LANCZOS)
-    return img
+        if not HAS_PIL:
+            raise ValueError("Pillow required for image conversion")
+        try:
+            img = Image.open(io.BytesIO(raw))
+        except Exception as exc:
+            raise ValueError("decode failed: {}".format(exc))
+
+    # Composite alpha onto white before luminance conversion so
+    # transparent areas don't turn black under .convert("L").
+    if img.mode in ("RGBA", "LA", "PA") or (img.mode == "P"
+                                            and "transparency" in img.info):
+        img = img.convert("RGBA")
+        bg = Image.new("RGB", img.size, (255, 255, 255))
+        bg.paste(img, mask=img.split()[3])
+        img = bg
+    elif img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
+
+    img = _resize_for_msx(img,
+                          target_w if target_w else None,
+                          target_h if target_h else None)
+    pcx = _to_pcx(img)
+    return pcx, "image/x-pcx"
+
+
+# _resize_to_target was the JPEG-pipeline aspect-ratio helper. PCX
+# output uses _resize_for_msx (2:1 aspect correction + 4-px width
+# alignment) instead, so the old helper has no remaining callers.
 
 
 # ── Search engine helpers ─────────────────────────────────────────────────
