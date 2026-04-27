@@ -14752,11 +14752,17 @@ TotalLines:     dw 0                    ; rendered line count for thumb math
 ThumbTop:       db THUMB_Y0             ; current thumb top y (set by ComputeThumb)
 ThumbHeight:    db THUMB_Y1 - THUMB_Y0 + 1
 AboutOpen:      db 0                    ; 1 while the Help popup is on screen
-ShowImages:     db 0                    ; 0 = strip <img> on render and skip
+ShowImages:     db 1                    ; 0 = strip <img> on render and skip
                                         ; remote img fetches; 1 = render
                                         ; local images + ask the bridge for
                                         ; remote PCX handles. Toggled from
                                         ; the Help popup checkbox.
+                                        ; Default flipped to 1 so the Help
+                                        ; checkbox starts checked and the
+                                        ; first RemoteLoadFile sends IMG ON
+                                        ; -- the new bridge defaults its
+                                        ; images flag the same way, so the
+                                        ; two ends agree without a toggle.
 
 ; Text cursor for DrawCharFast-based rendering.
 TextX:          dw 0

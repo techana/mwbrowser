@@ -5051,22 +5051,82 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(body)
 
 
+# ── Runtime config (CLI-driven; mutable at runtime via the wire protocol) ──
+
+# Mutable module-level config. Populated by main() from argparse, but
+# also touched at runtime: the MSX-side IMG ON / IMG OFF wire commands
+# flip CFG["no_images"] when they land (see the upcoming serial path
+# in task 11). Keeping it on a module dict means request handlers can
+# read it without plumbing extra arguments through every call site.
+CFG = {
+    # Default flipped from upstream (off) to on: the on-MSX Help-popup
+    # checkbox now starts checked, sending IMG ON at first navigation.
+    # The bridge follows -- if the user unticks the checkbox the next
+    # request comes in with IMG OFF and CFG["no_images"] flips True.
+    "no_images":  False,
+    # Pagination is the wire-level chunking the on-MSX renderer needs
+    # to keep its 24 KB FileBuf below the cap on long pages. Default
+    # ON because the MSX is the only client; --no-pagination is for
+    # diagnostic runs where you want a single OK HTM frame to inspect.
+    # Wired to the chunker once the serial path lands (task 11).
+    "paginate":   True,
+    # Reader-mode default. Off; flipped per-request via &reader=1.
+    "reader":     False,
+}
+
+
+def main():
+    import argparse
+    ap = argparse.ArgumentParser(
+        description=(__doc__ or "").strip().splitlines()[0]
+                    if __doc__ else "MSX Web Bridge",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    ap.add_argument("--host", default="0.0.0.0",
+                    help="HTTP listen address (default: 0.0.0.0)")
+    ap.add_argument("--port", type=int, default=PORT,
+                    help="HTTP listen port (default: {})".format(PORT))
+    ap.add_argument("--no-images", dest="no_images", action="store_true",
+                    help="Strip every <img> tag before shipping HTML to "
+                         "the MSX. Off by default -- the on-MSX checkbox "
+                         "starts checked, so the first request comes in "
+                         "with IMG ON. The bridge follows the IMG ON/OFF "
+                         "wire commands at runtime, so this only sets the "
+                         "initial state before the MSX speaks.")
+    ap.add_argument("--no-pagination", dest="no_pagination",
+                    action="store_true",
+                    help="Disable wire-level chunking of OK HTM frames. "
+                         "Pagination is on by default because the MSX-side "
+                         "FileBuf can't hold a full wikipedia-class page. "
+                         "Use --no-pagination for diagnostic runs where "
+                         "you want a single frame to inspect.")
+    args = ap.parse_args()
+    CFG["no_images"] = bool(args.no_images)
+    CFG["paginate"]  = not bool(args.no_pagination)
+    return args
+
+
 # ── Entry point ────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    _args = main()
     socketserver.TCPServer.allow_reuse_address = True
-    with socketserver.ThreadingTCPServer(("", PORT), Handler) as srv:
+    with socketserver.ThreadingTCPServer((_args.host, _args.port), Handler) as srv:
         print()
-        print("  Web Bridge for Old Browsers")
+        print("  MSX Web Bridge")
         print("  ──────────────────────────────────────")
         if HAS_PIL:
-            print("  Images : converted & resized via Pillow")
+            print("  Images   : converted to 2-bpp PCX via Pillow")
             _generate_logo()
         else:
-            print("  Images : pass-through (Pillow not installed)")
-        print("  Layout : CSS grid/flex → table conversion")
-        print("  Listening on  http://0.0.0.0:{}".format(PORT))
-        print("  Open          http://{}:{}".format(SERVER_IP, PORT))
+            print("  Images   : pass-through (Pillow not installed)")
+        print("  Layout   : CSS grid/flex → table conversion")
+        print("  Defaults : images={}  pagination={}".format(
+            "OFF" if CFG["no_images"] else "ON",
+            "ON"  if CFG["paginate"]  else "OFF"))
+        print("  Listening on  http://{}:{}".format(_args.host, _args.port))
+        if _args.host in ("0.0.0.0", ""):
+            print("  Open          http://{}:{}".format(SERVER_IP, _args.port))
         print("  Stop with     Ctrl-C")
         print()
         try:
