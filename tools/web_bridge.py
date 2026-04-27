@@ -24,7 +24,9 @@ Requires:
 import io
 import re
 import sys
+import time
 import base64
+import socket
 import struct
 import threading
 import http.server
@@ -4619,6 +4621,385 @@ def _approx_body_text_len(raw, scan_limit=200000):
     return sum(len(w) for w in chunk.split() if len(w) <= 30)
 
 
+# ── MSX serial bridge (port 2323) ─────────────────────────────────────────
+#
+# The on-MSX side talks a request/response line protocol over RS-232:
+#
+#     MSX -> bridge:  GET <target>\r\n
+#     bridge -> MSX:  OK <kind> <length>\r\n<body>          for kind in {HTM, PCX}
+#                     OK HTM <length> <page>/<total>\r\n<body>  paginated frame
+#                     ERR <code>\r\n                         404 / 500 / etc.
+#
+# <target> is one of:
+#     PROBE              - link-rate negotiation, replies with empty OK HTM
+#     IMG ON | IMG OFF   - per-session inline-image toggle (no_images)
+#     MORE               - fetch the next paginated chunk
+#     imNN.pcx           - serve a previously-minted image handle as PCX
+#     <url>              - http(s):// URL or bare hostname; fetched, simplified,
+#                          chunked if --pagination, returned as OK HTM[P].
+#
+# Output bytes are encoded in WIRE_CHARSET (ISO-8859-6) so the on-MSX
+# renderer can render Arabic without an extra transcode step. The bridge
+# trickles bytes out in 64-byte bursts with a 5 ms gap so the emulated
+# i8251 has time to drain the FIFO between sends.
+
+WIRE_CHARSET = "iso-8859-6"
+
+# Pagination simulator constants (mirror the on-MSX renderer): each
+# block-end tag advances a virtual TextY in pixels, doubled inside
+# <h1>/<h2>. We cut the chunk at the first safe boundary that would
+# push us past VIEWPORT_PX.
+SERIAL_LINE_CHARS      = 60
+SERIAL_VIEWPORT_PX     = 175
+SERIAL_TEXT_LINE_PX    = 8
+SERIAL_TR_LINE_PX      = 10
+SERIAL_MAX_CHUNK_BYTES = 6000
+
+_SERIAL_LINE_END_RE = re.compile(
+    rb"(?i)<br\s*/?>|</p>|</tr>|</li>|</h[1-6]>|</div>|</center>")
+_SERIAL_TR_END_RE   = re.compile(rb"(?i)</tr>")
+_SERIAL_SCALE2_OPEN  = re.compile(rb"(?i)<h[12](?:\s[^>]*)?>")
+_SERIAL_SCALE2_CLOSE = re.compile(rb"(?i)</h[12]>")
+
+
+def _serial_split_into_chunks(body):
+    """Walk `body` simulating the on-MSX renderer in pixels: every
+    block-end marker advances a virtual TextY (8 px standard, 10 px
+    for </tr>, doubled inside <h1>/<h2>); a text run that wraps past
+    LINE_CHARS spills onto another line at the current scale. Cut at
+    the first safe boundary whose advance would push past
+    VIEWPORT_PX. Falls back to MAX_CHUNK_BYTES + last '>' for
+    pathological pages with no usable line markers."""
+    chunks = []
+    pos, n = 0, len(body)
+    while pos < n:
+        end_limit = min(pos + SERIAL_MAX_CHUNK_BYTES, n)
+        i = pos
+        scale = 1
+        cur_chars = 0
+        used_px = 0
+        last_safe = -1
+        while i < end_limit:
+            if body[i] == 0x3C:                        # '<'
+                tag_end = body.find(b">", i, end_limit)
+                if tag_end == -1:
+                    break
+                tag = body[i:tag_end + 1]
+                low = tag.lower()
+                if _SERIAL_SCALE2_OPEN.match(low):
+                    scale = 2
+                elif _SERIAL_SCALE2_CLOSE.match(low):
+                    scale = 1
+                if _SERIAL_LINE_END_RE.match(low):
+                    per_px = (SERIAL_TR_LINE_PX
+                              if _SERIAL_TR_END_RE.match(low)
+                              else SERIAL_TEXT_LINE_PX) * scale
+                    if cur_chars > 0:
+                        wrap_lines = ((cur_chars + SERIAL_LINE_CHARS - 1)
+                                      // SERIAL_LINE_CHARS)
+                        used_px += wrap_lines * SERIAL_TEXT_LINE_PX * scale
+                    else:
+                        used_px += per_px
+                    cur_chars = 0
+                    last_safe = tag_end + 1
+                    if used_px >= SERIAL_VIEWPORT_PX:
+                        break
+                i = tag_end + 1
+            else:
+                b = body[i]
+                if b in (0x20, 0x09, 0x0A, 0x0D):
+                    if cur_chars > 0:
+                        cur_chars += 1
+                        if cur_chars >= SERIAL_LINE_CHARS:
+                            used_px += SERIAL_TEXT_LINE_PX * scale
+                            cur_chars = 0
+                else:
+                    cur_chars += 1
+                    if cur_chars >= SERIAL_LINE_CHARS:
+                        used_px += SERIAL_TEXT_LINE_PX * scale
+                        cur_chars = 0
+                i += 1
+        if end_limit == n and used_px < SERIAL_VIEWPORT_PX:
+            chunks.append(body[pos:])
+            break
+        if last_safe > pos:
+            cut = last_safe
+        else:
+            gt = body.rfind(b">", pos, end_limit)
+            cut = gt + 1 if gt != -1 else end_limit
+        chunks.append(body[pos:cut])
+        pos = cut
+    return chunks if chunks else [body]
+
+
+# Regex matching transform_html's <img src="/img/<URL>?_w=&_h="> output.
+# We rewrite those proxy URLs into imNN.pcx handles so the on-MSX side
+# only ever sees handles it knows how to fetch over the serial wire.
+_PROXY_IMG_SRC_RE = re.compile(r'src="(/img/[^"]+)"')
+
+
+class MsxSession:
+    """Per-connection state for the MSX serial protocol. Tracks the
+    pending paginated chunks of the current page plus the imNN.pcx
+    handle cache. A new session is created on every TCP accept so a
+    boot of MWBRO.COM gets a clean slate without having to reset
+    state by hand."""
+
+    def __init__(self, verbose=False):
+        self.verbose = verbose
+        self.pending_chunks = []
+        self.page_total = 0
+        self.page_served = 0
+        self.img_cache = {}      # handle -> (url, declared_w, declared_h)
+        self.img_counter = 0
+
+    def _log(self, msg):
+        if self.verbose:
+            print("  Serial   : {}".format(msg), flush=True)
+
+    # -- public ---------------------------------------------------------
+
+    def handle_get(self, target):
+        self._log("GET {!r}".format(target))
+
+        upper = target.upper()
+        if upper == "MORE":
+            return self._serve_next_chunk()
+        if upper == "PROBE":
+            self._log("link-rate probe -> OK HTM 0")
+            return ("HTM", b"")
+        if upper == "IMG ON":
+            CFG["no_images"] = False
+            self._log("images ON")
+            return ("HTM", b"")
+        if upper == "IMG OFF":
+            CFG["no_images"] = True
+            self._log("images OFF")
+            return ("HTM", b"")
+
+        if re.fullmatch(r"im\d+\.pcx", target, flags=re.I):
+            entry = self.img_cache.get(target.lower())
+            if not entry or CFG["no_images"]:
+                return ("404", None)
+            url, dw, dh = entry
+            return self._fetch_image_to_pcx(url, dw, dh)
+
+        if target.lower().startswith(("http://", "https://")):
+            return self._fetch_page(target)
+        if "." in target or target.startswith("/"):
+            return self._fetch_page("http://" + target.lstrip("/"))
+        return ("404", None)
+
+    # -- HTML fetch + simplify -----------------------------------------
+
+    def _fetch_page(self, url):
+        # Drop pagination / image cache from the previous page before
+        # touching the network, so a failed fetch doesn't leave stale
+        # chunks in place for the next GET MORE.
+        self.pending_chunks = []
+        self.page_total = 0
+        self.page_served = 0
+        self.img_cache = {}
+        self.img_counter = 0
+        try:
+            resp = _session.get(
+                url, headers=_fetch_headers_for(url),
+                timeout=FETCH_TIMEOUT, allow_redirects=True,
+            )
+            resp.raise_for_status()
+        except Exception as exc:
+            self._log("fetch failed: {}".format(exc))
+            return ("404", None)
+
+        ctype = resp.headers.get("Content-Type", "").lower()
+        if ctype.startswith("image/"):
+            return self._convert_image_bytes(resp.content)
+        if "text/html" not in ctype and "text/plain" not in ctype:
+            return ("404", None)
+
+        host = (urlparse(resp.url).hostname or "").lower()
+        try:
+            if _is_passthrough_host(host):
+                # _passthrough_html populates _IMG_HANDLE_CACHE; absorb
+                # those into the per-session cache.
+                _IMG_HANDLE_CACHE.clear()
+                title, content, is_rtl, _, _, _ = _passthrough_html(
+                    resp.content, resp.url, "msx-serial")
+                self.img_cache.update({k: v for k, v
+                                       in _IMG_HANDLE_CACHE.items()})
+                # Renumber: passthrough started at im01; the session counter
+                # tracks the highest minted index for any subsequent renumber.
+                self.img_counter = max(self.img_counter,
+                                       len(self.img_cache))
+            else:
+                title, content, is_rtl, _, _, _, _ = transform_html(
+                    resp.content, resp.url, "msx-serial", False)
+                # transform_html emits src="/img/<URL>?_w=W&_h=H". Convert
+                # those proxy URLs into im NN.pcx handles so the on-MSX
+                # side requests them over the serial wire we already have.
+                content = self._mint_handles_from_proxy_urls(content)
+        except Exception as exc:
+            self._log("transform error: {}".format(exc))
+            return ("404", None)
+
+        # Build a minimal MSX wrapper: <html><head><title>…</title></head>
+        # <body>…</body></html>. The on-MSX renderer reads <title> for the
+        # titlebar and ignores everything else in <head>, so no chrome.
+        title_safe = (title or "").replace("&", "&amp;") \
+                                  .replace("<", "&lt;") \
+                                  .replace(">", "&gt;")
+        html_dir = ' dir="rtl"' if is_rtl else ""
+        full = (
+            "<html{dir}><head><title>{t}</title></head>"
+            "<body>{c}</body></html>"
+        ).format(dir=html_dir, t=title_safe, c=content)
+        body = full.encode(WIRE_CHARSET, "replace")
+
+        if CFG["paginate"]:
+            chunks = _serial_split_into_chunks(body)
+        else:
+            chunks = [body]
+        self.pending_chunks = chunks
+        self.page_total = len(chunks)
+        self.page_served = 0
+        self._log("HTM {} B -> {} chunk(s) from {}".format(
+            len(body), self.page_total, resp.url))
+        return self._serve_next_chunk()
+
+    def _mint_handles_from_proxy_urls(self, html_str):
+        """transform_html outputs <img src="/img/<URL>?_w=W&_h=H">; we
+        replace those with imNN.pcx handles so the MSX-side fetch path
+        (GET imNN.pcx) can resolve them through this session."""
+        def repl(m):
+            inner = m.group(1)[5:]                       # strip "/img/"
+            mw = re.search(r'[?&]_w=(\d+)', inner)
+            mh = re.search(r'[?&]_h=(\d+)', inner)
+            w = int(mw.group(1)) if mw else None
+            h = int(mh.group(1)) if mh else None
+            url = re.sub(r'[?&]_[wh]=\d+', '', inner)
+            url = url.replace('?&', '?').rstrip('?')
+            self.img_counter += 1
+            handle = "im{:02d}.pcx".format(self.img_counter)
+            self.img_cache[handle] = (url, w, h)
+            return 'src="{}"'.format(handle)
+        return _PROXY_IMG_SRC_RE.sub(repl, html_str)
+
+    def _serve_next_chunk(self):
+        if not self.pending_chunks:
+            return ("404", None)
+        chunk = self.pending_chunks.pop(0)
+        self.page_served += 1
+        return ("HTMP", (chunk, self.page_served, self.page_total))
+
+    # -- Image fetch + PCX encode --------------------------------------
+
+    def _fetch_image_to_pcx(self, url, declared_w, declared_h):
+        try:
+            resp = _session.get(url, headers=_fetch_headers_for(url),
+                                timeout=FETCH_TIMEOUT, stream=True)
+            resp.raise_for_status()
+            ctype = resp.headers.get("Content-Type", "image/jpeg")
+            ctype = ctype.split(";")[0].strip()
+            pcx, _ = _process_image_bytes(
+                resp.content, ctype, url,
+                declared_w or 0, declared_h or 0)
+            return ("PCX", pcx)
+        except Exception as exc:
+            self._log("image fetch failed for {}: {}".format(url, exc))
+            return ("404", None)
+
+    def _convert_image_bytes(self, raw):
+        try:
+            pcx, _ = _process_image_bytes(raw, "image/jpeg", "")
+            return ("PCX", pcx)
+        except Exception:
+            return ("404", None)
+
+
+def _serial_readline(conn):
+    """Read until CRLF or 4 KB, whichever comes first. Returns the
+    raw bytes including the CRLF (or partial line on disconnect)."""
+    buf = bytearray()
+    while True:
+        b = conn.recv(1)
+        if not b:
+            return bytes(buf)
+        buf.extend(b)
+        if buf.endswith(b"\r\n"):
+            return bytes(buf)
+        if len(buf) > 4096:
+            return bytes(buf)
+
+
+def _serial_slow_send(conn, body, chunk=64, gap=0.005):
+    """Trickle `body` out in 64-byte bursts with 5 ms gaps so the
+    emulated 8251 UART can drain the FIFO between sends. Without
+    this, a single sendall() of a few hundred bytes overruns the
+    1-byte FIFO before the on-MSX poll loop picks them up."""
+    for i in range(0, len(body), chunk):
+        conn.sendall(body[i:i + chunk])
+        time.sleep(gap)
+
+
+def _serial_send_response(conn, kind, body):
+    if kind in ("HTM", "PCX"):
+        header = "OK {} {}\r\n".format(kind, len(body)).encode("ascii")
+        conn.sendall(header)
+        _serial_slow_send(conn, body)
+    elif kind == "HTMP":
+        chunk, page, total = body
+        if total > 1:
+            header = "OK HTM {} {}/{}\r\n".format(
+                len(chunk), page, total).encode("ascii")
+        else:
+            header = "OK HTM {}\r\n".format(len(chunk)).encode("ascii")
+        conn.sendall(header)
+        _serial_slow_send(conn, chunk)
+    elif kind == "404":
+        conn.sendall(b"ERR 404\r\n")
+    else:
+        conn.sendall(b"ERR 500\r\n")
+
+
+def _serial_serve_forever(host, port, verbose=False):
+    """Run the MSX serial protocol on (host, port). One connection at
+    a time; openMSX's rs232-net plug connects out to us. Spawn this
+    inside a daemon thread so the HTTP server keeps running too."""
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind((host, port))
+    srv.listen(1)
+    print("  Serial   : listening on {}:{}".format(host, port), flush=True)
+    while True:
+        try:
+            conn, addr = srv.accept()
+        except OSError:
+            break
+        print("  Serial   : connection from {}".format(addr), flush=True)
+        sess = MsxSession(verbose=verbose)
+        try:
+            while True:
+                line = _serial_readline(conn)
+                if not line:
+                    break
+                text = line.rstrip(b"\r\n").decode("ascii", "replace")
+                if not text.startswith("GET "):
+                    _serial_send_response(conn, "500", None)
+                    continue
+                target = text[4:]
+                kind, body = sess.handle_get(target)
+                _serial_send_response(conn, kind, body)
+        except (ConnectionError, OSError) as exc:
+            print("  Serial   : session error: {}".format(exc),
+                  file=sys.stderr, flush=True)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            print("  Serial   : disconnected", flush=True)
+
+
 # ── HTTP handler ───────────────────────────────────────────────────────────
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -5261,6 +5642,21 @@ def main():
                          "CSS-grid-to-table layout pass and the "
                          "Sabq/XenForo/YouTube extractors. Repeatable. "
                          "frogfind.com is included by default.")
+    ap.add_argument("--serial-host", default="127.0.0.1",
+                    help="Bind address for the MSX serial protocol "
+                         "(default: 127.0.0.1).")
+    ap.add_argument("--serial-port", type=int, default=2323,
+                    help="TCP port the MSX serial protocol listens on "
+                         "(default: 2323). openMSX's rs232-net plug "
+                         "connects out to this port.")
+    ap.add_argument("--no-serial", action="store_true",
+                    help="Disable the MSX serial listener; only run the "
+                         "HTTP simplifier on --port. Useful when the "
+                         "machine is also running the simulator and the "
+                         "real openMSX is talking to a different bridge "
+                         "instance.")
+    ap.add_argument("--verbose", action="store_true",
+                    help="Log every GET on the serial wire.")
     args = ap.parse_args()
     CFG["no_images"] = bool(args.no_images)
     CFG["paginate"]  = not bool(args.no_pagination)
@@ -5287,9 +5683,23 @@ if __name__ == "__main__":
         print("  Defaults : images={}  pagination={}".format(
             "OFF" if CFG["no_images"] else "ON",
             "ON"  if CFG["paginate"]  else "OFF"))
-        print("  Listening on  http://{}:{}".format(_args.host, _args.port))
+        if CFG["passthrough_hosts"] or _PASSTHROUGH_HOSTS:
+            _hosts = sorted(_PASSTHROUGH_HOSTS | CFG["passthrough_hosts"])
+            print("  Passthru : {}".format(", ".join(_hosts)))
+        print("  HTTP     : http://{}:{}".format(_args.host, _args.port))
         if _args.host in ("0.0.0.0", ""):
-            print("  Open          http://{}:{}".format(SERVER_IP, _args.port))
+            print("             http://{}:{}".format(SERVER_IP, _args.port))
+        # MSX serial listener runs in a daemon thread so Ctrl-C on the
+        # main HTTP loop tears the whole process down cleanly.
+        if not _args.no_serial:
+            t = threading.Thread(
+                target=_serial_serve_forever,
+                args=(_args.serial_host, _args.serial_port, _args.verbose),
+                daemon=True,
+            )
+            t.start()
+        else:
+            print("  Serial   : disabled (--no-serial)")
         print("  Stop with     Ctrl-C")
         print()
         try:
