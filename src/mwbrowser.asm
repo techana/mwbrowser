@@ -167,7 +167,7 @@ URL_MAX        equ 255         ; address-bar / fetch-target buffer cap (chars
                                ; before NUL). Bumped from 95 because real
                                ; mirror.aratab.com URLs run past the 100-char
                                ; line and got truncated on click.
-FILE_BUF_SIZE  equ 0x3600      ; 13.5 KB. Sized so FILEBUF_BASE (0x9600) +
+FILE_BUF_SIZE  equ 0x3400      ; 13 KB. Sized so FILEBUF_BASE (0x9800) +
                                ; FILE_BUF_SIZE + FONT_BUF_SIZE + 128 lands
                                ; at 0xD480 -- below both MSX-DOS 1.03's
                                ; *runtime* HIMEM (~0xDF94 on Sony HB-F1XD,
@@ -5117,10 +5117,13 @@ LineCacheMaybeAppend:
     ld      a, [LineCacheCount]
     cp      LineCacheMax
     ret     nc                          ; cache full -> skip
+    call    IsLineCacheStateSafe
+    ret     nz                          ; unsafe scope open -> skip
     push    hl
     push    de
     push    bc
-    ; Index byte = count * 2 (word stride).
+    ld      a, [LineCacheCount]
+    ; Index byte = count * 2 (word stride for line_no and doc_offset).
     add     a, a
     ld      c, a
     ld      b, 0
@@ -5144,18 +5147,160 @@ LineCacheMaybeAppend:
     ld      [hl], e
     inc     hl
     ld      [hl], d
-    ; Bump LineCacheCount.
-    ld      hl, LineCacheCount
-    inc     [hl]
+    ; Slot 3: parser state snapshot (8 bytes, LineCacheState +
+    ; count*8). LineCacheCount is unbumped at this point, so the
+    ; snapshot goes into the same slot as the line_no/doc_offset
+    ; we just wrote.
     pop     bc
     pop     de
     pop     hl
+    call    LineCacheSnapshot
+    ; Bump LineCacheCount only after both halves landed cleanly so a
+    ; partially-written slot can never be observed.
+    push    hl
+    ld      hl, LineCacheCount
+    inc     [hl]
+    pop     hl
+    ret
+
+; IsLineCacheStateSafe: returns Z (with A=0) when the parser's "open
+; scopes" are all at default values, NZ otherwise. Safe scope means
+; LineCacheRestore can rebuild every parser variable from the 8-byte
+; snapshot alone -- without any line-buffer replay or attribute fix-up.
+;
+; The cheap-out test sequence collapses 8 byte-equality checks into a
+; single OR pile. We OR the deltas together; A == 0 at the end means
+; every variable matched its default. Two of the variables don't have
+; "0" as default: HtmlScaleY default is 1 (subtract 1 first) and
+; HtmlFormFocus default is 0xFF (invert first). Other variables
+; default to zero / closed.
+;
+; Clobbers A, B; preserves HL/DE/BC/IX/IY.
+IsLineCacheStateSafe:
+    push    bc
+    ld      a, [HtmlInTable]
+    ld      b, a
+    ld      a, [HtmlInScript]
+    or      b
+    ld      b, a
+    ld      a, [HtmlFgDepth]
+    or      b
+    ld      b, a
+    ld      a, [HtmlCurHrefLen]
+    or      b
+    ld      b, a
+    ld      a, [HtmlStyleFlags]
+    or      b
+    ld      b, a
+    ld      a, [HtmlLiPending]
+    or      b
+    ld      b, a
+    ld      a, [PlainTextMode]
+    or      b
+    ld      b, a
+    ld      a, [HtmlScaleY]
+    dec     a                           ; default 1 -> 0
+    or      b
+    ld      b, a
+    ld      a, [HtmlFormFocus]
+    cpl                                  ; default 0xFF -> 0
+    or      b
+    pop     bc
+    ret
+
+; LineCacheSnapshot: pack the live parser state into LineCacheState +
+; LineCacheCount * 8. Caller must have ensured the slot index is in
+; range and IsLineCacheStateSafe just returned Z. Bumping the count
+; is the caller's job (LineCacheMaybeAppend).
+;
+; Slot bytes (must match LineCacheRestore):
+;   +0 HtmlScaleY  +1 HtmlListKind   +2 HtmlOlCounter +3 HtmlIndent
+;   +4 HtmlAlign   +5 HtmlDir        +6 HtmlFg        +7 (reserved)
+;
+; Clobbers A, HL, DE.
+LineCacheSnapshot:
+    push    bc
+    ld      a, [LineCacheCount]
+    ; index = count * 8 = count << 3
+    add     a, a
+    add     a, a
+    add     a, a
+    ld      e, a
+    ld      d, 0
+    ld      hl, LineCacheState
+    add     hl, de                      ; HL -> slot base
+    ld      a, [HtmlScaleY]
+    ld      [hl], a
+    inc     hl
+    ld      a, [HtmlListKind]
+    ld      [hl], a
+    inc     hl
+    ld      a, [HtmlOlCounter]
+    ld      [hl], a
+    inc     hl
+    ld      a, [HtmlIndent]
+    ld      [hl], a
+    inc     hl
+    ld      a, [HtmlAlign]
+    ld      [hl], a
+    inc     hl
+    ld      a, [HtmlDir]
+    ld      [hl], a
+    inc     hl
+    ld      a, [HtmlFg]
+    ld      [hl], a
+    inc     hl
+    xor     a
+    ld      [hl], a                     ; reserved byte
+    pop     bc
+    ret
+
+; LineCacheRestore: read slot A's snapshot back into the parser
+; globals. A = slot index (0..LineCacheCount-1); caller must
+; range-check. Phase 5's EnsureWindow is the first caller; today this
+; routine is reachable only from a future patch, so it has no live
+; site yet but is built and assembled to pin down the layout
+; alongside Snapshot.
+;
+; Clobbers A, HL, DE.
+LineCacheRestore:
+    push    bc
+    add     a, a
+    add     a, a
+    add     a, a
+    ld      e, a
+    ld      d, 0
+    ld      hl, LineCacheState
+    add     hl, de                      ; HL -> slot base
+    ld      a, [hl]
+    ld      [HtmlScaleY], a
+    inc     hl
+    ld      a, [hl]
+    ld      [HtmlListKind], a
+    inc     hl
+    ld      a, [hl]
+    ld      [HtmlOlCounter], a
+    inc     hl
+    ld      a, [hl]
+    ld      [HtmlIndent], a
+    inc     hl
+    ld      a, [hl]
+    ld      [HtmlAlign], a
+    inc     hl
+    ld      a, [hl]
+    ld      [HtmlDir], a
+    inc     hl
+    ld      a, [hl]
+    ld      [HtmlFg], a
+    pop     bc
     ret
 
 ; LineCacheReset: empty the cache. Called by LoadFile / RemoteLoadFile
 ; on every fresh document load -- prior offsets refer to bytes that
 ; have been overwritten in FileBuf and would point into the wrong
-; document if we tried to use them post-load.
+; document if we tried to use them post-load. We leave the byte
+; arrays uncleared (LineCacheCount gates reads) so the reset is one
+; instruction.
 LineCacheReset:
     xor     a
     ld      [LineCacheCount], a
@@ -15260,14 +15405,14 @@ Fcb:            ds 37                   ; MSX-DOS 1 FCB (36 bytes + 1 pad)
 WindowLen:      dw 0                    ; bytes currently in the FileBuf window
 DocOffset:      dw 0                    ; FileBuf[0] = byte DocOffset of doc
 
-; Restart-point cache (file_load_architecture Phase 3).
+; Restart-point cache (file_load_architecture Phases 3 + 4).
 ;
 ; During the initial-render pass (HtmlLineSkip == 0) the parser populates
-; LineCache[i] = (line_number, doc_offset) at every safe EmitNewline.
-; Phase 4 will widen the entry to also carry parser-state snapshots,
-; and Phase 5 will read the cache to jump to a target line without
-; replaying the whole document. Today the cache is write-only -- nobody
-; reads it yet -- so this commit is purely plumbing.
+; LineCache[i] = (line_number, doc_offset, parser_state) at every safe
+; EmitNewline. Phase 5 will read the cache to jump to a target line
+; without replaying the whole document; today the cache is still
+; write-only -- the snapshot half of the pair is in place but no
+; consumer calls LineCacheRestore yet.
 ;
 ; Entry policy: append until the cache is full (LineCacheCount ==
 ; LineCacheMax), then stop. Later phases swap this for a sampled /
@@ -15275,10 +15420,32 @@ DocOffset:      dw 0                    ; FileBuf[0] = byte DocOffset of doc
 ;
 ; Reset policy: LoadFile / RemoteLoadFile zero LineCacheCount because a
 ; new document invalidates every prior offset.
-LineCacheMax    equ 32
+;
+; Safe-state predicate (Phase 4): an EmitNewline boundary is safe to
+; cache only when every "currently open scope" counter sits at its
+; default value -- no <table>, no <script>, no <font> color, no form
+; widget, no <a>, no <b>/<i>/<u>/<s>, no pending list bullet, not
+; PlainTextMode, and not mid-heading (ScaleY == 1). Inside any of
+; those scopes the parser carries hidden state in the line buffer
+; (LineGlyph attrs, ArBuf shaping, table-cell positions, form-input
+; cursors, ...) that LineCacheRestore can't reconstruct from an
+; 8-byte slot. Skip and try again at the next line.
+;
+; Snapshot slot layout (LineCacheState[i], 8 bytes):
+;   +0: HtmlScaleY     +4: HtmlAlign
+;   +1: HtmlListKind   +5: HtmlDir
+;   +2: HtmlOlCounter  +6: HtmlFg
+;   +3: HtmlIndent     +7: reserved
+;
+; The slot is sized to 8 even though only 7 fields are live so the
+; per-slot stride is a clean shift instead of a multiply, and so
+; future state additions don't grow the cache footprint.
+LineCacheMax     equ 32
+LineCacheStateSz equ 8                  ; bytes per snapshot slot
 LineCacheCount: db 0
 LineCacheLineNo: ds LineCacheMax * 2    ; rendered line number
 LineCacheDocOff: ds LineCacheMax * 2    ; matching DocOffset + (cursor - FileBuf)
+LineCacheState:  ds LineCacheMax * LineCacheStateSz   ; packed parser state
 
 ScrollLine:     dw 0                    ; first visible line (0 = top of file)
 TotalLines:     dw 0                    ; rendered line count for thumb math
@@ -15558,11 +15725,11 @@ FileEnd:
 ; the budget at build time so future code growth fails the build
 ; instead of regressing silently.
 
-FILEBUF_BASE   equ 0x9600              ; aligned past current FileEnd
-                                       ; (~0x952A after Phase 2's
-                                       ; LoadFileChunk + DOS_RDRND wrapper
-                                       ; added ~175 bytes); bump
-                                       ; further if the ASSERT trips.
+FILEBUF_BASE   equ 0x9800              ; aligned past current FileEnd
+                                       ; (~0x9755 after Phase 4's parser-
+                                       ; state Snapshot/Restore + 256 B of
+                                       ; LineCacheState added ~340 B);
+                                       ; bump further if the ASSERT trips.
 
 FileBuf        equ FILEBUF_BASE
 FontBuf        equ FileBuf + FILE_BUF_SIZE
