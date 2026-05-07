@@ -161,7 +161,7 @@ URL_MAX        equ 255         ; address-bar / fetch-target buffer cap (chars
                                ; before NUL). Bumped from 95 because real
                                ; mirror.aratab.com URLs run past the 100-char
                                ; line and got truncated on click.
-FILE_BUF_SIZE  equ 0x3800      ; 14 KB. Sized so FILEBUF_BASE (0x9400) +
+FILE_BUF_SIZE  equ 0x3700      ; 13.75 KB. Sized so FILEBUF_BASE (0x9500) +
                                ; FILE_BUF_SIZE + FONT_BUF_SIZE + 128 lands
                                ; at 0xD480 -- below both MSX-DOS 1.03's
                                ; *runtime* HIMEM (~0xDF94 on Sony HB-F1XD,
@@ -5110,7 +5110,11 @@ ParseTag:
 .attrsDone:
 
     ; DispatchTag clobbers HL to walk the tag table; preserve the source
-    ; pointer so PrintFileContent resumes at the right byte.
+    ; pointer so PrintFileContent resumes at the right byte. Also expose
+    ; the post-tag cursor via ParserCursor so handlers that need to
+    ; prescan FileBuf (TagTableTag's first-row column count) don't have
+    ; to fish HL off the stack.
+    ld      [ParserCursor], hl
     push    hl
     call    DispatchTag
     pop     hl
@@ -9192,6 +9196,16 @@ TagTableTag:
     ld      a, [HtmlNextBorder]
     ld      [HtmlTableBorder], a        ; latch for the duration of the table
 
+    ; Pick a column layout from the cell count in the first <tr>. Without
+    ; this prescan, every table fell back to the static icon-layout (col 0
+    ; = 24 px) which clipped general 3-col data tables (test4 / BENCHTX).
+    ; MeasureTableCols snapshots ParserCursor / HtmlEnd, walks ahead, and
+    ; updates HtmlTableColCount; SetTableColLayout swings the layout
+    ; pointers so every TagTd / DrawTableVerticals call below sees the
+    ; matching geometry.
+    call    MeasureTableCols
+    call    SetTableColLayout
+
     call    DrawTableRuleHere
     ld      a, [TextY]
     ld      [TableTopY], a              ; remember top for full-height borders
@@ -9251,16 +9265,45 @@ DrawTableVerticals:
     inc     a
     ld      [BorderHeight], a
 
+    ; Left edge.
     ld      b, (TABLE_LEFT_PX - 4) / 4
     call    .dtvBar
-    ld      b, (40 - 4) / 4
+
+    ; Inner dividers, one per column boundary (so a 3-col table draws
+    ; 2 inner verticals, 5-col draws 4, 1-col draws none). Walk
+    ; TableColStartXPtr starting at col 1's start word and convert each
+    ; (start - 4) into a byte column for FillRect.
+    ld      a, [HtmlTableColCount]
+    dec     a
+    jr      z, .dtvRight                ; N=1 -> only outer borders
+    ld      c, a                        ; C = inner divider count
+    ld      hl, [TableColStartXPtr]
+    inc     hl
+    inc     hl                          ; skip col 0; HL -> col 1's start word
+.dtvInner:
+    push    bc
+    push    hl
+    ld      e, [hl]
+    inc     hl
+    ld      d, [hl]                     ; DE = cell start X
+    dec     de
+    dec     de
+    dec     de
+    dec     de                          ; DE -= 4 (sit in the gap before the cell)
+    srl     d
+    rr      e
+    srl     d
+    rr      e                           ; DE /= 4 (X in 4-px byte cols)
+    ld      b, e                        ; X < 512 so D=0 already
     call    .dtvBar
-    ld      b, (192 - 4) / 4
-    call    .dtvBar
-    ld      b, (308 - 4) / 4
-    call    .dtvBar
-    ld      b, (352 - 4) / 4
-    call    .dtvBar
+    pop     hl
+    inc     hl
+    inc     hl                          ; advance to next col's start word
+    pop     bc
+    dec     c
+    jr      nz, .dtvInner
+
+.dtvRight:
     ld      b, TABLE_RIGHT_PX / 4
     ; fall through for the right border
 
@@ -9382,35 +9425,40 @@ TagTd:
     ld      [TextY], a
 
     ; Compute cell start X from TableColStartX[index]. Under RTL we
-    ; mirror the column so col 0 lands at the rightmost position. The
-    ; position table has five slots whose left-right order is flipped
-    ; for RTL -- columns past the fifth fall back to the extreme slot.
+    ; mirror inside the active column count so col 0 lands at the
+    ; rightmost populated slot (and trailing zeroed slots stay
+    ; unreachable). When MeasureTableCols set HtmlTableColCount=3, RTL
+    ; index = (3-1) - col = 2 - col, hitting the populated slots 0..2
+    ; rather than the zeroed slots 3..4 the old `4 - col` flip aimed at.
     ld      a, [HtmlTableCol]
-    cp      5
-    jr      c, .okCol
-    ld      a, 4
-.okCol:
     ld      b, a
+    ld      a, [HtmlTableColCount]
+    dec     a                           ; A = (count - 1) = max valid index
+    cp      b
+    jr      nc, .okCol
+    ld      b, a                        ; clamp HtmlTableCol > count-1 to last
+.okCol:
     ld      a, [HtmlDir]
     or      a
     jr      z, .ltrCol
-    ld      a, 4
-    sub     b                           ; RTL: index = 4 - HtmlTableCol
+    ld      a, [HtmlTableColCount]
+    dec     a
+    sub     b                           ; RTL: index = (count - 1) - HtmlTableCol
     ld      b, a
 .ltrCol:
     ld      e, b
     ld      d, 0
-    ld      hl, TableColStartX
+    ld      hl, [TableColStartXPtr]     ; layout chosen at <table> open
     add     hl, de
     add     hl, de                      ; *2 for word-sized entries
     ld      e, [hl]
     inc     hl
     ld      d, [hl]                     ; DE = cell start X (2 bytes)
-    ; Cell end X comes from TableColEndX at the same physical index.
+    ; Cell end X comes from TableColEndXPtr at the same physical index.
     push    de
     ld      e, b
     ld      d, 0
-    ld      hl, TableColEndX
+    ld      hl, [TableColEndXPtr]
     add     hl, de
     add     hl, de
     ld      a, [hl]
@@ -9514,23 +9562,170 @@ FlushPendingCell:
 ; forces small rounding, so the actual numbers are 12 / 11.
 TABLE_LEFT_PX  equ 12
 TABLE_RIGHT_PX equ 480
-; Five fixed column slots, sized to fit the most common 5-column tables
-; we see (Apache directory listings: icon | name | date | size | desc).
-; Tables with 1..4 columns just don't reach the higher slots; tables
-; with 6+ columns clamp the extras into slot 4.
-;   col 0: 12..36   24 px  = 3 chars  (icon)
-;   col 1: 40..188  148 px = 18 chars (name / longest text)
-;   col 2: 192..304 112 px = 14 chars (date)
-;   col 3: 308..348 40 px  = 5 chars  (size)
-;   col 4: 352..480 128 px = 16 chars (description)
-TableColStartX:
-    dw  TABLE_LEFT_PX, 40, 192, 308, 352
-; Right edge (inclusive) for each column; used by RTL cell right-align
-; and by the full-height border draw below. The last column stretches
-; to TABLE_RIGHT_PX; the earlier columns stop 4 px before the next
-; column's content X so the vertical divider can land in the gap.
-TableColEndX:
-    dw  36, 188, 304, 348, TABLE_RIGHT_PX
+; Five fixed layouts indexed by HtmlTableColCount-1. Each layout is a
+; pair of word arrays: 5 column-start X values followed by 5 column-end
+; X values, all multiples of 4 so the inner divider strokes land on
+; byte boundaries. Slots past the live column count read as zeros (or
+; previous values) -- TagTd clamps the index at 4 anyway.
+;
+; The original single layout was sized for Apache directory listings
+; (icon | name | date | size | desc) with col 0 only 24 px wide. That
+; was wrong for general 3-column data tables: the first cell's text
+; (e.g. "Apples") spilled past col 0's 24 px slot and the second cell
+; landed at X=40 INSIDE the first cell's text. The bench/test4 pages
+; rendered as "Apl3s" / "Itendty" until this fix.
+;
+; Layout choice happens at <table> open after MeasureTableCols counts
+; cells in the first <tr>; SetTableColLayout copies pointers into
+; TableColStartXPtr / TableColEndXPtr so TagTd / DrawTableVerticals
+; can read column geometry through them.
+TblLayout1:
+    dw  TABLE_LEFT_PX,  0,    0,    0,    0
+    dw  TABLE_RIGHT_PX, 0,    0,    0,    0
+TblLayout2:
+    dw  TABLE_LEFT_PX,  244,  0,    0,    0
+    dw  240,            TABLE_RIGHT_PX, 0, 0, 0
+TblLayout3:
+    dw  TABLE_LEFT_PX,  168,  324,  0,    0
+    dw  164,            320,  TABLE_RIGHT_PX, 0, 0
+TblLayout4:
+    dw  TABLE_LEFT_PX,  132,  248,  364,  0
+    dw  128,            244,  360,  TABLE_RIGHT_PX, 0
+TblLayout5:
+    dw  TABLE_LEFT_PX,  108,  204,  300,  396
+    dw  104,            200,  296,  392,  TABLE_RIGHT_PX
+
+TableLayoutPtrs:
+    dw  TblLayout1, TblLayout2, TblLayout3, TblLayout4, TblLayout5
+
+; Live layout pointers, refreshed at every <table> open. Defaults point
+; at the 5-column layout so even if SetTableColLayout never fires (a
+; degenerate render path) the table still has a reasonable geometry.
+TableColStartXPtr: dw TblLayout5
+TableColEndXPtr:   dw TblLayout5 + 10     ; second half of the layout
+
+; SetTableColLayout: read HtmlTableColCount and steer
+; TableColStartXPtr / TableColEndXPtr at the matching ROM layout. Count
+; is clamped 1..5 by MeasureTableCols, so no extra range-check here.
+SetTableColLayout:
+    ld      a, [HtmlTableColCount]
+    dec     a                              ; 0..4
+    add     a, a                           ; *2 (word-sized pointer table)
+    ld      e, a
+    ld      d, 0
+    ld      hl, TableLayoutPtrs
+    add     hl, de
+    ld      a, [hl]
+    inc     hl
+    ld      h, [hl]
+    ld      l, a                           ; HL = layout base (start half)
+    ld      [TableColStartXPtr], hl
+    ld      de, 10                         ; end half sits 10 bytes (5 words) later
+    add     hl, de
+    ld      [TableColEndXPtr], hl
+    ret
+
+; MeasureTableCols: walk forward from [ParserCursor] (the byte right
+; after the open <table...>'s '>') counting <td>/<th> opens until we
+; hit </tr>, </table>, or the end of FileBuf. Result is clamped to
+; 1..5 and stored in HtmlTableColCount. Lookahead never modifies the
+; parser's main HL -- it works off ParserCursor and HtmlEnd snapshots.
+;
+; Note: BC tracks remaining bytes in the buffer (HtmlEnd - cursor) so
+; we get one cheap underflow check per byte instead of a 16-bit
+; bound-compare. Tag matching is case-insensitive via `and 0xDF` (works
+; for ASCII letters; punctuation stays distinct enough that '/' and
+; whitespace don't masquerade as a 'T'/'D'/'H'/'R').
+MeasureTableCols:
+    push    hl
+    push    de
+    push    bc
+    ld      hl, [ParserCursor]
+    ld      de, [HtmlEnd]
+    ; BC = HtmlEnd - cursor (== bytes available to scan)
+    push    hl
+    ex      de, hl
+    or      a
+    sbc     hl, de
+    ld      b, h
+    ld      c, l
+    pop     hl
+    ld      d, 0                           ; D = cell count
+.mtcLoop:
+    ld      a, b
+    or      c
+    jr      z, .mtcDone
+    ld      a, [hl]
+    inc     hl
+    dec     bc
+    cp      '<'
+    jr      nz, .mtcLoop
+    ld      a, b
+    or      c
+    jr      z, .mtcDone
+    ld      a, [hl]
+    inc     hl
+    dec     bc
+    cp      '/'
+    jr      z, .mtcCloseTag
+    and     0xDF
+    cp      'T'
+    jr      nz, .mtcLoop
+    ld      a, b
+    or      c
+    jr      z, .mtcDone
+    ld      a, [hl]
+    inc     hl
+    dec     bc
+    and     0xDF
+    cp      'D'
+    jr      z, .mtcCount
+    cp      'H'
+    jr      nz, .mtcLoop
+.mtcCount:
+    inc     d
+    ld      a, d
+    cp      8
+    jr      c, .mtcLoop                    ; sanity cap; clamp below
+    jr      .mtcDone
+.mtcCloseTag:
+    ld      a, b
+    or      c
+    jr      z, .mtcDone
+    ld      a, [hl]
+    inc     hl
+    dec     bc
+    and     0xDF
+    cp      'T'
+    jr      nz, .mtcLoop
+    ld      a, b
+    or      c
+    jr      z, .mtcDone
+    ld      a, [hl]
+    inc     hl
+    dec     bc
+    and     0xDF
+    cp      'R'
+    jr      z, .mtcDone                    ; </tr -> end of first row
+    cp      'A'
+    jr      z, .mtcDone                    ; </ta(ble) -> end of table
+    jr      .mtcLoop
+.mtcDone:
+    ld      a, d
+    or      a
+    jr      nz, .mtcGotN
+    ld      a, 1                           ; degenerate: empty table -> 1 col
+    jr      .mtcSet
+.mtcGotN:
+    cp      6
+    jr      c, .mtcSet
+    ld      a, 5                           ; clamp 6+ down to 5 (last layout)
+.mtcSet:
+    ld      [HtmlTableColCount], a
+    pop     bc
+    pop     de
+    pop     hl
+    ret
 
 ; DrawTableRuleHere: horizontal DGRAY rule at the current TextY across
 ; the table's width (from TABLE_LEFT_PX to TABLE_RIGHT_PX). Skipped
@@ -14881,8 +15076,18 @@ HtmlOlCounter:  db 0                    ; next <li> number in an <ol>
 HtmlIndent:     db 0                    ; left indent in pixels for new lines
 HtmlInTable:    db 0                    ; 1 while inside <table>
 HtmlTableCol:   db 0                    ; current cell index within a row
+HtmlTableColCount: db 5                 ; cell count in first <tr> (1..5); set by
+                                        ; MeasureTableCols at <table> open and
+                                        ; consumed by SetTableColLayout +
+                                        ; DrawTableVerticals. Default 5 keeps
+                                        ; the historical icon-layout if a tag
+                                        ; somehow renders before TagTableTag.
 HtmlTableFirst: db 0                    ; 1 if this is the very first row of the table
 HtmlRowTopY:    db 0                    ; TextY at the top of the current row (for vertical rules)
+ParserCursor:   dw 0                    ; saved parser HL at DispatchTag entry;
+                                        ; points just past the tag's '>'. Used by
+                                        ; lookahead-style handlers (currently
+                                        ; only TagTableTag's column prescan).
 HtmlSavedBold:  db 0                    ; scratch: STYLE_BOLD state before <th>
 HtmlFg:         db 3                    ; current text fg palette index (default BLACK=3)
 HtmlFgStack:    ds 4                    ; <font> stack of previous fg values
@@ -15097,9 +15302,11 @@ FileEnd:
 ; the budget at build time so future code growth fails the build
 ; instead of regressing silently.
 
-FILEBUF_BASE   equ 0x9400              ; aligned past current FileEnd
-                                       ; (0x9353); bump if the
-                                       ; build-time ASSERT below trips.
+FILEBUF_BASE   equ 0x9500              ; aligned past current FileEnd
+                                       ; (~0x9478 after the table-prescan
+                                       ; layouts + MeasureTableCols added
+                                       ; ~290 bytes of code/data); bump
+                                       ; further if the ASSERT trips.
 
 FileBuf        equ FILEBUF_BASE
 FontBuf        equ FileBuf + FILE_BUF_SIZE

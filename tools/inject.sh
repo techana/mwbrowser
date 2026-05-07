@@ -11,11 +11,20 @@ mcopy -i "$DISK" -o dist/mwbro.com ::/MWBRO.COM
 # logos, imgonly, txt) were retired when test8/test9/test10 started
 # covering the same tags + Arabic/tables. Remove stale copies from the
 # disk first so the root-dir slot budget fits the WEBSITE page set.
-for stale in TEST1.HTM TEST2.HTM TEST3.HTM TEST4.HTM TEST5.HTM TEST6.HTM \
+for stale in TEST1.HTM TEST2.HTM TEST3.HTM TEST5.HTM TEST6.HTM \
              TEST7.HTM IMGS2.HTM LOGOS.HTM IMGONLY.HTM TXT.TXT; do
     mdel -i "$DISK" "::/$stale" 2>/dev/null || true
 done
 mcopy -i "$DISK" -o samples/test.html  ::/TEST.HTM
+# test4.htm: minimal table-rendering regression page (3-column shopping
+# list). Re-shipped to investigate table corruption reported on the
+# bench HTMs.
+mcopy -i "$DISK" -o samples/test4.htm  ::/TEST4.HTM
+# rtltab.htm: 3-col RTL table covering the (count-1)-col mirror path
+# so RTL column ordering doesn't regress when the per-table layout
+# count moved off the hardcoded 5.
+[ -f samples/rtltab.htm ] && \
+    mcopy -i "$DISK" -o samples/rtltab.htm ::/RTLTAB.HTM 2>/dev/null || true
 # AUTOEXEC.BAT: MSX-DOS 1 reads this when the disk is booted from
 # (or when the user runs `command` interactively). Contains a single
 # `MWBRO` line so the browser auto-launches.
