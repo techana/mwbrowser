@@ -161,23 +161,19 @@ URL_MAX        equ 255         ; address-bar / fetch-target buffer cap (chars
                                ; before NUL). Bumped from 95 because real
                                ; mirror.aratab.com URLs run past the 100-char
                                ; line and got truncated on click.
-FILE_BUF_SIZE  equ 0x6000      ; 24 KB. Wikipedia / mirror.aratab.com pages
-                               ; routinely produce 4-5 paginated chunks at
-                               ; the bridge's ~6 KB chunk size; the previous
-                               ; 16 KB cap overflowed at chunk 3 and the
-                               ; partial-store cut tags in half, painting
-                               ; raw HTML attribute soup on page 3+. With
-                               ; FontBuf+ImgBuf above (= ~2.1 KB) the FileBuf
-                               ; tail still leaves ~9 KB stack headroom
-                               ; before BDOS at 0xF380.
-                               ; on our target machines (Sony HB-F1XD and
-                               ; AX-370), so everything we host in the TPA
-                               ; (FileBuf + FontBuf + ImgBuf) has to end
-                               ; below 0x9800 or we overwrite BDOS and the
-                               ; next command after Esc can't read the disk.
-                               ; 16 KB is comfortable for HTM bodies;
-                               ; images come in as streamed PCX chunks via
-                               ; ImgBuf / ImgStreamByte instead.
+FILE_BUF_SIZE  equ 0x5400      ; 21 KB. Sized so FILEBUF_BASE (0x9400)
+                               ; + FILE_BUF_SIZE + FONT_BUF_SIZE + 128
+                               ; lands at 0xF080 -- ~768 bytes below
+                               ; BDOS's HIMEM (~0xF380) on Sony HB-F1XD
+                               ; MSX-DOS 1.03. Reduced from 0x6000 (24 KB)
+                               ; when the FileBuf-vs-globals overlap bug
+                               ; was fixed: with FileBuf properly placed
+                               ; above the .COM image (FileEnd ~ 0x9353)
+                               ; instead of pinned at 0x6800, the upper
+                               ; bound is BDOS, not the next global. The
+                               ; bridge's 6 KB chunks still fit 3 chunks
+                               ; comfortably; wikipedia-class long
+                               ; articles flow via TryFetchMore.
 FONT_BUF_SIZE  equ 2048        ; 256 glyphs * 8 rows
 CONTENT_X_END  equ 491         ; scrollbar now starts at x=492
 TEXT_LINE_H    equ 8           ; MSX font row height
@@ -15004,23 +15000,42 @@ HtmlTableBorder: db 0                   ; live border flag for the open <table>
 FileEnd:
     SAVEBIN "dist/mwbro.com", 0x0100, FileEnd - 0x0100
 
-; FileBuf / FontBuf / ImgBuf pin at a fixed address. Empirically, letting
-; these float as the .COM grew past ~15565 B on AX-370 and ~15855 B on
-; Sony HB-F1XD caused Shutdown's palette-restore block to run via a
-; spurious jump -- almost certainly stack / return-address corruption
-; when one of these buffers crossed an address MSX-DOS or the slot
-; handler treats specially. Pinning here stops the .COM from caring
-; about its own absolute size.
+; ──────────────────────────────────────────────────────────────────
+; FileBuf / FontBuf / ImgBuf are runtime-only RAM regions placed
+; ABOVE the .COM image's last loaded byte (FileEnd). Declared via
+; `equ` so no bytes are emitted into the .COM file -- the runtime
+; RAM at these addresses is uninitialised at boot, which is fine
+; because every consumer writes before reading:
+;     FileBuf  -> LoadFile / RemoteLoadFile / TryFetchMore
+;     FontBuf  -> ExtractFont (called once at startup)
+;     ImgBuf   -> ImgStream (DMA scratch, written before each read)
 ;
-; The pin must sit ABOVE the last `ds`-allocated global; otherwise
-; FileBuf overlaps live state and serial reads silently overwrite
-; PlainTextMode / HistoryOldest / IsoMap. Bump history:
-;   0x5000 -> 0x5800 -> 0x6000 -> 0x6800
-; The latest jump made room for LINK_MAX=24 (LinkUrls grew 768 -> 2304)
-; plus the URL-encoding helpers + viewport simulator state. After each
-; bump, double-check `grep -E "^(FileEnd|FileBuf):" dist/mwbro.sym` to
-; make sure FileEnd stays below the pinned FileBuf address.
-    ORG 0x6800
-FileBuf:        ds FILE_BUF_SIZE        ; 16 KB HTTP/body landing buffer
-FontBuf:        ds FONT_BUF_SIZE        ; 2 KB MSX font pulled from CGTABL
-ImgBuf:         ds 128                  ; DMA scratch for streaming image loaders
+; Bug history (round-1 optimisation): this block was previously
+; `ORG 0x6800 / ds FILE_BUF_SIZE / ...`, with a written-down rule
+; that "FileBuf must sit ABOVE the last ds-allocated global". As the
+; .COM grew past ~26 KB, the preceding globals (HtmlTitleBuf,
+; HistoryBuf, ArBuf, PlainTextMode, LineGlyph, ...) drifted into
+; address range 0x8762..0x9293 -- *inside* the FileBuf reservation
+; at 0x6800..0xC7FF. Loading any file > ~8 KB into FileBuf then
+; silently overwrote those globals with file content, manifesting
+; as garbled rendering on large pages (BENCHTX.HTM / wikipedia).
+;
+; The fix: switch to `equ` (no overlap possible because we don't
+; emit bytes), pin FILEBUF_BASE clearly past FileEnd, and ASSERT
+; the budget at build time so future code growth fails the build
+; instead of regressing silently.
+
+FILEBUF_BASE   equ 0x9400              ; aligned past current FileEnd
+                                       ; (0x9353); bump if the
+                                       ; build-time ASSERT below trips.
+
+FileBuf        equ FILEBUF_BASE
+FontBuf        equ FileBuf + FILE_BUF_SIZE
+ImgBuf         equ FontBuf + FONT_BUF_SIZE
+
+; Build-time guard: if the .COM ever grows past FILEBUF_BASE, the
+; assembly fails instead of silently re-introducing the overlap.
+; HIMEM here is BDOS's lower edge on Sony HB-F1XD MSX-DOS 1.03
+; (~0xF380); the upper assert leaves ~768 bytes of stack headroom.
+    ASSERT FileEnd <= FILEBUF_BASE
+    ASSERT ImgBuf + 128 <= 0xF380

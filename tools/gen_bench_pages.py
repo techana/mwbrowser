@@ -72,9 +72,15 @@ def build_text_page() -> str:
     ]
 
     # Mix of headings + paragraphs. Section count tuned so the
-    # encoded output lands ~22 KB -- well under the 24 KB FileBuf cap
-    # so the page loads as a single buffer (no TryFetchMore in play).
-    for i in range(24):
+    # encoded output lands ~12 KB -- well under the 21 KB
+    # FILE_BUF_SIZE cap (post-FileBuf-overlap-fix), and small enough
+    # that the post-fix REAL parser walk (HTML tag dispatch + Arabic
+    # shaping, vs the corrupted-state PlainTextMode fast-path that
+    # was inflating the original baseline) completes in <60 s of
+    # emulated time. Earlier 23 KB version was tuned for the
+    # corrupted-state fast-path; it became unrunnably slow once the
+    # parser started doing real work.
+    for i in range(13):
         level = random.choice([2, 2, 3, 3, 4, 4, 4])
         parts.append(f"<h{level}>Section {i+1}: {sentence(2, 5)}</h{level}>")
         # Two or three paragraphs per heading.
