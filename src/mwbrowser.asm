@@ -161,23 +161,19 @@ URL_MAX        equ 255         ; address-bar / fetch-target buffer cap (chars
                                ; before NUL). Bumped from 95 because real
                                ; mirror.aratab.com URLs run past the 100-char
                                ; line and got truncated on click.
-FILE_BUF_SIZE  equ 0x6000      ; 24 KB. Wikipedia / mirror.aratab.com pages
-                               ; routinely produce 4-5 paginated chunks at
-                               ; the bridge's ~6 KB chunk size; the previous
-                               ; 16 KB cap overflowed at chunk 3 and the
-                               ; partial-store cut tags in half, painting
-                               ; raw HTML attribute soup on page 3+. With
-                               ; FontBuf+ImgBuf above (= ~2.1 KB) the FileBuf
-                               ; tail still leaves ~9 KB stack headroom
-                               ; before BDOS at 0xF380.
-                               ; on our target machines (Sony HB-F1XD and
-                               ; AX-370), so everything we host in the TPA
-                               ; (FileBuf + FontBuf + ImgBuf) has to end
-                               ; below 0x9800 or we overwrite BDOS and the
-                               ; next command after Esc can't read the disk.
-                               ; 16 KB is comfortable for HTM bodies;
-                               ; images come in as streamed PCX chunks via
-                               ; ImgBuf / ImgStreamByte instead.
+FILE_BUF_SIZE  equ 0x5400      ; 21 KB. Sized so FILEBUF_BASE (0x9400)
+                               ; + FILE_BUF_SIZE + FONT_BUF_SIZE + 128
+                               ; lands at 0xF080 -- ~768 bytes below
+                               ; BDOS's HIMEM (~0xF380) on Sony HB-F1XD
+                               ; MSX-DOS 1.03. Reduced from 0x6000 (24 KB)
+                               ; when the FileBuf-vs-globals overlap bug
+                               ; was fixed: with FileBuf properly placed
+                               ; above the .COM image (FileEnd ~ 0x9353)
+                               ; instead of pinned at 0x6800, the upper
+                               ; bound is BDOS, not the next global. The
+                               ; bridge's 6 KB chunks still fit 3 chunks
+                               ; comfortably; wikipedia-class long
+                               ; articles flow via TryFetchMore.
 FONT_BUF_SIZE  equ 2048        ; 256 glyphs * 8 rows
 CONTENT_X_END  equ 491         ; scrollbar now starts at x=492
 TEXT_LINE_H    equ 8           ; MSX font row height
@@ -232,6 +228,17 @@ Main:
     call    SerialInit
 
 MainLoop:
+    ; HALT pauses the CPU until the next interrupt -- on MSX with
+    ; default IM 1, that's the 50/60 Hz VBLANK from the VDP. Pacing
+    ; the idle loop on VBLANK gives us:
+    ;   - ~16-20 ms between mouse polls (more than smooth enough),
+    ;   - ~16-20 ms between keyboard peeks (still imperceptible),
+    ;   - 0 % CPU between events on emulators / real hardware,
+    ;   - and no busy-spin pinning openMSX's host thread at 100 %.
+    ; Interrupts are left enabled by MSX-DOS during a .COM session
+    ; so the EI guard isn't needed here. (Reference: MSX Assembly
+    ; Page summary §2 -- "EI/HALT is the canonical MSX vsync wait".)
+    halt
     call    PollMouse
 
     ; Non-blocking keyboard check. If no key, loop again (keeps polling mouse).
@@ -1635,18 +1642,41 @@ VdpSetReadAddr:
     ret
 
 ; VdpFill: DE bytes of value A, starting at VRAM addr in HL.
+;
+; Inner loop uses DJNZ as the per-iteration counter (8-bit, B reg)
+; with the `LD B,0 -> 256-iter` trick from the MSX Assembly Page,
+; bumping a high-byte counter in C every 256 bytes. Per-byte cost
+; drops from the previous `out / dec de / or-ze test / jr nz` (50
+; T-states / byte) to `out / djnz` (24 T-states / byte) -- ~52 %
+; faster on the only bulk caller (ClearContent's 27 KB startup
+; paint, which now finishes ~195 ms earlier on a 3.58 MHz Z80).
 VdpFill:
     push    af
     call    VdpSetWriteAddr
     pop     af
-.loop:
+
+    ; Split DE into (C = full-256 chunks = D, B = remainder = E).
+    ; If E (remainder) is zero, jump straight to the chunk loop;
+    ; otherwise emit the leading remainder via a single djnz pass.
+    ld      c, d                            ; C = high byte of count
+    ld      b, e                            ; B = low byte (== remainder)
+    inc     b
+    dec     b
+    jr      z, .vfChunks                    ; remainder == 0 -> chunks only
+.vfTail:
+    out     (VDP_DATA), a                   ; 11 T
+    djnz    .vfTail                         ; 13 taken / 8 not
+.vfChunks:
+    ; C iterations of 256 bytes (B=0 -> wraps 0xFF..0x01..0x00).
+    inc     c
+    dec     c
+    ret     z                                ; no full chunks left
+    ld      b, 0                            ; B = 0 -> 256 iterations
+.vfNext:
     out     (VDP_DATA), a
-    dec     de
-    ld      b, a
-    ld      a, d
-    or      e
-    ld      a, b
-    jr      nz, .loop
+    djnz    .vfNext
+    dec     c
+    jr      nz, .vfNext
     ret
 
 ; ============================================================================
@@ -1807,16 +1837,24 @@ ClearContent:
     call    PackColour
     ld      [PackedColour], a
 
-    call    VdpSetR14Zero
+    ; Screen 6's visible 212 lines × 128 bytes = 27 136 bytes = 0x6A00
+    ; sit at VRAM 0x00000..0x06A00. The first 16 KB (rows 0..127) live
+    ; in R14=0's window (A14..A16=000 -> 0x00000..0x03FFF); the trailing
+    ; 10 752 bytes (rows 128..211) sit in R14=1's window (A14..A16=001
+    ; -> 0x04000..0x07FFF). Earlier code wrote the second pass with
+    ; R14=2 (== 0x08000..0x0BFFF, off-screen scratch), which left the
+    ; bottom half of the canvas in whatever state VDP had after CHGMOD 6
+    ; -- the visible "gray bottom half on startup" bug.
+    call    VdpSetR14Zero                   ; R14 = 0 -> 0x00000..0x03FFF
     ld      hl, 0x0000
     ld      de, 0x4000
     ld      a, [PackedColour]
     call    VdpFill
 
-    ld      a, 2
+    ld      a, 1                            ; R14 = 1 -> 0x04000..0x07FFF
     call    VdpSetR14
     ld      hl, 0x0000
-    ld      de, 212 * 128 - 0x4000
+    ld      de, 212 * 128 - 0x4000          ; 0x2A00 -> rows 128..211
     ld      a, [PackedColour]
     call    VdpFill
 
@@ -3074,6 +3112,15 @@ LINK_URL_MAX    equ 255                 ; max chars per href (plus NUL); matches
 PrintFileContent:
     ld      a, 4
     ld      [LoadPhase], a              ; phase 4: parser entered
+  IFDEF BENCH
+    ; Bench sentinel: tools/bench_scroll.tcl watches write_io 0x2E and
+    ; logs the realtime stamp. Value 1 = render-start, 2 = render-end
+    ; (see .pfcEnd below). Watching the wall-clock delta between the
+    ; two stamps gives per-render latency without involving screen
+    ; sampling. Compiled out unless build.sh was invoked with BENCH=1.
+    ld      a, 1
+    out     (0x2E), a
+  ENDIF
     ld      a, [FileLen]
     ld      b, a
     ld      a, [FileLen + 1]
@@ -3230,6 +3277,11 @@ PrintFileContent:
     call    FormEndRender               ; flip FormSticky on
     ld      a, 5
     ld      [LoadPhase], a              ; phase 5: parser hit EOF (render done)
+  IFDEF BENCH
+    ; Bench sentinel pair: see PrintFileContent entry above.
+    ld      a, 2
+    out     (0x2E), a
+  ENDIF
     jp      SerialUnmaskVblank
 
 .tag:
@@ -14990,23 +15042,42 @@ HtmlTableBorder: db 0                   ; live border flag for the open <table>
 FileEnd:
     SAVEBIN "dist/mwbro.com", 0x0100, FileEnd - 0x0100
 
-; FileBuf / FontBuf / ImgBuf pin at a fixed address. Empirically, letting
-; these float as the .COM grew past ~15565 B on AX-370 and ~15855 B on
-; Sony HB-F1XD caused Shutdown's palette-restore block to run via a
-; spurious jump -- almost certainly stack / return-address corruption
-; when one of these buffers crossed an address MSX-DOS or the slot
-; handler treats specially. Pinning here stops the .COM from caring
-; about its own absolute size.
+; ──────────────────────────────────────────────────────────────────
+; FileBuf / FontBuf / ImgBuf are runtime-only RAM regions placed
+; ABOVE the .COM image's last loaded byte (FileEnd). Declared via
+; `equ` so no bytes are emitted into the .COM file -- the runtime
+; RAM at these addresses is uninitialised at boot, which is fine
+; because every consumer writes before reading:
+;     FileBuf  -> LoadFile / RemoteLoadFile / TryFetchMore
+;     FontBuf  -> ExtractFont (called once at startup)
+;     ImgBuf   -> ImgStream (DMA scratch, written before each read)
 ;
-; The pin must sit ABOVE the last `ds`-allocated global; otherwise
-; FileBuf overlaps live state and serial reads silently overwrite
-; PlainTextMode / HistoryOldest / IsoMap. Bump history:
-;   0x5000 -> 0x5800 -> 0x6000 -> 0x6800
-; The latest jump made room for LINK_MAX=24 (LinkUrls grew 768 -> 2304)
-; plus the URL-encoding helpers + viewport simulator state. After each
-; bump, double-check `grep -E "^(FileEnd|FileBuf):" dist/mwbro.sym` to
-; make sure FileEnd stays below the pinned FileBuf address.
-    ORG 0x6800
-FileBuf:        ds FILE_BUF_SIZE        ; 16 KB HTTP/body landing buffer
-FontBuf:        ds FONT_BUF_SIZE        ; 2 KB MSX font pulled from CGTABL
-ImgBuf:         ds 128                  ; DMA scratch for streaming image loaders
+; Bug history (round-1 optimisation): this block was previously
+; `ORG 0x6800 / ds FILE_BUF_SIZE / ...`, with a written-down rule
+; that "FileBuf must sit ABOVE the last ds-allocated global". As the
+; .COM grew past ~26 KB, the preceding globals (HtmlTitleBuf,
+; HistoryBuf, ArBuf, PlainTextMode, LineGlyph, ...) drifted into
+; address range 0x8762..0x9293 -- *inside* the FileBuf reservation
+; at 0x6800..0xC7FF. Loading any file > ~8 KB into FileBuf then
+; silently overwrote those globals with file content, manifesting
+; as garbled rendering on large pages (BENCHTX.HTM / wikipedia).
+;
+; The fix: switch to `equ` (no overlap possible because we don't
+; emit bytes), pin FILEBUF_BASE clearly past FileEnd, and ASSERT
+; the budget at build time so future code growth fails the build
+; instead of regressing silently.
+
+FILEBUF_BASE   equ 0x9400              ; aligned past current FileEnd
+                                       ; (0x9353); bump if the
+                                       ; build-time ASSERT below trips.
+
+FileBuf        equ FILEBUF_BASE
+FontBuf        equ FileBuf + FILE_BUF_SIZE
+ImgBuf         equ FontBuf + FONT_BUF_SIZE
+
+; Build-time guard: if the .COM ever grows past FILEBUF_BASE, the
+; assembly fails instead of silently re-introducing the overlap.
+; HIMEM here is BDOS's lower edge on Sony HB-F1XD MSX-DOS 1.03
+; (~0xF380); the upper assert leaves ~768 bytes of stack headroom.
+    ASSERT FileEnd <= FILEBUF_BASE
+    ASSERT ImgBuf + 128 <= 0xF380
