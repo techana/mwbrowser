@@ -161,18 +161,48 @@ URL_MAX        equ 255         ; address-bar / fetch-target buffer cap (chars
                                ; before NUL). Bumped from 95 because real
                                ; mirror.aratab.com URLs run past the 100-char
                                ; line and got truncated on click.
-FILE_BUF_SIZE  equ 0x5400      ; 21 KB. Sized so FILEBUF_BASE (0x9400)
-                               ; + FILE_BUF_SIZE + FONT_BUF_SIZE + 128
-                               ; lands at 0xF080 -- ~768 bytes below
-                               ; BDOS's HIMEM (~0xF380) on Sony HB-F1XD
-                               ; MSX-DOS 1.03. Reduced from 0x6000 (24 KB)
-                               ; when the FileBuf-vs-globals overlap bug
-                               ; was fixed: with FileBuf properly placed
-                               ; above the .COM image (FileEnd ~ 0x9353)
-                               ; instead of pinned at 0x6800, the upper
-                               ; bound is BDOS, not the next global. The
-                               ; bridge's 6 KB chunks still fit 3 chunks
-                               ; comfortably; wikipedia-class long
+FILE_BUF_SIZE  equ 0x3800      ; 14 KB. Sized so FILEBUF_BASE (0x9400) +
+                               ; FILE_BUF_SIZE + FONT_BUF_SIZE + 128 lands
+                               ; at 0xD480 -- below both MSX-DOS 1.03's
+                               ; *runtime* HIMEM (~0xDF94 on Sony HB-F1XD,
+                               ; queried via BIOS HIMSAV @ 0xFC4A) AND
+                               ; the .COM's initial SP (~0xDDC8 -- MSX-DOS
+                               ; sets this when loading the .COM).
+                               ;
+                               ; Two distinct constraints made earlier
+                               ; sizes wrong:
+                               ;
+                               ;  (a) above HIMEM = DOS scratch territory.
+                               ;      MSX-DOS pulls HIMEM down to ~0xDF94
+                               ;      to reserve sector cache / FAT / FCB
+                               ;      DMA. Memory from 0xDF94..0xF380 is
+                               ;      DOS-owned; any BDOS I/O can clobber
+                               ;      bytes there. The FontBuf at 0xE800
+                               ;      we tried first sat inside that
+                               ;      region -- every disk read corrupted
+                               ;      font glyphs and the renderer painted
+                               ;      garbage for chars whose font byte
+                               ;      offsets happened to overlap (the
+                               ;      's','t','v','w' cluster bug).
+                               ;
+                               ;  (b) below HIMEM but above SP = stack
+                               ;      collision territory. The .COM's
+                               ;      runtime SP starts at ~0xDDC8 and
+                               ;      grows down. Buffers between SP and
+                               ;      HIMEM get clobbered by stack writes
+                               ;      whenever a deep call chain runs.
+                               ;      The FontBuf at 0xD400..0xDBFF we
+                               ;      tried second straddled the active
+                               ;      stack -- ExtractFont's 2 KB write
+                               ;      smashed return addresses and MWBRO
+                               ;      crashed with a black screen at boot.
+                               ;
+                               ; 0xD480 leaves ~2.3 KB of stack headroom
+                               ; below 0xDDC8, comfortable for our call
+                               ; depth.
+                               ;
+                               ; The bridge's 6 KB chunks still fit two
+                               ; chunks per FileBuf; wikipedia-class long
                                ; articles flow via TryFetchMore.
 FONT_BUF_SIZE  equ 2048        ; 256 glyphs * 8 rows
 CONTENT_X_END  equ 491         ; scrollbar now starts at x=492
@@ -15075,9 +15105,21 @@ FileBuf        equ FILEBUF_BASE
 FontBuf        equ FileBuf + FILE_BUF_SIZE
 ImgBuf         equ FontBuf + FONT_BUF_SIZE
 
-; Build-time guard: if the .COM ever grows past FILEBUF_BASE, the
-; assembly fails instead of silently re-introducing the overlap.
-; HIMEM here is BDOS's lower edge on Sony HB-F1XD MSX-DOS 1.03
-; (~0xF380); the upper assert leaves ~768 bytes of stack headroom.
+; Build-time guards.
+;   * FileEnd <= FILEBUF_BASE: catches the FileBuf-vs-globals overlap
+;     by failing the build if the .COM ever grows past the pinned
+;     buffer base.
+;   * ImgBuf+128 <= 0xD500: caps the top buffer well below both
+;     MSX-DOS 1.03's runtime HIMEM (~0xDF94 on Sony HB-F1XD) and
+;     the .COM's initial SP (~0xDDC8). The 0xD500 cap leaves ~2 KB
+;     of stack headroom, which is plenty for our deepest call chain
+;     (Print->Tag->EmitNewline->ArFlush->Bidi->LineDraw->DrawCharFast
+;     ~12 frames worst case = ~50 bytes), with margin for both
+;     interrupt handlers and BIOS calls.
+;
+; If you hit either assert with a sane FILE_BUF_SIZE, the right move
+; is to shrink FILE_BUF_SIZE -- not to raise the upper cap. The cap
+; protects against silent corruption from DOS scratch (above HIMEM)
+; or stack collisions (below SP).
     ASSERT FileEnd <= FILEBUF_BASE
-    ASSERT ImgBuf + 128 <= 0xF380
+    ASSERT ImgBuf + 128 <= 0xD500
