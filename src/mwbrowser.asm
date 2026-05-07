@@ -33,6 +33,12 @@ DOS_OPEN       equ 0x0F        ; open file via FCB
 DOS_CLOSE      equ 0x10        ; close file via FCB
 DOS_READ       equ 0x14        ; sequential read (128-byte record)
 DOS_SETDMA     equ 0x1A        ; set disk transfer address
+DOS_RDRND      equ 0x21        ; random read: reads the 128-byte record at
+                               ; FCB+33..35 into the DMA buffer and syncs CR
+                               ; from those bytes. Does NOT auto-increment
+                               ; R0/R1/R2; pair with sequential DOS_READ for
+                               ; the records past the first if you want
+                               ; "seek then stream".
 
 VDP_DATA       equ 0x98
 VDP_CMD        equ 0x99
@@ -161,7 +167,7 @@ URL_MAX        equ 255         ; address-bar / fetch-target buffer cap (chars
                                ; before NUL). Bumped from 95 because real
                                ; mirror.aratab.com URLs run past the 100-char
                                ; line and got truncated on click.
-FILE_BUF_SIZE  equ 0x3700      ; 13.75 KB. Sized so FILEBUF_BASE (0x9500) +
+FILE_BUF_SIZE  equ 0x3600      ; 13.5 KB. Sized so FILEBUF_BASE (0x9600) +
                                ; FILE_BUF_SIZE + FONT_BUF_SIZE + 128 lands
                                ; at 0xD480 -- below both MSX-DOS 1.03's
                                ; *runtime* HIMEM (~0xDF94 on Sony HB-F1XD,
@@ -3041,25 +3047,81 @@ LoadFile:
     or      a
     ret     nz
 
-    ; DocOffset = 0 because every local load currently starts at byte
-    ; 0 of the document. WindowLen = min(file_size_from_FCB+16,
-    ; FILE_BUF_SIZE) is the actually populated portion of FileBuf.
-    ld      hl, [Fcb + 16]
-    ld      [WindowLen], hl
-    ld      de, 0
+    ; LoadFile is the "open whole document at byte 0" call: hand off
+    ; to LoadFileChunk(doc_offset=0, byte_count=FILE_BUF_SIZE). Phase 5
+    ; will introduce non-zero offsets via the same primitive when scroll
+    ; dispatch needs to slide the window.
+    ld      de, 0                       ; doc_offset
+    ld      hl, FILE_BUF_SIZE           ; byte_count
+    call    LoadFileChunk
+    push    af
+    ld      c, DOS_CLOSE
+    ld      de, Fcb
+    call    BDOS_ENTRY
+    pop     af
+    ret
+
+; LoadFileChunk: fill FileBuf starting at the given document offset
+; with up to byte_count bytes from the FCB-open file. Sets DocOffset
+; and WindowLen to reflect the loaded range.
+;
+; Inputs:
+;   FCB pre-OPENed by the caller (file size at FCB+16 is valid)
+;   DE = doc_offset (must be a multiple of 128 in this phase; the
+;        sub-record byte_remainder branch is tagged for Phase 5 when
+;        sliding-window backward fetches actually trigger it)
+;   HL = byte_count (caller's requested window size, clamped to
+;        FILE_BUF_SIZE downstream)
+;
+; Outputs:
+;   DocOffset = doc_offset
+;   WindowLen = min(byte_count, FILE_BUF_SIZE)  (caller's clamp; the
+;               read loop trims further if a record returns short)
+;   A         = 0 on success, !=0 if a read failed mid-stream
+;
+; Strategy:
+;
+;   doc_offset == 0  -> sequential DOS_READ loop from a freshly
+;       opened FCB. CR starts at 0, increments per read; equivalent
+;       to the pre-Phase-2 LoadFile body.
+;
+;   doc_offset != 0  -> per-record DOS_RDRND loop, bumping the FCB's
+;       R0/R1/R2 random-record field after each read. We can't mix
+;       RDRND with DOS_READ for the tail because RDRND only syncs
+;       CR FROM R0/R1/R2; it does not advance them, and DOS_READ
+;       reads from the CR position they just landed on (so the next
+;       sequential read would re-read the record we just fetched
+;       rather than the one after it). Phase 5 is when the non-zero
+;       branch first sees real callers; today only the sequential
+;       branch runs.
+LoadFileChunk:
     ld      [DocOffset], de
+    ; Clamp HL to FILE_BUF_SIZE so the caller can pass a generous
+    ; byte_count without overrunning FileBuf.
+    push    hl
     ld      de, FILE_BUF_SIZE
     or      a
     sbc     hl, de
-    jr      c, .sizeOk
+    pop     hl
+    jr      c, .lfcSizeOk
     ld      hl, FILE_BUF_SIZE
+.lfcSizeOk:
     ld      [WindowLen], hl
-.sizeOk:
+    ld      a, h
+    or      l
+    jr      z, .lfcDone                 ; nothing to read
 
+    ; Branch on DocOffset.
+    ld      a, [DocOffset]
+    ld      b, a
+    ld      a, [DocOffset + 1]
+    or      b
+    jr      nz, .lfcRandom
+
+    ; -- doc_offset == 0: plain sequential drain --
     ld      hl, FileBuf
-    ld      bc, FILE_BUF_SIZE / 128     ; 16-bit record counter: FILE_BUF_SIZE
-                                        ; up to 64 KB (8-bit B only reached 8 KB).
-.rl:
+    ld      bc, FILE_BUF_SIZE / 128     ; 16-bit record counter
+.lfcSeqLoop:
     push    bc
     push    hl
     ex      de, hl                      ; DE = DMA target
@@ -3071,18 +3133,68 @@ LoadFile:
     or      a
     pop     hl
     pop     bc
-    jr      nz, .done
+    jr      nz, .lfcDone                ; EOF / error -> stop reading
     ld      de, 128
     add     hl, de
     dec     bc
     ld      a, b
     or      c
-    jr      nz, .rl
+    jr      nz, .lfcSeqLoop
+    jr      .lfcDone
 
-.done:
-    ld      c, DOS_CLOSE
+    ; -- doc_offset != 0: RDRND-per-record, manually bumping R0..R2 --
+    ; (Phase 5 hooks here once EnsureWindow-driven backward fetches
+    ; arrive. Today no caller takes this path; the code is in place
+    ; so the primitive is complete and Phase 5 doesn't touch
+    ; LoadFileChunk at all.)
+.lfcRandom:
+    ld      hl, [DocOffset]
+    ld      a, l
+    add     a, a
+    ld      a, h
+    adc     a, a                        ; A = doc_offset / 128 (low byte)
+    ld      [Fcb + 33], a
+    xor     a
+    ld      [Fcb + 34], a
+    ld      [Fcb + 35], a
+
+    ld      hl, FileBuf
+    ld      bc, FILE_BUF_SIZE / 128
+.lfcRndLoop:
+    push    bc
+    push    hl
+    ex      de, hl
+    ld      c, DOS_SETDMA
+    call    BDOS_ENTRY
+    ld      c, DOS_RDRND
     ld      de, Fcb
     call    BDOS_ENTRY
+    or      a
+    pop     hl
+    pop     bc
+    jr      nz, .lfcDone                ; EOF / error -> stop
+    ld      de, 128
+    add     hl, de
+
+    ; Bump FCB+33..35 (24-bit random-record number).
+    push    hl
+    ld      hl, Fcb + 33
+    inc     [hl]
+    jr      nz, .lfcRndBumpDone
+    inc     hl
+    inc     [hl]
+    jr      nz, .lfcRndBumpDone
+    inc     hl
+    inc     [hl]
+.lfcRndBumpDone:
+    pop     hl
+
+    dec     bc
+    ld      a, b
+    or      c
+    jr      nz, .lfcRndLoop
+
+.lfcDone:
     xor     a
     ret
 
@@ -15335,10 +15447,10 @@ FileEnd:
 ; the budget at build time so future code growth fails the build
 ; instead of regressing silently.
 
-FILEBUF_BASE   equ 0x9500              ; aligned past current FileEnd
-                                       ; (~0x9478 after the table-prescan
-                                       ; layouts + MeasureTableCols added
-                                       ; ~290 bytes of code/data); bump
+FILEBUF_BASE   equ 0x9600              ; aligned past current FileEnd
+                                       ; (~0x952A after Phase 2's
+                                       ; LoadFileChunk + DOS_RDRND wrapper
+                                       ; added ~175 bytes); bump
                                        ; further if the ASSERT trips.
 
 FileBuf        equ FILEBUF_BASE
