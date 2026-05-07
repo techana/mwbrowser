@@ -228,6 +228,17 @@ Main:
     call    SerialInit
 
 MainLoop:
+    ; HALT pauses the CPU until the next interrupt -- on MSX with
+    ; default IM 1, that's the 50/60 Hz VBLANK from the VDP. Pacing
+    ; the idle loop on VBLANK gives us:
+    ;   - ~16-20 ms between mouse polls (more than smooth enough),
+    ;   - ~16-20 ms between keyboard peeks (still imperceptible),
+    ;   - 0 % CPU between events on emulators / real hardware,
+    ;   - and no busy-spin pinning openMSX's host thread at 100 %.
+    ; Interrupts are left enabled by MSX-DOS during a .COM session
+    ; so the EI guard isn't needed here. (Reference: MSX Assembly
+    ; Page summary §2 -- "EI/HALT is the canonical MSX vsync wait".)
+    halt
     call    PollMouse
 
     ; Non-blocking keyboard check. If no key, loop again (keeps polling mouse).
@@ -1631,18 +1642,41 @@ VdpSetReadAddr:
     ret
 
 ; VdpFill: DE bytes of value A, starting at VRAM addr in HL.
+;
+; Inner loop uses DJNZ as the per-iteration counter (8-bit, B reg)
+; with the `LD B,0 -> 256-iter` trick from the MSX Assembly Page,
+; bumping a high-byte counter in C every 256 bytes. Per-byte cost
+; drops from the previous `out / dec de / or-ze test / jr nz` (50
+; T-states / byte) to `out / djnz` (24 T-states / byte) -- ~52 %
+; faster on the only bulk caller (ClearContent's 27 KB startup
+; paint, which now finishes ~195 ms earlier on a 3.58 MHz Z80).
 VdpFill:
     push    af
     call    VdpSetWriteAddr
     pop     af
-.loop:
+
+    ; Split DE into (C = full-256 chunks = D, B = remainder = E).
+    ; If E (remainder) is zero, jump straight to the chunk loop;
+    ; otherwise emit the leading remainder via a single djnz pass.
+    ld      c, d                            ; C = high byte of count
+    ld      b, e                            ; B = low byte (== remainder)
+    inc     b
+    dec     b
+    jr      z, .vfChunks                    ; remainder == 0 -> chunks only
+.vfTail:
+    out     (VDP_DATA), a                   ; 11 T
+    djnz    .vfTail                         ; 13 taken / 8 not
+.vfChunks:
+    ; C iterations of 256 bytes (B=0 -> wraps 0xFF..0x01..0x00).
+    inc     c
+    dec     c
+    ret     z                                ; no full chunks left
+    ld      b, 0                            ; B = 0 -> 256 iterations
+.vfNext:
     out     (VDP_DATA), a
-    dec     de
-    ld      b, a
-    ld      a, d
-    or      e
-    ld      a, b
-    jr      nz, .loop
+    djnz    .vfNext
+    dec     c
+    jr      nz, .vfNext
     ret
 
 ; ============================================================================
