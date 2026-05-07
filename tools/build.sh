@@ -28,6 +28,14 @@ fi
 # we translate to the matching divisor. If neither is set we use the
 # in-source default (currently divisor 1 = 115200 baud).
 DEFINES=()
+# BENCH=1 turns on the optional bench sentinel: a pair of OUT (0x2E),A
+# writes (value 1 at PrintFileContent entry, value 2 at exit) that
+# tools/bench_scroll.tcl watches via `debug set_watchpoint write_io`
+# to record per-render wall-clock latency. No effect when BENCH is
+# unset; gated by IFDEF BENCH on the assembly side.
+if [[ -n "${BENCH:-}" ]]; then
+    DEFINES+=(-DBENCH)
+fi
 if [[ -n "${SERIAL_DIVISOR:-}" ]]; then
     DEFINES+=(-DSERIAL_DIVISOR="$SERIAL_DIVISOR")
 elif [[ -n "${SERIAL_BAUD:-}" ]]; then

@@ -3074,6 +3074,15 @@ LINK_URL_MAX    equ 255                 ; max chars per href (plus NUL); matches
 PrintFileContent:
     ld      a, 4
     ld      [LoadPhase], a              ; phase 4: parser entered
+  IFDEF BENCH
+    ; Bench sentinel: tools/bench_scroll.tcl watches write_io 0x2E and
+    ; logs the realtime stamp. Value 1 = render-start, 2 = render-end
+    ; (see .pfcEnd below). Watching the wall-clock delta between the
+    ; two stamps gives per-render latency without involving screen
+    ; sampling. Compiled out unless build.sh was invoked with BENCH=1.
+    ld      a, 1
+    out     (0x2E), a
+  ENDIF
     ld      a, [FileLen]
     ld      b, a
     ld      a, [FileLen + 1]
@@ -3230,6 +3239,11 @@ PrintFileContent:
     call    FormEndRender               ; flip FormSticky on
     ld      a, 5
     ld      [LoadPhase], a              ; phase 5: parser hit EOF (render done)
+  IFDEF BENCH
+    ; Bench sentinel pair: see PrintFileContent entry above.
+    ld      a, 2
+    out     (0x2E), a
+  ENDIF
     jp      SerialUnmaskVblank
 
 .tag:
