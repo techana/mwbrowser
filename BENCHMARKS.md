@@ -62,13 +62,43 @@ the `PrintFileContent` viewport-full short-circuit kicks in once
 `HtmlLineSkip` drains and the render Y has crossed `CONTENT_Y1` —
 so most images aren't re-fetched on a scrolled pass.
 
-## Targets for optimisation
+## Task B — DEFERRED
 
-Per the analysis in the project handover note:
+The simple "(line# → FileBuf offset)" cache implemented and tested.
+**Result: no measurable improvement over baseline** because a bare
+offset-only entry can't be safely restarted from PrintFileContent's
+default reset state. To make a cache jump correct, the parser frame
+at the cached point must match the post-reset state — which means
+either:
+
+1. **Restrict cache entries to "safe-state" boundaries** (no open
+   `<head>/<table>/<script>/<h1-2>/<b>/<a>/...`, no pending Arabic
+   word, no list indent, no non-default align/dir). On the
+   benchmark pages these boundaries are too sparse to help — we
+   ended up caching only the seed entry `(0, 0)`, which is
+   equivalent to no cache.
+
+2. **Store a full parser-state snapshot per entry** (HtmlStyleFlags
+   / Scale / InHead / InTitle / InTable / InScript / InAnchor /
+   Pre / ListKind / OlCounter / Indent / Align / Dir / Fg /
+   FgDepth / TableCol / TableFirst / RowTopY / LiPending / ArLen +
+   ArBuf / TextX / TextY ≈ 80 bytes per entry × 30+ entries ≈
+   2.4 KB).
+
+Option (2) is the right architectural answer but a significantly
+larger change than was budgeted for this round. **Tabled for a
+follow-up round-1.5** so it doesn't block A / C / D-G.
+
+The bench infrastructure (BENCHTX/BENCHIM, the harness, the
+sentinel, the baseline binary `dist/mwbro_baseline.com`) was kept;
+re-running the harness after each subsequent task gives a clean
+delta vs. baseline.
+
+## Targets for optimisation (revised)
 
 | Task | Hypothesis | Expected post-fix (BENCHTX) | Expected post-fix (BENCHIM scroll) |
 |---|---|--:|--:|
-| **B** Layout-offset cache | drops O(FileLen) prefix walk to O(1) lookup | ~3.0 s | ~1.5 s |
+| ~~**B** Layout-offset cache~~ | deferred — see above | — | — |
 | **A** HMMM-copy + render newly-exposed strip | re-render only ~1/22nd of viewport | ~0.4 s | ~0.4 s |
 | **C** Off-screen page-ahead | apparent 0 s on PgDn | ~0 s (perceived) | ~0 s (perceived) |
 | **D-G** Tidy-ups (OUTI / EI-HALT / IX-IY audit / EX-AF) | constant-factor improvements | -5 to -10 % everywhere | -5 to -10 % everywhere |
