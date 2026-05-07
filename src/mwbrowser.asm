@@ -3047,6 +3047,11 @@ LoadFile:
     or      a
     ret     nz
 
+    ; A fresh document invalidates every previously cached
+    ; (line_no, doc_offset) entry. Reset before the read so the
+    ; subsequent render's EmitNewlines start from an empty cache.
+    call    LineCacheReset
+
     ; LoadFile is the "open whole document at byte 0" call: hand off
     ; to LoadFileChunk(doc_offset=0, byte_count=FILE_BUF_SIZE). Phase 5
     ; will introduce non-zero offsets via the same primitive when scroll
@@ -3354,6 +3359,14 @@ PrintFileContent:
     ld      hl, FileBuf
 
 .loop:
+    ; Mirror the parser cursor into ParserCursor so any handler that
+    ; needs to know "where am I in the document?" -- LineCache append,
+    ; TagTableTag's column-count prescan, future Phase 4 snapshots --
+    ; can read a global instead of fishing HL off the call stack.
+    ; Cost: one ld [nn], hl per byte parsed (~16 T-states), a ~5%
+    ; bump on top of the existing per-byte HtmlEnd compare.
+    ld      [ParserCursor], hl
+
     ; Viewport-full short-circuit. Once HtmlLineSkip has drained (0) and
     ; the Y cursor has painted past the bottom of the content area,
     ; nothing we parse from here on can appear on screen. Bailing out
@@ -5073,6 +5086,79 @@ EmitNewline:
     xor     a
     ld      [HtmlWsPending], a
     ld      [HtmlLineHasWidget], a      ; consume: next line starts clean
+    call    LineCacheMaybeAppend
+    ret
+
+; LineCacheMaybeAppend: append (HtmlLineCount, current_doc_offset) to
+; LineCache if the conditions are right:
+;   - HtmlLineSkip == 0 (we're on the initial-render pass, not a
+;     scrolled re-render that would corrupt the cache with offsets
+;     into a partial window).
+;   - LineCacheCount < LineCacheMax (cache has a free slot).
+;
+; Phase 3 keeps the predicate this loose -- one entry per rendered
+; line until the cache is full. Phase 4 will tighten it into a real
+; "safe state" predicate (no open Arabic word, no in-table mid-row,
+; no in-pre, etc.) and snapshot the parser state alongside the
+; offset so Phase 5's EnsureWindow can resume rendering from the
+; cached point without replay artefacts.
+;
+; current_doc_offset = DocOffset + (ParserCursor - FileBuf), where
+; ParserCursor is the parser's read pointer kept fresh by
+; PrintFileContent's main loop. With DocOffset == 0 today the offset
+; is just (ParserCursor - FileBuf), but the addition is wired so
+; Phase 5's slide doesn't need to revisit this site.
+LineCacheMaybeAppend:
+    ld      a, [HtmlLineSkip]
+    ld      b, a
+    ld      a, [HtmlLineSkip + 1]
+    or      b
+    ret     nz                          ; scrolled render -> skip
+    ld      a, [LineCacheCount]
+    cp      LineCacheMax
+    ret     nc                          ; cache full -> skip
+    push    hl
+    push    de
+    push    bc
+    ; Index byte = count * 2 (word stride).
+    add     a, a
+    ld      c, a
+    ld      b, 0
+    ; Slot 1: line_no -> LineCacheLineNo[count]
+    ld      hl, LineCacheLineNo
+    add     hl, bc
+    ld      de, [HtmlLineCount]
+    ld      [hl], e
+    inc     hl
+    ld      [hl], d
+    ; Slot 2: doc_offset = (ParserCursor - FileBuf) + DocOffset
+    ld      hl, [ParserCursor]
+    ld      de, FileBuf
+    or      a
+    sbc     hl, de                      ; HL = window-relative offset
+    ld      de, [DocOffset]
+    add     hl, de                      ; HL = absolute doc-byte offset
+    ex      de, hl                      ; DE = doc_offset
+    ld      hl, LineCacheDocOff
+    add     hl, bc
+    ld      [hl], e
+    inc     hl
+    ld      [hl], d
+    ; Bump LineCacheCount.
+    ld      hl, LineCacheCount
+    inc     [hl]
+    pop     bc
+    pop     de
+    pop     hl
+    ret
+
+; LineCacheReset: empty the cache. Called by LoadFile / RemoteLoadFile
+; on every fresh document load -- prior offsets refer to bytes that
+; have been overwritten in FileBuf and would point into the wrong
+; document if we tried to use them post-load.
+LineCacheReset:
+    xor     a
+    ld      [LineCacheCount], a
     ret
 
 ; EmitBlankLine: ensure we're at start of a line and leave one blank line
@@ -14262,6 +14348,11 @@ RemoteGet:
 ; FileBuf (capped at FILE_BUF_SIZE, extra bytes drained so the next
 ; request finds a clean stream). Returns A=0 on success.
 RemoteLoadFile:
+    ; Same invalidation contract as LoadFile: the cache holds offsets
+    ; into the previous document, which becomes stale the moment we
+    ; start streaming a new body.
+    call    LineCacheReset
+
     ; Auto-probe the wire rate on the first remote fetch. Walks
     ; ProbeTable from fastest down to the BIOS default 1200 and
     ; locks at the first divisor the bridge actually responds at,
@@ -15168,6 +15259,26 @@ Fcb:            ds 37                   ; MSX-DOS 1 FCB (36 bytes + 1 pad)
 ;
 WindowLen:      dw 0                    ; bytes currently in the FileBuf window
 DocOffset:      dw 0                    ; FileBuf[0] = byte DocOffset of doc
+
+; Restart-point cache (file_load_architecture Phase 3).
+;
+; During the initial-render pass (HtmlLineSkip == 0) the parser populates
+; LineCache[i] = (line_number, doc_offset) at every safe EmitNewline.
+; Phase 4 will widen the entry to also carry parser-state snapshots,
+; and Phase 5 will read the cache to jump to a target line without
+; replaying the whole document. Today the cache is write-only -- nobody
+; reads it yet -- so this commit is purely plumbing.
+;
+; Entry policy: append until the cache is full (LineCacheCount ==
+; LineCacheMax), then stop. Later phases swap this for a sampled /
+; evicting policy that distributes entries across the full document.
+;
+; Reset policy: LoadFile / RemoteLoadFile zero LineCacheCount because a
+; new document invalidates every prior offset.
+LineCacheMax    equ 32
+LineCacheCount: db 0
+LineCacheLineNo: ds LineCacheMax * 2    ; rendered line number
+LineCacheDocOff: ds LineCacheMax * 2    ; matching DocOffset + (cursor - FileBuf)
 
 ScrollLine:     dw 0                    ; first visible line (0 = top of file)
 TotalLines:     dw 0                    ; rendered line count for thumb math
