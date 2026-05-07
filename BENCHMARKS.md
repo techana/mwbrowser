@@ -91,6 +91,33 @@ baseline `BENCH=1` binary. To re-run the baseline numbers from any
 future optimisation, restore it with `cp dist/mwbro_baseline.com
 dist/mwbro.com && ./tools/inject.sh`.
 
+## After tasks D + E
+
+Branch: `optimization_round_1` after the `tasks D + E` commit.
+- D: `VdpFill` inner loop rewritten with the `LD B,0 -> 256-iter`
+  trick (50 T-states / byte → 24 T-states / byte, only caller is
+  `ClearContent`'s 27 KB startup paint).
+- E: `HALT` inserted at the top of `MainLoop` so the idle path
+  pauses on VBLANK instead of busy-spinning.
+- F + G: confirmed no work to do on this codebase.
+
+### `BENCHTX.HTM` — text only, 11 912 B (post D+E)
+
+| Render # | Trigger | Start (s) | End (s) | Duration (s) | Δ vs baseline |
+|---|---|--:|--:|--:|--:|
+| 1 | Initial page load | 44.53 | 50.86 | **6.33** | **-0.26 s** ✅ |
+| 2 | 1st PageDown        | 51.50 | 56.24 | 4.74 | +0.23 (noise) |
+| 3 | 2nd PageDown        | 106.36 | 111.22 | 4.86 | +0.23 (noise) |
+| 4 | 3rd PageDown        | 166.37 | 171.16 | 4.79 | -0.05 (noise) |
+
+**Initial render: -260 ms.** Matches the predicted ~195 ms saving
+on the 27 KB startup paint within measurement margin. Per-scroll
+renders don't go through `VdpFill` (they use `FillRect` which is
+already DJNZ-paced at 24 T-states / byte), so the ~3 % per-scroll
+delta is within the harness's noise band (std-dev 0.13 s on
+baseline). E (MainLoop HALT) doesn't change render latency — it
+only paces the idle path between user input.
+
 ## Task B — DEFERRED
 
 The simple "(line# → FileBuf offset)" cache implemented and tested.
