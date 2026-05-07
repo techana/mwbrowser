@@ -1979,12 +1979,12 @@ DrawScrollbar:
     call    DrawUpArrow
     jp      DrawDownArrow
 
-; CountTotalLines: walk FileBuf[0..FileLen-1] counting LF bytes; stores into
+; CountTotalLines: walk FileBuf[0..WindowLen-1] counting LF bytes; stores into
 ; TotalLines (saturated at 255). Called after every successful load so the
 ; thumb math has a fresh denominator.
 CountTotalLines:
     ld      hl, FileBuf
-    ld      bc, [FileLen]
+    ld      bc, [WindowLen]
     ld      de, 0                       ; DE = 16-bit line count
 .loop:
     ld      a, b
@@ -2929,13 +2929,13 @@ BuildFcbFromHL:
     jr      nz, .pe
     ret
 
-; DetectArabicInBuf: walk the first FileLen bytes of FileBuf and return
+; DetectArabicInBuf: walk the first WindowLen bytes of FileBuf and return
 ; A = 1 as soon as any byte's IsoJoin entry carries the IS_ARABIC flag;
 ; A = 0 if the whole buffer is ASCII-only. Used by PrintFileContent to
 ; auto-switch .txt files to RTL when they contain Arabic text.
 DetectArabicInBuf:
     ld      hl, FileBuf
-    ld      bc, [FileLen]
+    ld      bc, [WindowLen]
 .daLoop:
     ld      a, b
     or      c
@@ -3002,7 +3002,7 @@ UpperCaseA:
     ret
 
 ; LoadFile: open via Fcb, read up to FILE_BUF_SIZE bytes into FileBuf, close.
-;   On success A=0, FileLen = bytes actually read (capped at buffer size).
+;   On success A=0, WindowLen = bytes actually read (capped at buffer size).
 ;   On failure A!=0 (file not found etc.).
 ; ResetFcbTail: zero Fcb bytes 12..35 (the record-number / random-read
 ; fields BDOS keeps internal). Called before every DOS_OPEN so a
@@ -3041,15 +3041,19 @@ LoadFile:
     or      a
     ret     nz
 
-    ; FileLen = min(file size from FCB+16, FILE_BUF_SIZE).
+    ; DocOffset = 0 because every local load currently starts at byte
+    ; 0 of the document. WindowLen = min(file_size_from_FCB+16,
+    ; FILE_BUF_SIZE) is the actually populated portion of FileBuf.
     ld      hl, [Fcb + 16]
-    ld      [FileLen], hl
+    ld      [WindowLen], hl
+    ld      de, 0
+    ld      [DocOffset], de
     ld      de, FILE_BUF_SIZE
     or      a
     sbc     hl, de
     jr      c, .sizeOk
     ld      hl, FILE_BUF_SIZE
-    ld      [FileLen], hl
+    ld      [WindowLen], hl
 .sizeOk:
 
     ld      hl, FileBuf
@@ -3151,9 +3155,9 @@ PrintFileContent:
     ld      a, 1
     out     (0x2E), a
   ENDIF
-    ld      a, [FileLen]
+    ld      a, [WindowLen]
     ld      b, a
-    ld      a, [FileLen + 1]
+    ld      a, [WindowLen + 1]
     or      b
     ret     z
 
@@ -3229,9 +3233,9 @@ PrintFileContent:
     ld      a, CONTENT_Y0
     ld      [TextY], a
 
-    ; HtmlEnd = FileBuf + FileLen
+    ; HtmlEnd = FileBuf + WindowLen
     ld      hl, FileBuf
-    ld      de, [FileLen]
+    ld      de, [WindowLen]
     add     hl, de
     ld      [HtmlEnd], hl
 
@@ -13848,7 +13852,7 @@ TfmRefused:     db 0                    ; latched 1 by TryFetchMore when the
                                         ; without storing" body-loop logic
                                         ; and forces TryFetchMore's tail to
                                         ; return CF=1 instead of advancing
-                                        ; FileLen.
+                                        ; WindowLen.
 
 SerialRead:     ; Poll for RxRDY and return byte in A.
                 ;
@@ -14187,8 +14191,13 @@ RemoteLoadFile:
     ld      a, [SerialKind]
     cp      1
     jr      nz, .rlfFail
-    ; FileLen = min(SerialLen, FILE_BUF_SIZE)
+    ; DocOffset = 0 because every load starts at doc byte 0 today.
+    ; WindowLen = min(SerialLen, FILE_BUF_SIZE) is the clamped working
+    ; set in FileBuf. The Phase 6 "GET CHUNK <offset>" command will
+    ; let DocOffset move forward for backward-scroll refetches.
     ld      hl, [SerialLen]
+    ld      de, 0
+    ld      [DocOffset], de
     ld      de, FILE_BUF_SIZE
     push    hl
     and     a
@@ -14197,9 +14206,9 @@ RemoteLoadFile:
     jr      c, .rlfOk
     ld      hl, FILE_BUF_SIZE
 .rlfOk:
-    ld      [FileLen], hl
+    ld      [WindowLen], hl
     ld      de, FileBuf
-    ld      bc, [FileLen]
+    ld      bc, [WindowLen]
 .rlfBody:
     ld      a, b
     or      c
@@ -14231,7 +14240,7 @@ RemoteLoadFile:
     jr      .rlfBody
 .rlfTail:
     ld      hl, [SerialLen]
-    ld      de, [FileLen]
+    ld      de, [WindowLen]
     and     a
     sbc     hl, de
     ld      b, h
@@ -14295,8 +14304,8 @@ StoreTotalLinesWithPages:
     ret
 
 ; TryFetchMore: pulls the next paginated chunk from the bridge ("GET
-; MORE\r\n"), appends the body to FileBuf at the current FileLen, and
-; bumps FileLen. Returns CF=0 on success (new bytes appended), CF=1
+; MORE\r\n"), appends the body to FileBuf at the current WindowLen, and
+; bumps WindowLen. Returns CF=0 on success (new bytes appended), CF=1
 ; when there's nothing more to fetch (only one page on the server,
 ; already at the last page, or the bridge has no remote session).
 ; Caller is responsible for re-rendering after a successful append.
@@ -14350,7 +14359,7 @@ TryFetchMore:
     ; out as "class="vector-..." " text). Better to stop at the last
     ; clean page boundary than to corrupt the render.
     ld      hl, FILE_BUF_SIZE
-    ld      de, [FileLen]
+    ld      de, [WindowLen]
     and     a
     sbc     hl, de                       ; HL = remaining bytes
     ld      de, [SerialLen]
@@ -14365,9 +14374,9 @@ TryFetchMore:
 .tfmReadAll:
     ld      bc, [SerialLen]
     ld      hl, FileBuf
-    ld      de, [FileLen]
+    ld      de, [WindowLen]
     add     hl, de
-    ex      de, hl                       ; DE = FileBuf + FileLen
+    ex      de, hl                       ; DE = FileBuf + WindowLen
 .tfmBody:
     ld      a, b
     or      c
@@ -14393,16 +14402,16 @@ TryFetchMore:
     jr      .tfmBody
 .tfmAppendDone:
     ; If we refused the append because the buffer would overflow, the
-    ; body loop just drained bytes -- skip the FileLen bump and report
+    ; body loop just drained bytes -- skip the WindowLen bump and report
     ; CF=1 so PageDown/ScrollDown stop trying to fetch further pages.
     ld      a, [TfmRefused]
     or      a
     jr      nz, .tfmRefuseExit
-    ; FileLen += SerialLen
-    ld      hl, [FileLen]
+    ; WindowLen += SerialLen
+    ld      hl, [WindowLen]
     ld      de, [SerialLen]
     add     hl, de
-    ld      [FileLen], hl
+    ld      [WindowLen], hl
     call    SerialUnmaskVblank
     xor     a
     ld      [Busy], a
@@ -15023,7 +15032,31 @@ EntrySP:        dw 0                    ; SP at Main entry (restored on Shutdown
 
 ; File I/O and navigation state.
 Fcb:            ds 37                   ; MSX-DOS 1 FCB (36 bytes + 1 pad)
-FileLen:        dw 0                    ; bytes actually loaded (clamped to buffer)
+
+; File-load streaming (file_load_architecture, phased rollout).
+;
+; The renderer walks FileBuf[0..WindowLen) -- a *window* into a
+; possibly larger document. Today (Phase 1) the window covers the
+; whole document up to FILE_BUF_SIZE bytes; later phases will slide
+; it on demand to support docs larger than the window.
+;
+;   DocOffset = document offset of FileBuf[0]
+;   WindowLen = how many bytes of FileBuf are populated
+;
+; Pre-streaming code path (still the only one):
+;   DocOffset = 0
+;   WindowLen = min(file_size, FILE_BUF_SIZE)
+;
+; Once Phase 5 (sliding window) lands, scroll-driven loads can shift
+; DocOffset forward and refetch FileBuf so target lines stay inside
+; [DocOffset, DocOffset + WindowLen). DocSize is left for a later
+; phase: the local FCB carries the file's total size and the bridge
+; reports it via the "<bytes> <page>/<total>" frame, but no consumer
+; needs it yet.
+;
+WindowLen:      dw 0                    ; bytes currently in the FileBuf window
+DocOffset:      dw 0                    ; FileBuf[0] = byte DocOffset of doc
+
 ScrollLine:     dw 0                    ; first visible line (0 = top of file)
 TotalLines:     dw 0                    ; rendered line count for thumb math
 ThumbTop:       db THUMB_Y0             ; current thumb top y (set by ComputeThumb)
@@ -15052,7 +15085,7 @@ FastFontByte:   db 0
 FastRowsLeft:   db 0
 
 ; Step 3: HTML parser state.
-HtmlEnd:        dw 0                    ; end-of-buffer sentinel (FileBuf+FileLen)
+HtmlEnd:        dw 0                    ; end-of-buffer sentinel (FileBuf+WindowLen)
 HtmlInHead:     db 0                    ; 1 while inside <head>...</head>
 HtmlInTitle:    db 0                    ; 1 while inside <title>...</title>
 HtmlStyleFlags: db 0                    ; STYLE_BOLD / STYLE_ITALIC / etc.
