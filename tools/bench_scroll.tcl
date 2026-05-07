@@ -38,13 +38,17 @@ set SHOT_PREFIX vwr-bench-
 regsub -nocase {\.htm$} $BENCH_PAGE "" PAGE_LABEL
 
 # Number of PageDown presses to issue once the page has loaded.
-set N_PAGEDOWNS 4
+set N_PAGEDOWNS 3
 # Wall-clock seconds between consecutive PageDown presses. Must be
 # *longer than the slowest current render* so each press starts
 # from a stable state. Override per-page via env var BENCH_GAP.
-# Defaults: BENCHTX = 12 s, BENCHIM = 60 s (image-heavy initial
-# render dominates and pushes per-scroll latency way up).
-set GAP_S 12
+#
+# Default 60 s: with the FileBuf-overlap bug fixed (round 1), the
+# parser actually does its full job (tag dispatch + Arabic shaping)
+# instead of falling into the corrupted-state PlainTextMode
+# fast-path. Real renders on a ~12 KB page are ~30-50 s of
+# emulated time, so 60 s gives every PageDown a clean start.
+set GAP_S 60
 if {[info exists ::env(BENCH_GAP)] && [string length $::env(BENCH_GAP)]} {
     set GAP_S $::env(BENCH_GAP)
 }

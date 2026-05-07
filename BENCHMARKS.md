@@ -23,44 +23,73 @@ Methodology:
   - **BENCHIM.HTM** (5 298 B) — short markup, 12 inline `<img
     src="PGnn.PCX">`. Stresses the image pipeline + scroll-with-images.
 
-## Baseline (pre-optimisation)
+## Pre-fix baseline — INVALIDATED
 
-Branch: `optimization_round_1` at the infra-only commit (no
-renderer changes yet — same `PrintFileContent` walk-from-FileBuf-byte-0
-on every scroll).
+The first set of numbers I captured here (BENCHTX 23 402 B / 10.12 s
+per scroll) was measured with the FileBuf-vs-globals overlap bug
+silently corrupting `PlainTextMode` to a non-zero value during file
+load. That flipped the renderer into the `<pre>` / plain-text fast
+path, which is much cheaper per byte than the real parser. The
+"10 s per scroll on 23 KB" number is therefore not comparable to a
+correctly-rendering build.
 
-### `BENCHTX.HTM` — text only, 23 402 B
+The same load corrupted `HtmlTitleBuf`, `ArBuf`, `HistoryBuf`, etc.
+— renderable globals that had ended up at addresses inside the
+`ORG 0x6800` / `ds FILE_BUF_SIZE` reservation as the `.COM` grew
+past 26 KB. See the `optimization_round_1: fix FileBuf-vs-globals
+overlap` commit for the full diagnosis.
+
+## Post-fix baseline (real-parser render)
+
+Branch: `optimization_round_1` after the FileBuf-overlap fix.
+Symbols are now placed via EQU at `FILEBUF_BASE = 0x9400`, past
+the natural-PC end of the .COM (`FileEnd = 0x9353`). Build-time
+ASSERTs trip if either bound is violated again. `FILE_BUF_SIZE`
+dropped from `0x6000` (24 KB) to `0x5400` (21 KB) so
+`FileBuf + FontBuf + ImgBuf` ends safely below BDOS HIMEM.
+
+`BENCHTX.HTM` was resized 23 402 B → **12 270 B** because the
+old size was tuned for the broken fast-path; with the parser
+actually doing tag dispatch + Arabic shaping, the larger
+file took unrunnably long for an automated harness. 12 KB is
+still big enough to exercise the prefix-walk cost and produce
+4 viewport-pages of content.
+
+### `BENCHTX.HTM` — text only, 12 270 B (post-fix)
 
 | Render # | Trigger | Start (s) | End (s) | Duration (s) |
 |---|---|--:|--:|--:|
-| 1 | 1st PageDown | 49.40 | 58.91 |  **9.51** |
-| 2 | 2nd PageDown | 59.55 | 69.71 | **10.16** |
-| 3 | 3rd PageDown | 70.38 | 80.92 | **10.54** |
-| 4 | 4th PageDown | 82.36 | 92.62 | **10.26** |
+| 1 | Initial page load | 44.43 | 51.02 | **6.59** |
+| 2 | 1st PageDown        | 51.65 | 56.16 | **4.51** |
+| 3 | 2nd PageDown        | 106.36 | 110.99 | **4.63** |
+| 4 | 3rd PageDown        | 166.37 | 171.21 | **4.84** |
 
-**Mean: 10.12 s per scroll. Std dev: 0.39 s.**
+**Mean per-scroll: 4.66 s. Std dev: 0.13 s.**
 
-The first PageDown is essentially the same cost as the others —
-expected, because the prefix walk cost is `O(FileLen)` regardless of
-which target line we're skipping to. Each render re-parses all
-23 402 bytes.
-
-### `BENCHIM.HTM` — 12 inline PCX images, 5 298 B markup
+### `BENCHIM.HTM` — 12 inline PCX images, 5 511 B markup (post-fix)
 
 | Render # | Trigger | Start (s) | End (s) | Duration (s) |
 |---|---|--:|--:|--:|
-| 1 | Initial load (page render including 12 image fetches) | 41.83 | 93.46 | **51.63** |
-| 2 | 1st PageDown (re-render; images cached as already-painted? no — re-fetched) | 94.09 |  98.77 | **4.68** |
-| 3 | 2nd PageDown | 126.38 | 131.07 | **4.69** |
+| 1 | Initial load (markup + 12 image fetches) | 41.67 | 93.06 | **51.39** |
+| 2 | 1st PageDown | 93.69 | 98.17 | **4.48** |
+| 3 | 2nd PageDown | 106.37 | 111.01 | **4.64** |
 
-**Initial load: 51.63 s** — dominated by 12 × disk-read PCX + RLE
-decode + VRAM blit. About 4.3 s per inline image.
+**Initial load: 51.39 s** — dominated by 12 × disk-read PCX +
+RLE decode + VRAM blit. Effectively identical to the corrupted-state
+number because BENCHIM is small enough (5.5 KB) to land entirely in
+the FileBuf safe zone (0x6800..0x8761), so it never tripped the
+overlap bug.
 
-**Subsequent scrolls: 4.69 s mean.** Faster than BENCHTX scrolls
-because the markup is only 5 KB (1/4.5× the prefix-walk cost), and
-the `PrintFileContent` viewport-full short-circuit kicks in once
-`HtmlLineSkip` drains and the render Y has crossed `CONTENT_Y1` —
-so most images aren't re-fetched on a scrolled pass.
+**Subsequent scrolls: 4.56 s mean.** Comparable to BENCHTX scrolls
+since both pages now go through the same real-parser walk; the
+viewport-full short-circuit prevents image re-fetch.
+
+### Snapshot binary
+
+`dist/mwbro_baseline.com` (sha `1ef4d83651a7…`) is the post-fix
+baseline `BENCH=1` binary. To re-run the baseline numbers from any
+future optimisation, restore it with `cp dist/mwbro_baseline.com
+dist/mwbro.com && ./tools/inject.sh`.
 
 ## Task B — DEFERRED
 
