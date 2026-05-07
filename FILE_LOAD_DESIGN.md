@@ -205,6 +205,84 @@ This is multi-session work. Commits land one phase at a time:
   *some* of the prior window in `FileBuf` after a forward slide, so
   small backward scrolls don't trigger fetch.
 
+## Bridge ↔ browser pagination (already implemented; preserve through phases)
+
+The remote-load path already has a streaming protocol that runs in
+parallel to (and pre-dates) this design doc. The sliding-window work
+must not regress it.
+
+**Bridge side (`tools/web_bridge.py`):**
+
+- `_serial_split_into_chunks(body)` mirrors the on-MSX renderer's
+  pixel-driven block-end advances: every `</p>`, `</tr>`, `<br>`,
+  `</li>`, `</hN>`, `</div>`, `</center>` advances a virtual TextY
+  (8 px standard, 10 px for `</tr>`, doubled inside `<h1>`/`<h2>`),
+  and a text run that wraps past 60 chars spills onto another line.
+  When `used_px >= 175 px` the chunk cuts at the last safe block
+  boundary. Falls back to `MAX_CHUNK_BYTES + last '>'` for pages
+  with no usable line markers.
+- `MsxSession.serve(url)` builds the body, splits into chunks, stores
+  `pending_chunks`, sets `page_total = len(chunks)`.
+- First `GET <url>` and subsequent `GET MORE` invocations consume
+  chunks one at a time via `_serve_next_chunk()`, returning
+  `("HTMP", (chunk_bytes, page_served, page_total))`.
+- `_serial_send_response` formats the wire header:
+    - `OK HTM <bytes> <page>/<total>\r\n` if `total > 1`
+    - `OK HTM <bytes>\r\n` if `total == 1` (legacy single-frame format)
+
+**Browser side (`src/mwbrowser.asm`):**
+
+- `RemoteGet` parses the bytes count, then on space it parses
+  `<page>/<total>` into `SerialPage` and `SerialPageTotal`. On bare
+  CRLF it defaults both to 2 so `remaining = total - page == 0`
+  collapses to "no more chunks" cleanly.
+- `RemoteLoadFile` drains the first chunk's body into FileBuf, sets
+  `WindowLen = chunk_size`, then renders.
+- `StoreTotalLinesWithPages` runs after every render that follows a
+  remote fetch. It computes
+  `TotalLines = HtmlLineCount + (SerialPageTotal - SerialPage) * TEXT_MAX_LINES`,
+  i.e. extends the rendered line count with a 22-line-per-pending-chunk
+  estimate. `ComputeThumb` then sizes the scrollbar against the
+  *full* document so the user sees the document's true size before
+  the trailing chunks have actually been fetched.
+- `TryFetchMore` fires when scroll dispatch crosses past the current
+  WindowLen on a remote session. Sends `GET MORE\r\n`, appends the
+  next chunk to FileBuf at the current `WindowLen`, bumps
+  `WindowLen += SerialLen`, and re-runs `StoreTotalLinesWithPages`
+  so the thumb proportions catch up.
+- `TryFetchMore` refuses to append when the chunk wouldn't fit
+  (drains the wire to keep the bridge in sync, sets `TfmRefused=2`)
+  rather than corrupting FileBuf with a partial frame. Today this
+  hard-stops scroll at the FILE_BUF_SIZE boundary; Phase 5 will
+  replace the refusal with a "slide the window forward by one chunk"
+  eviction so MORE can keep flowing.
+
+**Phase compatibility checklist:**
+
+- Phases 1–3 are bridge-transparent: `WindowLen` rename matches the
+  field TryFetchMore already wrote, `LoadFileChunk` is local-only,
+  `LineCacheReset` fires at the top of `RemoteLoadFile` so a fresh
+  remote document invalidates the cache.
+- Phase 4 (parser-state snapshot) is also bridge-transparent — it
+  only changes what `LineCacheMaybeAppend` stores, not when.
+- **Phase 5 has to interact with TryFetchMore**: today TryFetchMore
+  appends to a fixed FileBuf and refuses overflow; Phase 5's
+  EnsureWindow needs to evict the oldest portion of FileBuf when a
+  new chunk arrives, OR teach TryFetchMore to call EnsureWindow
+  before appending. The bridge protocol itself doesn't change.
+- Phase 6 (`GET CHUNK <offset>`) is additive on the bridge side: the
+  current `MsxSession` already keeps `pending_chunks` for `GET MORE`;
+  add an offset-indexed cache so the MSX can ask for "the chunk
+  containing doc byte N" for backward-scroll fetches that the
+  forward-only `GET MORE` can't satisfy.
+- Phase 7 should benchmark a multi-chunk wiki page (`page_total >= 5`)
+  to confirm pagination + sliding-window cooperate correctly.
+
 ## Status
 
-Branch live, design doc committed. Phase 1 is the next code commit.
+Phases 1, 2, 3 shipped on `file_load_architecture`. Phases 1–3 are
+plumbing-only (no observable rendering change); the abstraction is
+in place so Phase 4 can land on top without touching unrelated code.
+Branch verified compatible with the existing bridge↔browser
+pagination handshake. Phase 4 (parser-state snapshot + restore) is
+the next code commit.
