@@ -4,6 +4,7 @@
 !.gitignore
 !README.md
 !README-ar.md
+!BENCHMARKS.md
 !src/
 !src/mwbrowser.asm
 !src/iso8859_6.inc

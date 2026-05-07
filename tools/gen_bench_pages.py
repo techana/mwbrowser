@@ -7,8 +7,8 @@ renderer change produces byte-identical HTML, keeping benchmarks
 comparable across builds.
 
 Output:
-  samples/BENCH_TX.HTM   ~22 KB, text + tables + lists, no images
-  samples/BENCH_IM.HTM   ~10 KB markup + 8-12 <img src="PGnn.PCX">
+  samples/BENCHTX.HTM   ~22 KB, text + tables + lists, no images
+  samples/BENCHIM.HTM   ~10 KB markup + 8-12 <img src="PGnn.PCX">
 
 Both are kept under FILE_BUF_SIZE = 24576 bytes so TryFetchMore never
 fires; the benchmark only measures the renderer / scroll path.
@@ -143,19 +143,19 @@ def main() -> int:
     if len(text) >= cap:
         # Trim from the end until under the cap, preserving </body></html>.
         # (Cheap; if this fires, lower the section count above.)
-        print("warn: BENCH_TX over cap, truncating", file=sys.stderr)
+        print("warn: BENCHTX over cap, truncating", file=sys.stderr)
         text = text[: cap - 32] + b"</body></html>\r\n"
     if len(imgs) >= cap:
-        print("warn: BENCH_IM over cap, truncating", file=sys.stderr)
+        print("warn: BENCHIM over cap, truncating", file=sys.stderr)
         imgs = imgs[: cap - 32] + b"</body></html>\r\n"
 
-    with open(os.path.join(samples, "BENCH_TX.HTM"), "wb") as f:
+    with open(os.path.join(samples, "BENCHTX.HTM"), "wb") as f:
         f.write(text)
-    with open(os.path.join(samples, "BENCH_IM.HTM"), "wb") as f:
+    with open(os.path.join(samples, "BENCHIM.HTM"), "wb") as f:
         f.write(imgs)
 
-    print(f"BENCH_TX.HTM   {len(text):>6} bytes")
-    print(f"BENCH_IM.HTM   {len(imgs):>6} bytes")
+    print(f"BENCHTX.HTM   {len(text):>6} bytes")
+    print(f"BENCHIM.HTM   {len(imgs):>6} bytes")
     return 0
 
 

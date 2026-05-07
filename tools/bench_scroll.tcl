@@ -12,8 +12,8 @@
 #      cycle harness reads that log to compute averages.
 #
 # Page choice: pass via the BENCH_PAGE TCL variable BEFORE -script,
-# defaults to BENCH_TX.HTM. Example invocation:
-#   openmsx ... -command 'set BENCH_PAGE BENCH_IM.HTM' \
+# defaults to BENCHTX.HTM. Example invocation:
+#   openmsx ... -command 'set BENCH_PAGE BENCHIM.HTM' \
 #                -script tools/bench_scroll.tcl
 #
 # Output:
@@ -21,20 +21,33 @@
 #   /tmp/bench_<page>.log              (only if -DBENCH was built in)
 
 # ── Config ────────────────────────────────────────────────────────
-if {![info exists BENCH_PAGE]} { set BENCH_PAGE "BENCH_TX.HTM" }
+# Page selection: BENCH_PAGE env var, ::BENCH_PAGE TCL global, or
+# fall back to BENCHTX.HTM. The env-var path is the most reliable
+# across openMSX versions because -command / -script run in
+# different scopes on some builds.
+if {[info exists ::env(BENCH_PAGE)] && [string length $::env(BENCH_PAGE)]} {
+    set BENCH_PAGE $::env(BENCH_PAGE)
+} elseif {[info exists ::BENCH_PAGE] && [string length $::BENCH_PAGE]} {
+    set BENCH_PAGE $::BENCH_PAGE
+} else {
+    set BENCH_PAGE "BENCHTX.HTM"
+}
 set SHOT_DIR /tmp
 set SHOT_PREFIX vwr-bench-
 # Strip .HTM for the screenshot label.
 regsub -nocase {\.htm$} $BENCH_PAGE "" PAGE_LABEL
 
-# Number of PageDown presses to issue once the page has loaded. Six
-# is enough to get past page 1 + page 2 (where parser-prefix-walk
-# cost peaks) and into a "steady-state" later page.
-set N_PAGEDOWNS 6
-# Wall-clock seconds between consecutive PageDown presses. Has to be
-# longer than the slowest current render so each press starts from
-# a stable state. 4s is generous on the un-optimised baseline.
-set GAP_S 4
+# Number of PageDown presses to issue once the page has loaded.
+set N_PAGEDOWNS 4
+# Wall-clock seconds between consecutive PageDown presses. Must be
+# *longer than the slowest current render* so each press starts
+# from a stable state. Override per-page via env var BENCH_GAP.
+# Defaults: BENCHTX = 12 s, BENCHIM = 60 s (image-heavy initial
+# render dominates and pushes per-scroll latency way up).
+set GAP_S 12
+if {[info exists ::env(BENCH_GAP)] && [string length $::env(BENCH_GAP)]} {
+    set GAP_S $::env(BENCH_GAP)
+}
 
 # ── Helpers ───────────────────────────────────────────────────────
 proc shot {label} {
@@ -53,8 +66,11 @@ flush $BENCH_FH
 
 debug set_watchpoint write_io 0x2E {} {
     upvar #0 BENCH_FH fh
-    set v [debug read "I/O ports" 0x2E]
     set t [machine_info time]
+    # openMSX exposes the byte being written as $::wp_last_value while
+    # the watchpoint command runs (and $::wp_last_address as the port).
+    set v "?"
+    catch {set v $::wp_last_value}
     set tag "?"
     if {$v == 1} { set tag "render-start" }
     if {$v == 2} { set tag "render-end"   }
@@ -65,19 +81,37 @@ debug set_watchpoint write_io 0x2E {} {
 # ── Boot sequence ─────────────────────────────────────────────────
 # (timing matches existing shot_*.tcl scripts: ~24s for MSX-DOS to be
 #  ready at the prompt, ~30s by the time MWBRO has launched.)
+#
+# Use [list ...] (or double-quoted bodies) to defer-then-substitute
+# $BENCH_PAGE; bare `{ ... }` is a literal block in TCL and would
+# type the dollar sign + variable name into the address bar.
+proc type_page {} {
+    global BENCH_PAGE
+    # IsLocalUrl in mwbrowser.asm requires a letter:filename pattern,
+    # otherwise the URL is sent to the bridge -- which 404s when no
+    # bridge is running. Prefix with the boot drive (A:).
+    type "A:${BENCH_PAGE}\r"
+}
+
 after time 23 { shot dos-ready }
 after time 24 { type "MWBRO\r" }
-after time 30 { shot mwbro-launched }
-# Clear address bar and type the test page name.
-after time 31 { type "\x0c" }                ;# Ctrl-L = clear input
-after time 32 { type "C:" }
-after time 33 { type "$BENCH_PAGE\r" }
-after time 40 { shot page-loaded }
+# Bumped to t=34 -- MWBRO.COM is now ~37 KB and the MSX-DOS 1 disk
+# load takes about 8 emulated seconds, so an earlier shot caught
+# the prompt mid-load and any keystrokes hit DOS instead of the
+# browser. shot_lastline.tcl's t=30 worked back when the .COM was
+# ~14 KB; this margin holds for the current binary.
+after time 34 { shot mwbro-launched }
+# Clear address bar (Ctrl-L) and type the test page filename. No
+# drive prefix -- MWBRO opens relative names from the current DOS
+# drive (matches shot_lastline.tcl's pattern).
+after time 35 { type "\x0c" }
+after time 36 { type_page }
+after time 44 { shot page-loaded }
 
 # ── Scroll loop: N_PAGEDOWNS presses, GAP_S apart ────────────────
 # Schedule them statically so we don't depend on TCL after-callbacks
 # resolving variables at fire time.
-set start_t 42
+set start_t 46
 for {set i 1} {$i <= $N_PAGEDOWNS} {incr i} {
     set press_t [expr {$start_t + ($i - 1) * $GAP_S}]
     set shot_t  [expr {$press_t + $GAP_S - 1}]   ;# 1s before next press
