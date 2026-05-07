@@ -1803,16 +1803,24 @@ ClearContent:
     call    PackColour
     ld      [PackedColour], a
 
-    call    VdpSetR14Zero
+    ; Screen 6's visible 212 lines × 128 bytes = 27 136 bytes = 0x6A00
+    ; sit at VRAM 0x00000..0x06A00. The first 16 KB (rows 0..127) live
+    ; in R14=0's window (A14..A16=000 -> 0x00000..0x03FFF); the trailing
+    ; 10 752 bytes (rows 128..211) sit in R14=1's window (A14..A16=001
+    ; -> 0x04000..0x07FFF). Earlier code wrote the second pass with
+    ; R14=2 (== 0x08000..0x0BFFF, off-screen scratch), which left the
+    ; bottom half of the canvas in whatever state VDP had after CHGMOD 6
+    ; -- the visible "gray bottom half on startup" bug.
+    call    VdpSetR14Zero                   ; R14 = 0 -> 0x00000..0x03FFF
     ld      hl, 0x0000
     ld      de, 0x4000
     ld      a, [PackedColour]
     call    VdpFill
 
-    ld      a, 2
+    ld      a, 1                            ; R14 = 1 -> 0x04000..0x07FFF
     call    VdpSetR14
     ld      hl, 0x0000
-    ld      de, 212 * 128 - 0x4000
+    ld      de, 212 * 128 - 0x4000          ; 0x2A00 -> rows 128..211
     ld      a, [PackedColour]
     call    VdpFill
 

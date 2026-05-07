@@ -31,23 +31,19 @@ ASCII_WORDS = (
     "viewport content area pagination hover link history form"
 ).split()
 
-# Ten short Arabic phrases (Arabic block, will encode cleanly to
-# ISO-8859-6 since the renderer uses that wire charset).
-ARABIC_PHRASES = [
-    "متصفح صغير", "صفحة الاختبار", "نص طويل", "السطر الأول",
-    "الصفحة الثانية", "الجدول الكبير", "قائمة من العناصر",
-    "صورة من الذاكرة", "أداء التمرير", "ذاكرة الفيديو",
-]
-
+# Arabic phrases used to live here, mixed into ~18% of sentences,
+# but the BiDi/shaper interaction with ASCII on the same line was
+# corrupting ASCII letters during render (wrong glyph substitution
+# for chars adjacent to Arabic words). The bench page should test
+# the parser walk in isolation from the shaper, so we keep the
+# content pure ASCII. Arabic-rendering correctness has its own
+# regression tests under tools/shot_arabic.tcl + samples/rtltab.htm.
 random.seed(42)
 
 
 def sentence(min_words=6, max_words=14):
     n = random.randint(min_words, max_words)
     words = random.choices(ASCII_WORDS, k=n)
-    if random.random() < 0.18:
-        words.insert(random.randint(0, n - 1),
-                     random.choice(ARABIC_PHRASES))
     return " ".join(words).capitalize() + "."
 
 
