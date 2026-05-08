@@ -4655,6 +4655,15 @@ SERIAL_TEXT_LINE_PX    = 8
 SERIAL_TR_LINE_PX      = 10
 SERIAL_MAX_CHUNK_BYTES = 6000
 
+# GET CHUNK <offset> serves a fixed-size byte-range slice of the most
+# recently fetched page body. Sized just under the on-MSX FILE_BUF_SIZE
+# (13 KB after file_load_architecture phase 4's bump) so a single CHUNK
+# response fills the browser's window without trickling MORE frames on
+# top. Distinct from SERIAL_MAX_CHUNK_BYTES (the GET MORE pixel-paginated
+# chunk cap) because CHUNK serves byte-range slices for sliding-window
+# scroll, not pixel-paginated ones for sequential reading.
+SERIAL_CHUNK_RANGE_BYTES = 12 * 1024
+
 _SERIAL_LINE_END_RE = re.compile(
     rb"(?i)<br\s*/?>|</p>|</tr>|</li>|</h[1-6]>|</div>|</center>")
 _SERIAL_TR_END_RE   = re.compile(rb"(?i)</tr>")
@@ -4752,6 +4761,12 @@ class MsxSession:
         self.page_served = 0
         self.img_cache = {}      # handle -> (url, declared_w, declared_h)
         self.img_counter = 0
+        # Full encoded body of the most recent page, kept after the
+        # initial pixel-paginated chunking (pending_chunks). Backs the
+        # GET CHUNK <offset> command which serves byte-range slices for
+        # the on-MSX sliding-window scroll path
+        # (file_load_architecture Phase 6).
+        self.body = b""
 
     def _log(self, msg):
         if self.verbose:
@@ -4776,6 +4791,20 @@ class MsxSession:
             CFG["no_images"] = True
             self._log("images OFF")
             return ("HTM", b"")
+        if upper.startswith("CHUNK "):
+            # GET CHUNK <byte_offset>\r\n
+            #   Returns up to SERIAL_CHUNK_RANGE_BYTES of self.body
+            #   starting at the given byte offset. Wire format reuses the
+            #   paginated frame: "OK HTM <len> <chunk_idx>/<total>" so
+            #   the on-MSX scrollbar math (StoreTotalLinesWithPages) keeps
+            #   working without a new parser path. chunk_idx is
+            #   1-indexed and computed off offset // SERIAL_CHUNK_RANGE_BYTES
+            #   so successive GET CHUNK calls walk consistent indices.
+            try:
+                offset = int(target[6:].strip())
+            except ValueError:
+                return ("404", None)
+            return self._serve_chunk_at(offset)
 
         if re.fullmatch(r"im\d+\.pcx", target, flags=re.I):
             entry = self.img_cache.get(target.lower())
@@ -4795,12 +4824,13 @@ class MsxSession:
     def _fetch_page(self, url):
         # Drop pagination / image cache from the previous page before
         # touching the network, so a failed fetch doesn't leave stale
-        # chunks in place for the next GET MORE.
+        # chunks in place for the next GET MORE / GET CHUNK.
         self.pending_chunks = []
         self.page_total = 0
         self.page_served = 0
         self.img_cache = {}
         self.img_counter = 0
+        self.body = b""
         try:
             resp = _session.get(
                 url, headers=_fetch_headers_for(url),
@@ -4862,6 +4892,10 @@ class MsxSession:
         self.pending_chunks = chunks
         self.page_total = len(chunks)
         self.page_served = 0
+        # Keep the raw body around for GET CHUNK <offset> requests; the
+        # pixel-paginated chunks above drain via GET MORE while CHUNK
+        # serves arbitrary byte ranges for slide-window scroll.
+        self.body = body
         self._log("HTM {} B -> {} chunk(s) from {}".format(
             len(body), self.page_total, resp.url))
         return self._serve_next_chunk()
@@ -4890,6 +4924,30 @@ class MsxSession:
         chunk = self.pending_chunks.pop(0)
         self.page_served += 1
         return ("HTMP", (chunk, self.page_served, self.page_total))
+
+    def _serve_chunk_at(self, offset):
+        """Serve the byte range [offset, offset + SERIAL_CHUNK_RANGE_BYTES)
+        of the most recently fetched body. Returns 404 if no body is
+        cached or the offset is past EOF; otherwise an HTMP frame whose
+        chunk_idx / total fields are computed from the byte-range grid
+        (NOT the pixel-paginated grid GET MORE uses)."""
+        if not self.body:
+            return ("404", None)
+        if offset < 0 or offset >= len(self.body):
+            return ("404", None)
+        chunk = self.body[offset:offset + SERIAL_CHUNK_RANGE_BYTES]
+        total = (len(self.body) + SERIAL_CHUNK_RANGE_BYTES - 1) // \
+                SERIAL_CHUNK_RANGE_BYTES
+        idx = offset // SERIAL_CHUNK_RANGE_BYTES + 1
+        # Cap idx and total at 255 so the OK HTM <p>/<t> wire fields
+        # stay 8-bit (the on-MSX parser clamps there).
+        if total > 255:
+            total = 255
+        if idx > 255:
+            idx = 255
+        self._log("CHUNK off={} len={} idx={}/{}".format(
+            offset, len(chunk), idx, total))
+        return ("HTMP", (chunk, idx, total))
 
     # -- Image fetch + PCX encode --------------------------------------
 

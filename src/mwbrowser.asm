@@ -167,7 +167,7 @@ URL_MAX        equ 255         ; address-bar / fetch-target buffer cap (chars
                                ; before NUL). Bumped from 95 because real
                                ; mirror.aratab.com URLs run past the 100-char
                                ; line and got truncated on click.
-FILE_BUF_SIZE  equ 0x3400      ; 13 KB. Sized so FILEBUF_BASE (0x9800) +
+FILE_BUF_SIZE  equ 0x3300      ; 12.75 KB. Sized so FILEBUF_BASE (0x9900) +
                                ; FILE_BUF_SIZE + FONT_BUF_SIZE + 128 lands
                                ; at 0xD480 -- below both MSX-DOS 1.03's
                                ; *runtime* HIMEM (~0xDF94 on Sony HB-F1XD,
@@ -14953,6 +14953,164 @@ TryFetchMore:
     scf
     ret
 
+; Format5Decimal: write HL as 5 ASCII decimal digits + NUL at [DE].
+; Always emits exactly 5 digits with leading zeros (the bridge-side
+; int() parser ignores them) so callers don't have to worry about
+; suppression. Range: HL = 0..65535; output buffer must hold >=6 bytes.
+;
+; Strategy: subtract powers of 10 in unsigned 16-bit, counting how many
+; subtractions until the result goes negative. The trailing sbc with
+; CF=0 restores HL after one too many subtracts. Same idiom as a
+; classic CP/M binary-to-decimal printer.
+;
+; Out: DE advanced 6 bytes (5 digits + NUL).
+; Clobbers: A, BC, HL, DE (DE moves forward).
+Format5Decimal:
+    ld      bc, -10000
+    call    .f5dDigit
+    ld      bc, -1000
+    call    .f5dDigit
+    ld      bc, -100
+    call    .f5dDigit
+    ld      bc, -10
+    call    .f5dDigit
+    ld      a, l
+    add     a, '0'
+    ld      [de], a
+    inc     de
+    xor     a
+    ld      [de], a
+    inc     de
+    ret
+.f5dDigit:
+    ld      a, '0' - 1
+.f5dLoop:
+    inc     a
+    add     hl, bc
+    jr      c, .f5dLoop                 ; CF set when subtraction (BC<0) didn't underflow
+    sbc     hl, bc                       ; restore HL after the failing subtract
+    ld      [de], a
+    inc     de
+    ret
+
+; EnsureWindowRemote: replace FileBuf with a fresh window of body bytes
+; starting at the given target_doc_offset. Sends "GET CHUNK <offset>"
+; over the wire and drains the body into FileBuf at byte 0. Mirrors
+; EnsureWindowLocal but for remote sessions.
+;
+; Inputs:
+;   HL = target_doc_offset (16-bit; the bridge accepts up to ~64 KB
+;        before a 24-bit widening becomes necessary)
+;
+; Outputs:
+;   On success: DocOffset = target, WindowLen = bytes received (clamped
+;     to FILE_BUF_SIZE), FileBuf populated, LineCache reset, A = 0.
+;   On failure (timeout, 404, wrong kind): A != 0, DocOffset / WindowLen
+;     unchanged.
+;
+; Caller is responsible for the post-fetch ScrollLine reset and
+; RefreshAfterScroll, mirroring how PageDown's local-slide path
+; handles it for EnsureWindowLocal.
+RgChunkPrefix:  db "CHUNK ", 0
+
+EnsureWindowRemote:
+    push    hl                           ; save target across format step
+    ; Build "CHUNK NNNNN\0" in ChunkCmdBuf.
+    ld      de, ChunkCmdBuf
+    ld      hl, RgChunkPrefix
+.ewrCpPrefix:
+    ld      a, [hl]
+    or      a
+    jr      z, .ewrCpDone
+    ld      [de], a
+    inc     hl
+    inc     de
+    jr      .ewrCpPrefix
+.ewrCpDone:
+    pop     hl                           ; HL = target
+    push    hl                           ; re-save for the DocOffset commit
+    call    Format5Decimal               ; writes digits + NUL to [DE]
+
+    ; Send "GET CHUNK NNNNN\r\n" and parse the OK / ERR header.
+    call    SerialMaskVblank
+    ld      hl, ChunkCmdBuf
+    call    RemoteGet
+    jr      c, .ewrFail
+    ld      a, [SerialKind]
+    cp      1                            ; HTM (kind 1 = HTM/HTMP)
+    jr      nz, .ewrFail
+
+    ; Compute clamped WindowLen = min(SerialLen, FILE_BUF_SIZE).
+    ld      hl, [SerialLen]
+    ld      de, FILE_BUF_SIZE
+    push    hl
+    or      a
+    sbc     hl, de
+    pop     hl
+    jr      c, .ewrLenOk
+    ld      hl, FILE_BUF_SIZE
+.ewrLenOk:
+    ld      [WindowLen], hl
+
+    ; Drain SerialLen body bytes into FileBuf. The first WindowLen
+    ; bytes are stored; any tail past the cap is drained (kept off
+    ; the wire) so the bridge stays in sync. Mirrors RemoteLoadFile's
+    ; .rlfBody / .rlfTail.
+    ld      de, FileBuf
+    ld      bc, [WindowLen]
+.ewrBody:
+    ld      a, b
+    or      c
+    jr      z, .ewrTail
+    push    bc
+    push    de
+    call    SerialRead
+    pop     de
+    pop     bc
+    jr      c, .ewrFailDrop              ; mid-body timeout; bail (DocOffset stays)
+    ld      [de], a
+    inc     de
+    dec     bc
+    call    BusyHeartbeat
+    jr      .ewrBody
+.ewrTail:
+    ld      hl, [SerialLen]
+    ld      de, [WindowLen]
+    and     a
+    sbc     hl, de
+    ld      b, h
+    ld      c, l
+.ewrDrain:
+    ld      a, b
+    or      c
+    jr      z, .ewrDone
+    push    bc
+    call    SerialRead
+    pop     bc
+    jr      c, .ewrFailDrop              ; bridge dead mid-drain; abandon
+    dec     bc
+    jr      .ewrDrain
+
+.ewrDone:
+    call    SerialUnmaskVblank
+    pop     hl                           ; HL = target (saved at entry)
+    ld      [DocOffset], hl
+    call    LineCacheReset
+    xor     a
+    ret
+
+.ewrFailDrop:
+    call    SerialUnmaskVblank
+    pop     hl                           ; balance the stack (saved target)
+    or      1                            ; ensure A != 0
+    ret
+
+.ewrFail:
+    call    SerialUnmaskVblank
+    pop     hl                           ; balance the stack
+    or      1
+    ret
+
 ; RemoteImgOpen: filename is in ImgNameBuf. Expects OK PCX; saves body
 ; length into ImgBytesLeft so ImgStreamByte can pull from the UART.
 RemoteImgOpen:
@@ -15519,6 +15677,12 @@ UrlLen:         db 0
 UrlCursor:      db 0                    ; caret column inside UrlBuf, 0..UrlLen
 UrlBuf:         ds URL_MAX + 1          ; 96 chars + NUL
 
+; Scratch buffer EnsureWindowRemote builds "CHUNK <decimal-offset>" in
+; before handing it to RemoteGet. RemoteGet prepends "GET " and appends
+; "\r\n", so the wire frame ends up "GET CHUNK NNNNN\r\n". 16 bytes is
+; comfortably oversized -- "CHUNK " (6) + 5 digits + NUL = 12.
+ChunkCmdBuf:    ds 16
+
 ; Mouse state -- driven by PSG reg 14/15 via ports 0xA0/0xA1/0xA2. Port A
 ; (joyporta on openMSX) is used; the GetMouse routine adapts the technique
 ; from resources/MSX Mouse/MSX_MouseText.asm.
@@ -15896,7 +16060,12 @@ FileEnd:
 ; the budget at build time so future code growth fails the build
 ; instead of regressing silently.
 
-FILEBUF_BASE   equ 0x9800              ; aligned past current FileEnd
+FILEBUF_BASE   equ 0x9900              ; aligned past current FileEnd
+                                       ; (~0x98xx after Phase 6's
+                                       ; EnsureWindowRemote +
+                                       ; Format5Decimal helpers added
+                                       ; ~230 B); bump further if the
+                                       ; ASSERT below trips.
                                        ; (~0x9755 after Phase 4's parser-
                                        ; state Snapshot/Restore + 256 B of
                                        ; LineCacheState added ~340 B);
