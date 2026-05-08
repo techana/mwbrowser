@@ -264,6 +264,29 @@ Main:
     call    SerialInit
 
 MainLoop:
+    ; ──── DO NOT remove the `ei` below. ────────────────────────────
+    ; If you HALT with interrupts disabled, the CPU never wakes up.
+    ; This was a months-long bug:
+    ;   - The original code had bare `halt` with the comment
+    ;     "MSX-DOS leaves interrupts enabled during a .COM session,
+    ;      so the EI guard isn't needed here."
+    ;   - That assumption holds on HB-F1XD (where every test in the
+    ;     development branch ran clean) but is FALSE on Sony HB-F700D,
+    ;     Al-Alamiah AX-370, and likely a wider class of MSX2 BIOSes
+    ;     that hand control to the .COM with IFF=0.
+    ;   - Symptom on emulators: openMSX warns
+    ;     "warning: DI; HALT detected, which means a hang."
+    ;   - Symptom on real hardware: machine freezes; an eventual
+    ;     reset / NMI runs our shutdown code and the V9938 palette
+    ;     ends up holding Screen0Palette -- which fooled an earlier
+    ;     CLAUDE.md into theorising an "AX-370 ~15565 B TPA cap."
+    ;     There is no such cap. The hang is purely the bare HALT.
+    ; The Z80 architecture guarantees EI's effect is delayed by one
+    ; instruction, so the HALT below cannot take an interrupt before
+    ; it executes -- this idiom is safe and is the canonical MSX
+    ; vsync wait. (Reference: Z80 manual §4.1, MSX Assembly Page §2.)
+    ; ──────────────────────────────────────────────────────────────
+    ;
     ; HALT pauses the CPU until the next interrupt -- on MSX with
     ; default IM 1, that's the 50/60 Hz VBLANK from the VDP. Pacing
     ; the idle loop on VBLANK gives us:
@@ -271,16 +294,6 @@ MainLoop:
     ;   - ~16-20 ms between keyboard peeks (still imperceptible),
     ;   - 0 % CPU between events on emulators / real hardware,
     ;   - and no busy-spin pinning openMSX's host thread at 100 %.
-    ;
-    ; The canonical MSX vsync wait is "EI / HALT". Earlier versions of
-    ; this loop relied on "MSX-DOS leaves interrupts enabled during a
-    ; .COM session" and dropped the EI -- that holds on HB-F1XD but
-    ; NOT on Sony HB-F700D / Al-Alamiah AX-370 (and likely other MSX2
-    ; models), where openMSX caught the bare HALT with IFF=0 and
-    ; logged "DI; HALT detected, which means a hang" because the
-    ; CPU could never wake up. The Z80 architecture guarantees EI's
-    ; effect is delayed by one instruction, so the HALT here always
-    ; sees IFF=1 and the next VBLANK reliably exits.
     ei
     halt
     call    PollMouse
