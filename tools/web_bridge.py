@@ -4800,8 +4800,14 @@ class MsxSession:
             #   working without a new parser path. chunk_idx is
             #   1-indexed and computed off offset // SERIAL_CHUNK_RANGE_BYTES
             #   so successive GET CHUNK calls walk consistent indices.
+            #
+            # Offset is parsed as hex (no "0x" prefix needed) -- the
+            # MSX-side Format6Hex emits a 6-digit uppercase hex string,
+            # which covers the 24-bit DocOffset range without needing
+            # an 8-digit Format8Decimal helper.
+            arg = target[6:].strip()
             try:
-                offset = int(target[6:].strip())
+                offset = int(arg, 16)
             except ValueError:
                 return ("404", None)
             return self._serve_chunk_at(offset)

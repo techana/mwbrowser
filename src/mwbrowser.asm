@@ -167,7 +167,7 @@ URL_MAX        equ 255         ; address-bar / fetch-target buffer cap (chars
                                ; before NUL). Bumped from 95 because real
                                ; mirror.aratab.com URLs run past the 100-char
                                ; line and got truncated on click.
-FILE_BUF_SIZE  equ 0x3100      ; 12.25 KB. Sized so FILEBUF_BASE (0x9B00) +
+FILE_BUF_SIZE  equ 0x3000      ; 12 KB. Sized so FILEBUF_BASE (0x9C00) +
                                ; FILE_BUF_SIZE + FONT_BUF_SIZE + 128 lands
                                ; at 0xD480 -- below both MSX-DOS 1.03's
                                ; *runtime* HIMEM (~0xDF94 on Sony HB-F1XD,
@@ -3068,11 +3068,17 @@ LoadFile:
     or      a
     ret     nz
 
-    ; Latch the file's full size from FCB+16 before we start reading.
-    ; EnsureWindowLocal needs DocSize to know when a forward slide
-    ; would actually fetch new content vs land past EOF.
+    ; Latch the file's full size from FCB+16..18 before we start
+    ; reading. MSX-DOS stores file size as 4 bytes at FCB+16 (CP/M
+    ; legacy, max 16 MB); we keep 24 bits so docs past 64 KB
+    ; (Wikipedia articles, blog posts) navigate end-to-end. The top
+    ; byte at FCB+19 is silently dropped -- 24-bit DocOffset can
+    ; only address up to 16 MB anyway, and any real .htm we'd open
+    ; on an MSX-DOS 1 floppy is well under that.
     ld      hl, [Fcb + 16]
     ld      [DocSize], hl
+    ld      a, [Fcb + 18]
+    ld      [DocSize + 2], a
 
     ; A fresh document invalidates every previously cached
     ; (line_no, doc_offset) entry. Reset before the read so the
@@ -3083,8 +3089,9 @@ LoadFile:
     ; to LoadFileChunk(doc_offset=0, byte_count=FILE_BUF_SIZE).
     ; EnsureWindowLocal handles non-zero offsets when scroll dispatch
     ; slides the window past the initial chunk.
-    ld      de, 0                       ; doc_offset
-    ld      hl, FILE_BUF_SIZE           ; byte_count
+    xor     a                            ; high byte of 24-bit doc_offset
+    ld      de, 0                        ; low word
+    ld      hl, FILE_BUF_SIZE            ; byte_count
     call    LoadFileChunk
     push    af
     ld      c, DOS_CLOSE
@@ -3099,10 +3106,11 @@ LoadFile:
 ;
 ; Inputs:
 ;   FCB pre-OPENed by the caller (file size at FCB+16 is valid)
-;   DE = doc_offset (must be a multiple of 128 in this phase; the
-;        sub-record byte_remainder branch is tagged for Phase 5 when
-;        sliding-window backward fetches actually trigger it)
-;   HL = byte_count (caller's requested window size, clamped to
+;   A:DE = doc_offset (A = high byte, DE = low word; must be a
+;          multiple of 128. The sub-record byte_remainder branch is
+;          deferred for the day sliding-window backward fetches
+;          actually need it.)
+;   HL  = byte_count (caller's requested window size, clamped to
 ;        FILE_BUF_SIZE downstream)
 ;
 ; Outputs:
@@ -3127,7 +3135,9 @@ LoadFile:
 ;       branch first sees real callers; today only the sequential
 ;       branch runs.
 LoadFileChunk:
+    ; Save 24-bit doc_offset (A = hi, DE = lo word).
     ld      [DocOffset], de
+    ld      [DocOffset + 2], a
     ; Clamp HL to FILE_BUF_SIZE so the caller can pass a generous
     ; byte_count without overrunning FileBuf.
     push    hl
@@ -3141,12 +3151,15 @@ LoadFileChunk:
     ld      [WindowLen], hl
     ld      a, h
     or      l
-    jr      z, .lfcDone                 ; nothing to read
+    jp      z, .lfcDone                 ; nothing to read (jp = past 7-shift loop)
 
-    ; Branch on DocOffset.
+    ; Branch on DocOffset (24-bit zero-test).
     ld      a, [DocOffset]
     ld      b, a
     ld      a, [DocOffset + 1]
+    or      b
+    ld      b, a
+    ld      a, [DocOffset + 2]
     or      b
     jr      nz, .lfcRandom
 
@@ -3180,14 +3193,28 @@ LoadFileChunk:
     ; so the primitive is complete and Phase 5 doesn't touch
     ; LoadFileChunk at all.)
 .lfcRandom:
-    ld      hl, [DocOffset]
+    ; Load 24-bit DocOffset into A:HL (high byte in A, low word in HL),
+    ; then right-shift 7 to convert byte_offset to record_index. Result
+    ; is at most 17 bits so it fits in FCB+33..35's 3-byte field.
+    ld      a, [DocOffset]
+    ld      l, a
+    ld      a, [DocOffset + 1]
+    ld      h, a
+    ld      a, [DocOffset + 2]
+    ld      b, 7
+.lfcShr7:
+    srl     a
+    rr      h
+    rr      l
+    djnz    .lfcShr7
+    ; A:HL = record_index. Spill to FCB+33..35. The Z80's
+    ; `ld [imm16], r8` is only valid for A; for L/H we route through A.
+    push    af
     ld      a, l
-    add     a, a
-    ld      a, h
-    adc     a, a                        ; A = doc_offset / 128 (low byte)
     ld      [Fcb + 33], a
-    xor     a
+    ld      a, h
     ld      [Fcb + 34], a
+    pop     af
     ld      [Fcb + 35], a
 
     ld      hl, FileBuf
@@ -3275,51 +3302,61 @@ ClearContentArea:
 ; per-call open/close cost is ~one BDOS hop pair plus the seek
 ; setup inside LoadFileChunk; on a real floppy this is dwarfed
 ; by the actual record reads.
+; Caller convention: 24-bit target stashed in `SlideTarget` (3-byte
+; RAM scratch) before the call. Keeping it in RAM avoids the stack
+; juggling that A:HL register-pair conventions would force across
+; all the BDOS calls below; the slide path is rare enough that the
+; ~6-byte cost (load/store) is invisible.
 EnsureWindowLocal:
     push    bc
     push    de
-    push    hl                           ; save target
-    ld      de, [DocOffset]
+    push    hl
+    push    af
+    ; Fast-path: is SlideTarget already inside [DocOffset,
+    ; DocOffset + WindowLen)? 24-bit subtract: target - DocOffset.
+    ; Sign-extend WindowLen to 24 bits (high byte = 0). We carry
+    ; the borrow into the high byte via `sbc a, c`.
+    ld      hl, [SlideTarget]            ; HL = target lo word
+    ld      bc, [DocOffset]              ; BC = DocOffset lo word
     or      a
-    sbc     hl, de                       ; HL = target - DocOffset
-    jr      c, .ewlSlide                 ; target < DocOffset -> slide back
-    ld      de, [WindowLen]
-    sbc     hl, de
-    jr      c, .ewlAlreadyIn             ; in current window -> no-op
+    sbc     hl, bc                       ; HL = target_lo - DocOffset_lo
+    ld      a, [SlideTarget + 2]
+    ld      b, a                         ; B = target hi
+    ld      a, [DocOffset + 2]
+    ld      c, a                         ; C = DocOffset hi
+    ld      a, b
+    sbc     a, c                         ; A = target_hi - DocOffset_hi - borrow
+    jr      c, .ewlSlide                 ; target < DocOffset -> slide
+    ; A:HL = target - DocOffset (>= 0). Subtract WindowLen (16-bit).
+    ld      bc, [WindowLen]
+    or      a
+    sbc     hl, bc
+    sbc     a, 0
+    jr      c, .ewlAlreadyIn             ; (target - DocOffset) < WindowLen -> in-window
 .ewlSlide:
-    ; Round target down to a 128-byte record boundary so LoadFileChunk
-    ; doesn't need its byte_remainder branch (deferred to a later
-    ; refinement). HL still has the original target (we restored on
-    ; the .ewlSlide path before adjusting only the DE). Wait -- HL was
-    ; mutated by the sbc pair above, so reload from the saved copy.
-    pop     hl                           ; HL = target_doc_offset (saved)
-    push    hl                           ; re-save (we still need it for cleanup)
-    ld      a, l
-    and     0x80                         ; keep bit 7, zero bits 0..6
-    ld      l, a                         ; HL aligned down to 128
+    ; Align SlideTarget down to a 128-byte record boundary in place.
+    ld      a, [SlideTarget]
+    and     0x80
+    ld      [SlideTarget], a
 
-    ; Reopen FCB. ResetFcbTail clears CR / R0..R2 / extent state but
-    ; leaves the drive/name fields LoadFile / BuildFcbFromUrl
-    ; populated, so DOS_OPEN finds the same file again.
-    push    hl                           ; save aligned offset
+    ; Reopen FCB.
     call    ResetFcbTail
     ld      c, DOS_OPEN
     ld      de, Fcb
     call    BDOS_ENTRY
-    pop     hl                           ; aligned offset back
     or      a
-    jr      nz, .ewlOpenFail
+    jp      nz, .ewlOpenFail
 
-    ; Slide invalidates LineCache: the old (line_no, doc_offset)
-    ; entries refer to bytes that no longer live in FileBuf. Reset
-    ; before the read so the post-render's EmitNewlines start from
-    ; an empty cache and repopulate for the new window.
-    push    hl
+    ; Slide invalidates LineCache.
     call    LineCacheReset
-    pop     hl
 
-    ex      de, hl                       ; DE = aligned doc_offset
-    ld      hl, FILE_BUF_SIZE            ; byte_count
+    ; LoadFileChunk(A:DE = SlideTarget, HL = byte_count).
+    ld      a, [SlideTarget]
+    ld      e, a
+    ld      a, [SlideTarget + 1]
+    ld      d, a
+    ld      a, [SlideTarget + 2]
+    ld      hl, FILE_BUF_SIZE
     call    LoadFileChunk
     push    af
     ld      c, DOS_CLOSE
@@ -3328,19 +3365,18 @@ EnsureWindowLocal:
     pop     af
 
 .ewlExit:
+    pop     af
     pop     hl
     pop     de
     pop     bc
     ret
 
 .ewlAlreadyIn:
-    ; HL got mangled by the bounds-check sbc; restore from the saved
-    ; copy and exit clean.
     xor     a
     jr      .ewlExit
 
 .ewlOpenFail:
-    or      1                            ; ensure A != 0 for the caller
+    or      1
     jr      .ewlExit
 
 ; ============================================================================
@@ -5288,40 +5324,54 @@ LineCacheMaybeAppend:
     inc     a
     ld      [LineCacheCount], a
 .lcmaWrite:
-    ; Save slot index for the snapshot call below.
+    ; Save slot index for snapshot + doc_offset index recomputation.
     ld      a, c
     ld      [LineCacheWriteSlot], a
-    ; Index byte = slot * 2 (word stride).
-    sla     c
+    ; ── Slot 1: line_no -> LineCacheLineNo[slot] (16-bit / 2-byte stride) ──
+    sla     c                            ; C = slot * 2
     ld      b, 0
-    ; Slot 1: line_no -> LineCacheLineNo[slot]
     ld      hl, LineCacheLineNo
     add     hl, bc
     ld      de, [HtmlLineCount]
     ld      [hl], e
     inc     hl
     ld      [hl], d
-    ; Slot 2: doc_offset = (ParserCursor - FileBuf) + DocOffset
+    ; ── Slot 2: doc_offset (24-bit / 3-byte stride) ──
+    ; doc_offset = (ParserCursor - FileBuf) + DocOffset
     ld      hl, [ParserCursor]
     ld      de, FileBuf
     or      a
-    sbc     hl, de                      ; HL = window-relative offset
+    sbc     hl, de                       ; HL = window-relative offset (16-bit)
+    ; Add DocOffset (24-bit): low word into HL with carry, high byte
+    ; into A.
     ld      de, [DocOffset]
-    add     hl, de                      ; HL = absolute doc-byte offset
-    ex      de, hl                      ; DE = doc_offset
+    add     hl, de
+    ld      a, [DocOffset + 2]
+    adc     a, 0                         ; A = doc_offset high byte
+    ; Compute slot*3 byte index, point HL at slot's 3-byte cell.
+    push    af                           ; preserve high byte
+    ld      a, [LineCacheWriteSlot]
+    ld      c, a
+    add     a, c
+    add     a, c                         ; A = slot * 3
+    ld      e, a
+    ld      d, 0
+    ; Save the just-computed lo word before we trash HL.
+    ld      b, h
+    ld      c, l                         ; BC = doc_offset low word
     ld      hl, LineCacheDocOff
-    add     hl, bc
-    ld      [hl], e
+    add     hl, de                       ; HL = &slot.doc_offset
+    ld      [hl], c                      ; lo
     inc     hl
-    ld      [hl], d
-    ; Slot 3: parser state snapshot. LineCacheSnapshot reads
-    ; LineCacheWriteSlot for the slot index (was using LineCacheCount
-    ; before ring eviction landed; ring writes target an arbitrary
-    ; slot, not always next-available).
+    ld      [hl], b                      ; mid
+    inc     hl
+    pop     af
+    ld      [hl], a                      ; hi
+    ; ── Slot 3: parser state snapshot ──
     pop     bc
     pop     de
     pop     hl
-    jp      LineCacheSnapshot           ; tail-call
+    jp      LineCacheSnapshot            ; tail-call
 
 ; IsLineCacheStateSafe: returns Z (with A=0) when the parser's "open
 ; scopes" are all at default values, NZ otherwise. Safe scope means
@@ -5467,64 +5517,92 @@ LineCacheReset:
     ld      [LineCacheHead], a
     ret
 
+; Cmp24: 24-bit unsigned compare of two values stored at [HL] and [DE]
+; (lo / mid / hi byte order). Returns CF=1 iff [HL] < [DE], CF=0
+; otherwise; Z=1 iff the values are equal. HL and DE are preserved.
+; Clobbers A, B.
+Cmp24:
+    push    hl
+    push    de
+    ld      a, [de]
+    ld      b, a
+    ld      a, [hl]
+    sub     b                            ; HL_lo - DE_lo
+    inc     hl
+    inc     de
+    ld      a, [de]
+    ld      b, a
+    ld      a, [hl]
+    sbc     a, b                         ; HL_mid - DE_mid - borrow
+    inc     hl
+    inc     de
+    ld      a, [de]
+    ld      b, a
+    ld      a, [hl]
+    sbc     a, b                         ; HL_hi - DE_hi - borrow
+    pop     de
+    pop     hl
+    ret
+
 ; LineCacheLookupOffset: find the cached slot whose stored doc_offset
-; is the largest one not exceeding the requested target. Returns A =
-; slot index (0..LineCacheCount-1), or A = 0xFF if no slot qualifies
-; (cache empty, or every entry's doc_offset > target).
+; is the largest one not exceeding the target stashed in SlideTarget
+; (24-bit). Returns A = slot index (0..LineCacheCount-1), or 0xFF if
+; no slot qualifies.
 ;
-; In:  HL = target_doc_offset
-; Out: A  = best slot, or 0xFF
-;      HL/DE/BC preserved (callee saves)
+; Uses LcloBestOff / LcloBestIdx as scratch. Caller saves HL/DE/BC.
 ;
-; Walks every populated slot once -- LineCacheMax is 32 so the linear
-; scan finishes in <~600 T-states even at full count, called rarely
-; (once per slide). Uses a small RAM scratch block (LcloTarget /
-; LcloBestOff / LcloBestIdx) to keep the loop state out of the
-; pushed-stack-juggling that 16-bit compares would otherwise need.
+; Walks every populated slot once -- LineCacheMax = 32 so the linear
+; scan finishes in <~1000 T-states (24-bit compare is more expensive
+; than 16-bit, but called rarely, once per slide).
 LineCacheLookupOffset:
     push    hl
     push    de
     push    bc
-    ld      [LcloTarget], hl
     ld      a, 0xFF
     ld      [LcloBestIdx], a
     xor     a
     ld      [LcloBestOff], a
     ld      [LcloBestOff + 1], a
+    ld      [LcloBestOff + 2], a
     ld      a, [LineCacheCount]
     or      a
     jr      z, .lcloDone
-    ld      b, a                        ; B = remaining slots to scan
-    ld      c, 0                        ; C = current slot index
+    ld      b, a                         ; B = remaining slots
+    ld      c, 0                         ; C = current slot index
 .lcloIter:
-    ; Read entry doc_offset into DE.
+    ; HL = LineCacheDocOff + slot * 3
     ld      a, c
-    add     a, a
+    add     a, c
+    add     a, c                         ; A = slot * 3 (slots <= 32)
     ld      e, a
     ld      d, 0
     ld      hl, LineCacheDocOff
-    add     hl, de
-    ld      e, [hl]
-    inc     hl
-    ld      d, [hl]                     ; DE = entry.doc_offset
-    ; Test entry <= target.
-    ld      hl, [LcloTarget]
-    or      a
-    sbc     hl, de                      ; HL = target - entry; CF=1 if entry > target
-    jr      c, .lcloSkip
-    ; Test entry > best (so we keep the largest qualifying entry).
-    ld      hl, [LcloBestOff]
-    or      a
-    sbc     hl, de                      ; HL = best - entry; CF=1 if entry > best
-    jr      nc, .lcloSkip
-    ; Update best.
-    ld      hl, LcloBestOff
-    ld      [hl], e
-    inc     hl
-    ld      [hl], d
+    add     hl, de                       ; HL = &slot.doc_offset
+    ; slot <= target ?
+    push    hl
+    ld      de, SlideTarget
+    call    Cmp24                        ; CF=1 -> slot<target; Z -> equal
+    pop     hl
+    jr      c, .lcloVsBest
+    jr      nz, .lcloNext                ; slot > target -> skip
+.lcloVsBest:
+    ; slot <= target. Update best iff slot > best.
+    push    hl
+    ld      de, LcloBestOff
+    call    Cmp24                        ; CF -> slot<best; Z -> equal
+    pop     hl
+    jr      c, .lcloNext                 ; slot < best -> skip
+    jr      z, .lcloNext                 ; slot == best -> skip
+    ; slot > best: copy slot's 3 bytes into LcloBestOff and remember
+    ; the slot index.
     ld      a, c
     ld      [LcloBestIdx], a
-.lcloSkip:
+    push    bc
+    ld      de, LcloBestOff
+    ld      bc, 3
+    ldir
+    pop     bc
+.lcloNext:
     inc     c
     djnz    .lcloIter
 .lcloDone:
@@ -5534,46 +5612,43 @@ LineCacheLookupOffset:
     pop     hl
     ret
 
-; SlideAlignTarget: cache-align a slide's desired byte-offset to a
-; cached safe boundary at or before that offset, so the post-slide
-; render can pick up parser state from the matching snapshot. If no
-; cached entry qualifies, the target stays unchanged and
-; PendingRestoreSlot is left at 0xFF -- the slide proceeds with the
-; pre-Phase-7-fix behaviour (default state, possible <ul>/<font>
-; reset).
+; SlideAlignTarget: cache-align the slide target stored in SlideTarget
+; to a cached safe boundary at or before it, so the post-slide render
+; can pick up parser state from the matching snapshot. If no cached
+; entry qualifies, SlideTarget is left unchanged and
+; PendingRestoreSlot becomes 0xFF (the pre-cache-aligned path:
+; default state at the boundary).
 ;
-; In:  HL = desired_target_doc_offset
-; Out: HL = adjusted target (entry.doc_offset if cache hit; unchanged
-;      otherwise)
-;      [PendingRestoreSlot] = slot index, or 0xFF = no restore
-;      DE/BC preserved
+; In:  SlideTarget pre-set (24-bit).
+; Out: SlideTarget = entry.doc_offset on cache hit (else unchanged).
+;      PendingRestoreSlot = slot index or 0xFF.
 SlideAlignTarget:
     push    de
     push    bc
-    push    hl                          ; preserve desired target
+    push    hl
     call    LineCacheLookupOffset
     cp      0xFF
     jr      z, .satNoCache
     ld      [PendingRestoreSlot], a
-    ; HL = LineCacheDocOff[slot]
-    add     a, a
+    ; Copy LineCacheDocOff[slot] (3 bytes) into SlideTarget.
+    ld      c, a
+    add     a, c
+    add     a, c                         ; A = slot * 3
     ld      e, a
     ld      d, 0
     ld      hl, LineCacheDocOff
     add     hl, de
-    ld      e, [hl]
-    inc     hl
-    ld      d, [hl]                     ; DE = entry.doc_offset
-    pop     hl                          ; discard saved desired
-    push    de
-    pop     hl                          ; HL = entry.doc_offset
+    ld      de, SlideTarget
+    ld      bc, 3
+    ldir
+    pop     hl
     pop     bc
     pop     de
     ret
 .satNoCache:
     ld      a, 0xFF
     ld      [PendingRestoreSlot], a
-    pop     hl                          ; HL = desired target (unchanged)
+    pop     hl
     pop     bc
     pop     de
     ret
@@ -12936,12 +13011,22 @@ MaybeSlideBackward:
 ;
 ; Returns CF=0 on slide success, CF=1 on EnsureWindow failure.
 SlideBackwardLocal:
+    ; SlideTarget = max(0, DocOffset - FILE_BUF_SIZE). 24-bit subtract
+    ; (FILE_BUF_SIZE zero-extends). On underflow, clamp to 0.
     ld      hl, [DocOffset]
     ld      de, FILE_BUF_SIZE
     or      a
     sbc     hl, de
+    ld      [SlideTarget], hl
+    ld      a, [DocOffset + 2]
+    sbc     a, 0
+    ld      [SlideTarget + 2], a
     jr      nc, .sbloAlign
-    ld      hl, 0                        ; clamp to byte 0
+    ; Underflow (DocOffset < FILE_BUF_SIZE) -> clamp to 0.
+    xor     a
+    ld      [SlideTarget], a
+    ld      [SlideTarget + 1], a
+    ld      [SlideTarget + 2], a
 .sbloAlign:
     call    SlideAlignTarget
     call    EnsureWindowLocal
@@ -12953,17 +13038,23 @@ SlideBackwardLocal:
     scf
     ret
 
-; SlideBackwardRemote: remote analogue. The bridge's GET CHUNK
-; <offset> can serve any byte range of the cached body, so backward
-; navigation works the same way as forward slide -- just with a
-; smaller target.
+; SlideBackwardRemote: remote analogue. Same 24-bit subtract pattern
+; as SlideBackwardLocal; bridge's GET CHUNK serves any byte range of
+; the cached body.
 SlideBackwardRemote:
     ld      hl, [DocOffset]
     ld      de, FILE_BUF_SIZE
     or      a
     sbc     hl, de
+    ld      [SlideTarget], hl
+    ld      a, [DocOffset + 2]
+    sbc     a, 0
+    ld      [SlideTarget + 2], a
     jr      nc, .sbroAlign
-    ld      hl, 0
+    xor     a
+    ld      [SlideTarget], a
+    ld      [SlideTarget + 1], a
+    ld      [SlideTarget + 2], a
 .sbroAlign:
     call    SlideAlignTarget
     call    EnsureWindowRemote
@@ -13078,25 +13169,36 @@ PageDown:
 ;     correctly. A future refinement will use cached snapshots
 ;     to bridge across slides cleanly.
 SlideForwardLocal:
-    ; desired_target = DocOffset + WindowLen
+    ; desired_target = DocOffset + WindowLen, 24-bit add. WindowLen is
+    ; 16-bit so it zero-extends; DocOffset's high byte gets a +carry
+    ; from the low-word add.
     ld      hl, [DocOffset]
     ld      de, [WindowLen]
     add     hl, de
+    ld      [SlideTarget], hl
+    ld      a, [DocOffset + 2]
+    adc     a, 0
+    ld      [SlideTarget + 2], a
     ; Bail if desired_target >= DocSize (nothing left to fetch).
-    ld      de, [DocSize]
-    push    hl
+    ; 24-bit compare: SlideTarget - DocSize.
+    ld      hl, [SlideTarget]
+    ld      bc, [DocSize]
     or      a
-    sbc     hl, de
-    pop     hl
-    jr      c, .sflFetch
+    sbc     hl, bc
+    ld      a, [SlideTarget + 2]
+    ld      b, a
+    ld      a, [DocSize + 2]
+    ld      c, a
+    ld      a, b
+    sbc     a, c
+    jr      c, .sflFetch                 ; SlideTarget < DocSize -> fetch
     scf
     ret
 .sflFetch:
     ; Cache-align: if a cached safe boundary sits at or before
     ; desired_target, slide to *that* offset instead so the matching
     ; parser-state snapshot can be restored after the slide. Otherwise
-    ; HL is unchanged and PendingRestoreSlot stays at 0xFF (the
-    ; pre-Phase-7-fix path -- defaults at the boundary).
+    ; SlideTarget is unchanged and PendingRestoreSlot stays at 0xFF.
     call    SlideAlignTarget
     call    EnsureWindowLocal
     or      a
@@ -13119,12 +13221,17 @@ SlideForwardLocal:
 ; contents with the next byte-range chunk, similar to
 ; SlideForwardLocal.
 SlideForwardRemote:
+    ; desired_target = DocOffset + WindowLen (24-bit add into
+    ; SlideTarget). Cache-align identically to SlideForwardLocal so
+    ; the post-slide render's restore hook can rebuild the parser
+    ; scope across the boundary.
     ld      hl, [DocOffset]
     ld      de, [WindowLen]
-    add     hl, de                       ; HL = desired_target
-    ; Cache-align identically to SlideForwardLocal so the post-slide
-    ; render's restore hook can rebuild the parser scope across the
-    ; boundary.
+    add     hl, de
+    ld      [SlideTarget], hl
+    ld      a, [DocOffset + 2]
+    adc     a, 0
+    ld      [SlideTarget + 2], a
     call    SlideAlignTarget
     call    EnsureWindowRemote
     or      a
@@ -15046,11 +15153,13 @@ RemoteLoadFile:
     jr      nz, .rlfFail
     ; DocOffset = 0 because every load starts at doc byte 0 today.
     ; WindowLen = min(SerialLen, FILE_BUF_SIZE) is the clamped working
-    ; set in FileBuf. The Phase 6 "GET CHUNK <offset>" command will
-    ; let DocOffset move forward for backward-scroll refetches.
+    ; set in FileBuf. EnsureWindowRemote slides DocOffset forward via
+    ; "GET CHUNK <offset>" for SlideForwardRemote / SlideBackwardRemote.
     ld      hl, [SerialLen]
     ld      de, 0
     ld      [DocOffset], de
+    xor     a
+    ld      [DocOffset + 2], a          ; clear high byte of 24-bit DocOffset
     ld      de, FILE_BUF_SIZE
     push    hl
     and     a
@@ -15354,9 +15463,12 @@ Format5Decimal:
 ; handles it for EnsureWindowLocal.
 RgChunkPrefix:  db "CHUNK ", 0
 
+; Caller convention: 24-bit SlideTarget pre-set in RAM before the
+; call. Wire format: "GET CHUNK NNNNNN\r\n" with NNNNNN being 6
+; uppercase hex digits (24-bit). Bridge accepts hex via int(target,
+; 16) so the same parse path handles 0..16 MB byte offsets.
 EnsureWindowRemote:
-    push    hl                           ; save target across format step
-    ; Build "CHUNK NNNNN\0" in ChunkCmdBuf.
+    ; Build "CHUNK XXXXXX\0" in ChunkCmdBuf.
     ld      de, ChunkCmdBuf
     ld      hl, RgChunkPrefix
 .ewrCpPrefix:
@@ -15368,11 +15480,12 @@ EnsureWindowRemote:
     inc     de
     jr      .ewrCpPrefix
 .ewrCpDone:
-    pop     hl                           ; HL = target
-    push    hl                           ; re-save for the DocOffset commit
-    call    Format5Decimal               ; writes digits + NUL to [DE]
+    ; Read 24-bit SlideTarget into A:HL and emit as 6 hex digits.
+    ld      hl, [SlideTarget]
+    ld      a, [SlideTarget + 2]
+    call    Format6Hex                   ; writes 6 hex + NUL at [DE]
 
-    ; Send "GET CHUNK NNNNN\r\n" and parse the OK / ERR header.
+    ; Send "GET CHUNK XXXXXX\r\n" and parse the OK / ERR header.
     call    SerialMaskVblank
     ld      hl, ChunkCmdBuf
     call    RemoteGet
@@ -15395,8 +15508,7 @@ EnsureWindowRemote:
 
     ; Drain SerialLen body bytes into FileBuf. The first WindowLen
     ; bytes are stored; any tail past the cap is drained (kept off
-    ; the wire) so the bridge stays in sync. Mirrors RemoteLoadFile's
-    ; .rlfBody / .rlfTail.
+    ; the wire) so the bridge stays in sync.
     ld      de, FileBuf
     ld      bc, [WindowLen]
 .ewrBody:
@@ -15408,7 +15520,7 @@ EnsureWindowRemote:
     call    SerialRead
     pop     de
     pop     bc
-    jr      c, .ewrFailDrop              ; mid-body timeout; bail (DocOffset stays)
+    jr      c, .ewrFailDrop
     ld      [de], a
     inc     de
     dec     bc
@@ -15428,28 +15540,80 @@ EnsureWindowRemote:
     push    bc
     call    SerialRead
     pop     bc
-    jr      c, .ewrFailDrop              ; bridge dead mid-drain; abandon
+    jr      c, .ewrFailDrop
     dec     bc
     jr      .ewrDrain
 
 .ewrDone:
     call    SerialUnmaskVblank
-    pop     hl                           ; HL = target (saved at entry)
+    ; Commit 24-bit SlideTarget -> DocOffset.
+    ld      hl, [SlideTarget]
     ld      [DocOffset], hl
+    ld      a, [SlideTarget + 2]
+    ld      [DocOffset + 2], a
     call    LineCacheReset
     xor     a
     ret
 
 .ewrFailDrop:
     call    SerialUnmaskVblank
-    pop     hl                           ; balance the stack (saved target)
     or      1                            ; ensure A != 0
     ret
 
 .ewrFail:
     call    SerialUnmaskVblank
-    pop     hl                           ; balance the stack
     or      1
+    ret
+
+; Format6Hex: emit a 24-bit unsigned integer as exactly 6 ASCII
+; uppercase hex digits + NUL terminator, starting at [DE]. Caller
+; passes the value in A:HL (A = high byte, HL = low word).
+;
+; In:   A:HL = value, DE = output buffer (>= 7 bytes).
+; Out:  DE advances 7 bytes (6 digits + NUL).
+; Clobbers: A, BC, HL.
+Format6Hex:
+    ld      b, a                         ; B = high byte
+    ; Emit B (top 8 bits) as 2 hex chars.
+    ld      a, b
+    rrca
+    rrca
+    rrca
+    rrca
+    call    .nybble
+    ld      a, b
+    call    .nybble
+    ; Emit H (mid 8 bits).
+    ld      a, h
+    rrca
+    rrca
+    rrca
+    rrca
+    call    .nybble
+    ld      a, h
+    call    .nybble
+    ; Emit L (low 8 bits).
+    ld      a, l
+    rrca
+    rrca
+    rrca
+    rrca
+    call    .nybble
+    ld      a, l
+    call    .nybble
+    xor     a
+    ld      [de], a
+    inc     de
+    ret
+.nybble:
+    and     0x0F
+    cp      10
+    jr      c, .digit
+    add     a, 'A' - '0' - 10
+.digit:
+    add     a, '0'
+    ld      [de], a
+    inc     de
     ret
 
 ; RemoteImgOpen: filename is in ImgNameBuf. Expects OK PCX; saves body
@@ -16066,8 +16230,14 @@ EntrySP:        dw 0                    ; SP at Main entry (restored on Shutdown
 ; needs it yet.
 ;
 WindowLen:      dw 0                    ; bytes currently in the FileBuf window
-DocOffset:      dw 0                    ; FileBuf[0] = byte DocOffset of doc
-DocSize:        dw 0                    ; total document length in bytes; set
+; 24-bit byte offsets so docs past 64 KB (real Wikipedia articles,
+; long blog posts, etc.) work end-to-end. Stored as 3 bytes lo /
+; mid / hi -- low word at +0..+1 is the same layout `ld hl,
+; [DocOffset]` would give a 16-bit read, so old code that only cares
+; about the bottom 16 bits keeps working unchanged. New 24-bit math
+; sites read the high byte separately at +2.
+DocOffset:      db 0, 0, 0              ; FileBuf[0] = byte DocOffset of doc
+DocSize:        db 0, 0, 0              ; total document length in bytes; set
                                         ; from FCB+16 at LoadFile / from
                                         ; SerialLen on the first remote
                                         ; frame (best-effort there). Read by
@@ -16126,8 +16296,16 @@ LineCacheHead:  db 0
 ; lookup loop's bookkeeping doesn't have to juggle stack pushes
 ; through 16-bit comparisons. Only touched while the routine runs;
 ; nobody reads these afterwards.
-LcloTarget:     dw 0                    ; saved target_doc_offset
-LcloBestOff:    dw 0                    ; best entry doc_offset so far
+LcloTarget:     db 0, 0, 0              ; saved target_doc_offset (24-bit)
+LcloBestOff:    db 0, 0, 0              ; best entry doc_offset so far (24-bit)
+
+; SlideTarget: 24-bit byte_offset the next EnsureWindow{Local,Remote}
+; should slide to. Caller (SlideForwardLocal etc.) computes it via
+; 24-bit math and stashes it here; the EnsureWindow routines read it
+; back. Putting it in RAM avoids the stack-juggling that an A:HL
+; register-pair convention would force across the BDOS / serial calls
+; that fall in the slide path.
+SlideTarget:    db 0, 0, 0
 LcloBestIdx:    db 0xFF                 ; best entry slot, or 0xFF = none
 
 ; Slide -> render parser-state hand-off (Phase 7 fix). When a slide
@@ -16397,7 +16575,7 @@ ChunkCmdBuf:        ds 16
 CursorBg:           ds 16
 Fcb:                ds 37
 LineCacheLineNo:    ds LineCacheMax * 2
-LineCacheDocOff:    ds LineCacheMax * 2
+LineCacheDocOff:    ds LineCacheMax * 3   ; 24-bit per slot for doc_offsets
 LineCacheState:     ds LineCacheMax * LineCacheStateSz
 LineCacheWriteSlot: ds 1                ; slot index LineCacheSnapshot
                                          ; should write to (set by
