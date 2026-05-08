@@ -35,5 +35,6 @@
 !samples/PG[0-9][0-9].PNG
 
 !FILE_LOAD_DESIGN.md
+!BITMAP_PIPELINE_DESIGN.md
 
 !samples/AUTOEXEC.BAT
