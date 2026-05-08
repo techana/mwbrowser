@@ -4368,6 +4368,78 @@ def _resize_for_msx(im, declared_w, declared_h):
     return im
 
 
+_BMP_STRIP_TAGS_RE = re.compile(r"<[^>]+>")
+_BMP_ENTITIES = {
+    "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": '"',
+    "&apos;": "'", "&nbsp;": " ",
+}
+
+
+def _bmp_strip_tags(html_str):
+    """Crude tag stripper for the bitmap text-render path. Drops every
+    <tag>, decodes the few HTML entities the on-MSX renderer also
+    handles, and collapses whitespace. Good enough for a first-cut
+    'render to image' until we wire a real HTML-aware path."""
+    s = _BMP_STRIP_TAGS_RE.sub("", html_str)
+    for k, v in _BMP_ENTITIES.items():
+        s = s.replace(k, v)
+    s = re.sub(r"&#(\d+);", lambda m: chr(int(m.group(1))), s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+# Screen-6 content-area dimensions (must match the on-MSX
+# CONTENT_Y0..CONTENT_Y1 + content-area X range).
+SCREEN6_VIEW_W = 512
+SCREEN6_VIEW_H = 183                     # content rows: y = 29..211
+SCREEN6_VIEW_BYTES = SCREEN6_VIEW_W * SCREEN6_VIEW_H // 4
+
+
+def _bmp_render_text_to_screen6(text):
+    """Render a string into a 512x183 grayscale image (black on white)
+    and pack as 2-bpp Screen-6 bytes. Word-wraps at the viewport width
+    using PIL's default bitmap font (~6x11). Output is the raw pixel
+    payload that streams over the wire and gets blitted straight to
+    VRAM by the on-MSX RenderRemoteBitmap routine."""
+    from PIL import Image, ImageDraw, ImageFont
+    try:
+        font = ImageFont.load_default()
+    except Exception:
+        font = None
+    im = Image.new("L", (SCREEN6_VIEW_W, SCREEN6_VIEW_H), 255)
+    draw = ImageDraw.Draw(im)
+    # Approximate glyph width for word-wrap.
+    glyph_w = 6
+    cols = SCREEN6_VIEW_W // glyph_w
+    line_h = 11
+    rows = SCREEN6_VIEW_H // line_h
+    # Word-wrap.
+    out_lines = []
+    for paragraph in text.split("\n"):
+        if not paragraph.strip():
+            out_lines.append("")
+            continue
+        words = paragraph.split()
+        cur = ""
+        for w in words:
+            cand = (cur + " " + w).strip()
+            if len(cand) > cols:
+                if cur:
+                    out_lines.append(cur)
+                cur = w
+            else:
+                cur = cand
+        if cur:
+            out_lines.append(cur)
+    # Render up to `rows` lines.
+    for i, line in enumerate(out_lines[:rows]):
+        try:
+            draw.text((0, i * line_h), line, fill=0, font=font)
+        except Exception:
+            draw.text((0, i * line_h), line, fill=0)
+    return _pack_2bpp(im)
+
+
 def _pack_2bpp(im):
     """Floyd-Steinberg dither into the 4-level Screen-6 palette and
     pack 4 pixels per byte (MSB first). Each output slot index lands
@@ -4791,6 +4863,25 @@ class MsxSession:
             CFG["no_images"] = True
             self._log("images OFF")
             return ("HTM", b"")
+        if upper.startswith("VIEW "):
+            # GET VIEW <url>\r\n
+            #   Hybrid bitmap pipeline (BITMAP_PIPELINE_DESIGN.md):
+            #   bridge fetches + simplifies the URL, renders the body as
+            #   a 512x183 px Screen-6 bitmap (content-area only -- the
+            #   MSX-side UI chrome at rows 0..28 stays untouched), and
+            #   returns the raw 2-bpp packed pixels as `OK BMP <bytes>`.
+            #   The MSX side blits straight to VRAM via direct OUTI loops
+            #   instead of running the HTML parser. ~23 KB of pixels
+            #   travels over the wire each fetch; at 115200 baud that's
+            #   ~2 s vs the ~8 s the HTML parse + render path takes for
+            #   a comparable page. Initial cut: text-only rendering using
+            #   PIL ImageDraw + the on-MSX 6x8 font (close approximation
+            #   via PIL's bitmap fonts). Future work: full headless HTML
+            #   render via Playwright / wkhtmltopdf for fidelity.
+            url = target[5:].strip()
+            if not url:
+                return ("404", None)
+            return self._fetch_view(url)
         if upper.startswith("CHUNK "):
             # GET CHUNK <byte_offset>\r\n
             #   Returns up to SERIAL_CHUNK_RANGE_BYTES of self.body
@@ -4931,6 +5022,56 @@ class MsxSession:
         self.page_served += 1
         return ("HTMP", (chunk, self.page_served, self.page_total))
 
+    def _fetch_view(self, url):
+        """Hybrid bitmap pipeline: fetch + simplify URL, render body as
+        a Screen-6 viewport bitmap. Returns ("BMP", <2-bpp bytes>).
+
+        Body bytes are 512 px wide * 183 px tall (content area only, no
+        UI chrome) packed at 4 px/byte = 23 KB. Pixel value 3 = black
+        text on slot-2-white background; the on-MSX renderer blits
+        these straight to VRAM at row 29 (CONTENT_Y0).
+        """
+        if not HAS_PIL:
+            self._log("VIEW {}: Pillow not installed".format(url))
+            return ("404", None)
+        # Fetch + simplify via the existing path.
+        if not (url.lower().startswith("http://") or
+                url.lower().startswith("https://")):
+            url = "http://" + url.lstrip("/")
+        try:
+            resp = _session.get(
+                url, headers=_fetch_headers_for(url),
+                timeout=FETCH_TIMEOUT, allow_redirects=True,
+            )
+            resp.raise_for_status()
+        except Exception as exc:
+            self._log("VIEW fetch failed: {}".format(exc))
+            return ("404", None)
+        ctype = resp.headers.get("Content-Type", "").lower()
+        if "text/html" not in ctype and "text/plain" not in ctype:
+            return ("404", None)
+        try:
+            host = (urlparse(resp.url).hostname or "").lower()
+            if _is_passthrough_host(host):
+                _IMG_HANDLE_CACHE.clear()
+                title, content, _, _, _, _ = _passthrough_html(
+                    resp.content, resp.url, "msx-serial")
+            else:
+                title, content, _, _, _, _, _ = transform_html(
+                    resp.content, resp.url, "msx-serial", False)
+        except Exception as exc:
+            self._log("VIEW transform error: {}".format(exc))
+            return ("404", None)
+        # Strip remaining tags / entities for the bitmap renderer's
+        # plain-text path. Future work: full HTML-aware render via
+        # Playwright / wkhtmltopdf so headings, lists, etc. land at
+        # their proper sizes.
+        text_blob = _bmp_strip_tags(content)
+        bitmap_bytes = _bmp_render_text_to_screen6(
+            (title or "") + "\n" + text_blob)
+        self._log("VIEW {} -> BMP {} B".format(url, len(bitmap_bytes)))
+        return ("BMP", bitmap_bytes)
+
     def _serve_chunk_at(self, offset):
         """Serve the byte range [offset, offset + SERIAL_CHUNK_RANGE_BYTES)
         of the most recently fetched body. Returns 404 if no body is
@@ -5006,7 +5147,7 @@ def _serial_slow_send(conn, body, chunk=64, gap=0.005):
 
 
 def _serial_send_response(conn, kind, body):
-    if kind in ("HTM", "PCX"):
+    if kind in ("HTM", "PCX", "BMP"):
         header = "OK {} {}\r\n".format(kind, len(body)).encode("ascii")
         conn.sendall(header)
         _serial_slow_send(conn, body)

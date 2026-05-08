@@ -167,7 +167,7 @@ URL_MAX        equ 255         ; address-bar / fetch-target buffer cap (chars
                                ; before NUL). Bumped from 95 because real
                                ; mirror.aratab.com URLs run past the 100-char
                                ; line and got truncated on click.
-FILE_BUF_SIZE  equ 0x3000      ; 12 KB. Sized so FILEBUF_BASE (0x9C00) +
+FILE_BUF_SIZE  equ 0x2F00      ; 11.75 KB. Sized so FILEBUF_BASE (0x9D00) +
                                ; FILE_BUF_SIZE + FONT_BUF_SIZE + 128 lands
                                ; at 0xD480 -- below both MSX-DOS 1.03's
                                ; *runtime* HIMEM (~0xDF94 on Sony HB-F1XD,
@@ -3045,11 +3045,25 @@ ResetFcbTail:
     ret
 
 LoadFile:
-    ; URL shape routes the load. Drive-letter paths ("C:..." etc.) go
-    ; through MSX-DOS; everything else (schemed or bare hostnames /
-    ; paths) is handed to the bridge, which auto-prefixes http:// when
-    ; the scheme is missing. IsRemoteSession stays set through the
-    ; render so <img src="imNN.pcx"> loads also land on the UART.
+    ; URL shape routes the load:
+    ;   "view:<path>"   -> hybrid bitmap pipeline (RemoteLoadView).
+    ;                      The bridge renders the page as a Screen-6
+    ;                      bitmap and streams pixels straight to VRAM.
+    ;   "X:..." (1 letter, ":")
+    ;                   -> MSX-DOS local file (LoadFileChunk path).
+    ;   anything else   -> remote HTML fetch (RemoteLoadFile +
+    ;                      pagination + parser).
+    ; IsRemoteSession stays set on remote paths so <img src="imNN.pcx">
+    ; also lands on the UART.
+    ld      hl, UrlBuf
+    call    IsViewUrl
+    jr      nz, .lfNotView
+    ; "view:" stripped from HL by IsViewUrl already (HL now points at
+    ; the post-prefix URL). Shift UrlBuf left by 5 bytes so the bridge
+    ; sees just the URL after the prefix.
+    call    UrlStripViewPrefix
+    jp      RemoteLoadView
+.lfNotView:
     ld      hl, UrlBuf
     call    IsLocalUrl
     jr      z, .lfLocal
@@ -12611,6 +12625,8 @@ NavigateToCurrentUrl:
 
     call    BuildFcbFromUrl
     call    DetectPlainText
+    xor     a
+    ld      [IsViewMode], a                 ; default: HTML mode; set by RemoteLoadView
     call    LoadFile
     or      a
     jr      nz, .err
@@ -12623,6 +12639,16 @@ NavigateToCurrentUrl:
     call    HistoryPush
     call    HistoryUpdateFlags
 
+    ; Hybrid bitmap pipeline: if RemoteLoadView painted a Screen-6
+    ; bitmap straight to VRAM, skip ClearContentArea + PrintFileContent
+    ; (those would wipe the bitmap and try to parse FileBuf as HTML --
+    ; FileBuf is untouched in view mode so it still has whatever the
+    ; previous page left there). Just refresh the toolbar / busy
+    ; indicator and we're done.
+    ld      a, [IsViewMode]
+    or      a
+    jr      nz, .navViewDone
+
     ld      hl, 0
     ld      [ScrollLine], hl
     call    ClearContentArea
@@ -12630,6 +12656,7 @@ NavigateToCurrentUrl:
     call    StoreTotalLinesWithPages
     call    ComputeThumb
     call    DrawScrollbar
+.navViewDone:
     xor     a
     ld      [Busy], a
     ld      a, 6
@@ -12899,6 +12926,15 @@ RefreshContentInPlace:
     jp      PrintFileContent
 
 InPlaceRender:  db 0                    ; 1 = current render can skip redraws
+
+; Hybrid bitmap pipeline (BITMAP_PIPELINE_DESIGN.md). 1 when the most
+; recent navigation went through RemoteLoadView, i.e. the bridge sent
+; pre-rendered Screen-6 pixels and we blitted them straight to VRAM.
+; NavigateToCurrentUrl checks this and skips ClearContentArea +
+; PrintFileContent so the parser doesn't wipe / overwrite the bitmap
+; we just painted. Reset to 0 at the top of every navigation attempt
+; so a follow-up HTML fetch falls through the normal path.
+IsViewMode:     db 0
                                         ; that the previous pass already left on
                                         ; VRAM (e.g. image bitmaps).
 
@@ -14938,12 +14974,75 @@ IsLocalUrl:
     or      1
     ret
 
+; IsViewUrl: HL -> NUL URL. Returns Z if the URL starts with "view:"
+; (case-insensitive), NZ otherwise. Used by LoadFile to route the
+; hybrid bitmap pipeline. The match is "v","i","e","w",":" -- five
+; chars, no whitespace allowed before.
+IsViewUrl:
+    push    hl
+    push    bc
+    ld      bc, IvuPattern
+.ivuLoop:
+    ld      a, [bc]
+    or      a
+    jr      z, .ivuMatch                 ; pattern exhausted -> match
+    ld      e, a                         ; pattern char (already lowercase ':' or letter)
+    ld      a, [hl]
+    or      a
+    jr      z, .ivuNo                    ; URL ended early
+    ; Lowercase URL char (only A-Z; ':' is unchanged).
+    cp      'A'
+    jr      c, .ivuCmp
+    cp      'Z' + 1
+    jr      nc, .ivuCmp
+    add     a, 'a' - 'A'
+.ivuCmp:
+    cp      e
+    jr      nz, .ivuNo
+    inc     hl
+    inc     bc
+    jr      .ivuLoop
+.ivuMatch:
+    pop     bc
+    pop     hl
+    xor     a                            ; Z = view-prefix match
+    ret
+.ivuNo:
+    pop     bc
+    pop     hl
+    or      1                            ; NZ = no match
+    ret
+IvuPattern: db "view:", 0
+
+; UrlStripViewPrefix: shift UrlBuf left by 5 bytes (drop "view:")
+; in place. Caller has confirmed the prefix exists via IsViewUrl.
+UrlStripViewPrefix:
+    push    hl
+    push    de
+    push    bc
+    ld      hl, UrlBuf + 5
+    ld      de, UrlBuf
+    ld      bc, URL_MAX                 ; copies URL_MAX bytes including the trailing NUL
+    ldir
+    ; Adjust UrlLen by -5 (clamp at 0).
+    ld      a, [UrlLen]
+    sub     5
+    jr      nc, .uspvOk
+    xor     a
+.uspvOk:
+    ld      [UrlLen], a
+    pop     bc
+    pop     de
+    pop     hl
+    ret
+
 ; RemoteGet: HL -> NUL target. Sends "GET <target>\r\n", reads status
 ; line, leaves body bytes queued on the UART. Outputs:
-;   SerialKind: 1=HTM, 2=PCX, 0=ERR
+;   SerialKind: 1=HTM/HTMP, 2=PCX, 3=BMP (hybrid bitmap), 0=ERR
 ;   SerialLen:  16-bit body length
 ; Returns CF=1 on ERR / parse failure.
 RgGet:          db "GET ", 0
+RgGetView:      db "GET VIEW ", 0       ; hybrid bitmap pipeline
 RemoteGet:
     push    hl
     ld      hl, RgGet
@@ -14954,6 +15053,12 @@ RemoteGet:
     call    SerialWrite
     ld      a, 0x0A
     call    SerialWrite
+RemoteGetParseReply:
+    ; Re-entry point for callers that built their own "GET <whatever>\r\n"
+    ; (e.g. RemoteLoadView's "GET VIEW <url>") and want only the OK / ERR
+    ; header parsing. Clobbers everything RemoteGet does -- assume nothing
+    ; about register state on entry.
+    ;
     ; Drain status line into SerialBuf (16 B); parser reads fresh bytes
     ; from the UART directly rather than buffering so we save code.
     ; Every SerialRead can now time out; CF=1 surfaces as a failure so
@@ -14974,13 +15079,16 @@ RemoteGet:
     jp      nz, .rgFail
     call    SerialRead                  ; ' '
     jp      c, .rgFail
-    call    SerialRead                  ; 'H' or 'P'
+    call    SerialRead                  ; 'H', 'P', or 'B'
     jp      c, .rgFail
-    ld      b, 1
+    ld      b, 1                         ; SerialKind=1 -> HTM/HTMP
     cp      'H'
     jr      z, .rgKind
-    ld      b, 2
+    ld      b, 2                         ; SerialKind=2 -> PCX
     cp      'P'
+    jr      z, .rgKind
+    ld      b, 3                         ; SerialKind=3 -> BMP (hybrid bitmap)
+    cp      'B'
     jp      nz, .rgFail
 .rgKind:
     ld      a, b
@@ -15263,6 +15371,133 @@ StoreTotalLinesWithPages:
     ld      [TotalLines], hl
     pop     de
     pop     bc
+    ret
+
+; ----------------------------------------------------------------------
+; Hybrid bitmap pipeline (BITMAP_PIPELINE_DESIGN.md).
+;
+; Bridge command: "GET VIEW <url>\r\n" -> "OK BMP <bytes>\r\n<body>".
+; Body is exactly 23424 bytes: 183 rows x 128 bytes/row of Screen-6
+; 2-bpp pixels for the content area only (rows 29..211). The MSX
+; blits these straight to VRAM via OUT (VDP_DATA), A in two phases
+; because the content area straddles R14=0 and R14=1 windows:
+;   phase 1: rows 29..127 in R14=0, 99 rows * 128 = 12672 bytes,
+;            VRAM start address 29 * 128 = 0x0E80.
+;   phase 2: rows 128..211 in R14=1, 84 rows * 128 = 10752 bytes,
+;            VRAM start address 0x0000 (within R14=1's 16 KB window).
+; Total = 23424 bytes -- matches the bridge's SCREEN6_VIEW_BYTES.
+;
+; The point of this path: at 115200 baud the wire transfer is ~2 s,
+; vs the 6-8 s the HTML parser + per-glyph render takes for a doc
+; of similar visible size. Subsequent scrolls cost zero parse work
+; (just blit the next viewport bitmap when the user PageDowns).
+; ----------------------------------------------------------------------
+RemoteLoadView:
+    ; UrlBuf has the URL (post-"view:" stripping if a prefix was
+    ; involved at navigation time). Sends the wire request, parses
+    ; the OK BMP header, then drains body bytes into VRAM.
+    ld      a, [SerialProbed]
+    or      a
+    call    z, SerialAutoProbe
+    jp      c, .rlvFail                  ; no rate worked
+    ld      a, 2
+    ld      [IsRemoteSession], a
+    call    SerialMaskVblank
+
+    ; Send "GET VIEW <UrlBuf>\r\n".
+    ld      hl, RgGetView
+    call    SerialWriteZ
+    ld      hl, UrlBuf
+    call    SerialWriteZ
+    ld      a, 0x0D
+    call    SerialWrite
+    ld      a, 0x0A
+    call    SerialWrite
+
+    ; Parse the OK / ERR header, populating SerialKind + SerialLen.
+    call    RemoteGetParseReply
+    jp      c, .rlvFail
+    ld      a, [SerialKind]
+    cp      3                            ; BMP
+    jp      nz, .rlvFail
+
+    ; Drain body bytes into VRAM. The bridge always sends exactly
+    ; 23424 bytes for this command; SerialLen carries the same value
+    ; on the wire and we use that as the master count so any future
+    ; ranged BMP frames (partial viewport) work without code change.
+    call    RenderRemoteBitmap
+    or      a
+    jr      nz, .rlvFail
+
+    call    SerialUnmaskVblank
+    xor     a
+    ld      [Busy], a
+    call    PaintToolbar
+    ; Tell NavigateToCurrentUrl to skip ClearContentArea +
+    ; PrintFileContent -- our pixels are already on screen.
+    ld      a, 1
+    ld      [IsViewMode], a
+    xor     a
+    ret
+
+.rlvFail:
+    call    SerialUnmaskVblank
+    xor     a
+    ld      [Busy], a
+    call    PaintToolbar
+    or      1                            ; ensure A != 0 -> caller surfaces 404
+    ret
+
+; RenderRemoteBitmap: stream SerialLen bytes from the UART straight
+; into the Screen-6 content-area VRAM. Two-phase because Screen-6
+; pages span R14=0 (rows 0..127) and R14=1 (rows 128..255 / 211).
+;
+; Returns A = 0 on success, !=0 if a SerialRead times out. On
+; failure VRAM is partially overwritten (best-effort: the prefix
+; pixels that arrived before the timeout are visible; the rest of
+; the viewport keeps whatever was there before).
+RenderRemoteBitmap:
+    ; Phase 1: rows 29..127 in R14=0. 99 rows * 128 = 12672 bytes.
+    ld      b, 0
+    ld      c, CONTENT_Y0                ; row 29
+    call    SetVramWritePos              ; uses R14=0 since C < 128
+    ld      bc, 12672
+.rrbPhase1:
+    ld      a, b
+    or      c
+    jr      z, .rrbPhase2
+    push    bc
+    call    SerialRead
+    pop     bc
+    jr      c, .rrbFail
+    out     (VDP_DATA), a
+    dec     bc
+    jr      .rrbPhase1
+
+.rrbPhase2:
+    ; Switch to R14=1 (rows 128..211).
+    ld      a, 1
+    call    VdpSetR14
+    ld      hl, 0x0000                   ; VRAM offset within R14=1 window
+    call    VdpSetWriteAddr
+    ld      bc, 10752                    ; 84 rows * 128 bytes
+.rrbPhase2Loop:
+    ld      a, b
+    or      c
+    jr      z, .rrbDone
+    push    bc
+    call    SerialRead
+    pop     bc
+    jr      c, .rrbFail
+    out     (VDP_DATA), a
+    dec     bc
+    jr      .rrbPhase2Loop
+
+.rrbDone:
+    xor     a
+    ret
+.rrbFail:
+    or      1
     ret
 
 ; TryFetchMore: pulls the next paginated chunk from the bridge ("GET
@@ -15728,7 +15963,7 @@ RemoteImgClose:
     jr      nc, .ricL                    ; CF=0 -> byte drained, keep going
     jp      SerialUnmaskVblank           ; CF=1 -> serial timeout, abandon
 
-SerialKind:     db 0                    ; 0=ERR, 1=HTM, 2=PCX
+SerialKind:     db 0                    ; 0=ERR, 1=HTM/HTMP, 2=PCX, 3=BMP
 SerialLen:      dw 0
 SerialPage:     db 1                    ; 1-indexed page number this response is
 SerialPageTotal: db 1                   ; total pages estimated by the bridge
