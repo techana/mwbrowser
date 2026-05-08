@@ -9151,7 +9151,6 @@ RmbLabelLen:    db 0
 ; into this buffer + NUL so GRPPRT's draw-until-NUL loop stops at the
 ; fit width. Max 30 glyphs = 240 px (wider than our 492-px canvas
 ; would ever host for a reasonable image).
-RmbLabelBuf:    ds 31
 
 ; RmbDrawLabel: draw alt (or src filename) centred inside the box at
 ; (HtmlIndent, TextY, RmbWBytes*4, RmbHPixels). Called only when the
@@ -9594,10 +9593,7 @@ BmpPackIdx:   db 0                     ; 0..3, position within packed byte
 BmpPackByte:  db 0
 BmpNibBuf:    db 0                     ; 4-bpp half-byte pixel buffer
 BmpNibLeft:   db 0                     ; 1 if the low nibble of BmpNibBuf is still pending
-BmpPal16:     ds 16                    ; slot 0..3 per BMP-4bpp palette entry
 IMG_NAME_MAX equ 32
-ImgNameBuf:   ds IMG_NAME_MAX + 1     ; scratch for <img src="..."> filenames
-ExtImgRemap:  ds 256                  ; palette fixup LUT built once at startup
 
 ; <font color="name">: push current fg, set new fg + CurrentFontLUT from
 ; the color name stored in HtmlCurHref (ScanHrefAttr captured it via the
@@ -11115,9 +11111,6 @@ FormParseCursor: db 0
 ; Per-slot screen rectangle, captured by TagInput at render time. Used
 ; by TryFormClick to map mouse coords to a slot. X is 16-bit pixel,
 ; Y is 8-bit row, W is pixel width.
-FormScreenX:    ds FORM_MAX * 2
-FormScreenY:    ds FORM_MAX
-FormScreenW:    ds FORM_MAX * 2
 
 ; FormCaptureRect: A = slot. Stores (TextX, TextY, width=0) for the
 ; current widget into FormScreen[X|Y|W][A]. Width is computed later by
@@ -15427,7 +15420,6 @@ TitleCur:       db 0
 TitleCurFlags:  db 0
 TitleConn:      db 0
 TitleJ:         db 0                    ; end index of current non-Arabic run
-TitleDrawBuf:   ds TITLE_BUF_MAX + 1
 
 ; ============================================================================
 ; Data
@@ -15867,13 +15859,10 @@ Busy:           db 0
 LoadPhase:      db 0
 UrlLen:         db 0
 UrlCursor:      db 0                    ; caret column inside UrlBuf, 0..UrlLen
-UrlBuf:         ds URL_MAX + 1          ; 96 chars + NUL
-
-; Scratch buffer EnsureWindowRemote builds "CHUNK <decimal-offset>" in
-; before handing it to RemoteGet. RemoteGet prepends "GET " and appends
-; "\r\n", so the wire frame ends up "GET CHUNK NNNNN\r\n". 16 bytes is
-; comfortably oversized -- "CHUNK " (6) + 5 digits + NUL = 12.
-ChunkCmdBuf:    ds 16
+; UrlBuf, ChunkCmdBuf moved past FileEnd: (AX-370 size cap fix).
+; ChunkCmdBuf still holds "CHUNK <decimal-offset>\0" -- 6 + 5 + 1 = 12 B,
+; oversized to 16 -- before EnsureWindowRemote hands it to RemoteGet,
+; which prepends "GET " and appends CRLF on the wire.
 
 ; Mouse state -- driven by PSG reg 14/15 via ports 0xA0/0xA1/0xA2. Port A
 ; (joyporta on openMSX) is used; the GetMouse routine adapts the technique
@@ -15892,14 +15881,12 @@ MouseRaw:       db 0                    ; raw button byte from last GetMouse
 CursorX:        dw 0                    ; pixel X of the currently-drawn cursor
 CursorY:        db 0                    ; pixel Y of the currently-drawn cursor
 CursorVisible:  db 0
-CursorBg:       ds 16                   ; 2 bytes * 8 rows VRAM backup
 CursorByteCol:  db 0                    ; scratch (byte col during erase/draw)
 CursorRowY:     db 0                    ; scratch (current y during loops)
 CursorBgPtr:    dw 0                    ; scratch (pointer into CursorBg)
 EntrySP:        dw 0                    ; SP at Main entry (restored on Shutdown)
 
 ; File I/O and navigation state.
-Fcb:            ds 37                   ; MSX-DOS 1 FCB (36 bytes + 1 pad)
 
 ; File-load streaming (file_load_architecture, phased rollout).
 ;
@@ -15970,9 +15957,7 @@ DocSize:        dw 0                    ; total document length in bytes; set
 LineCacheMax     equ 32
 LineCacheStateSz equ 8                  ; bytes per snapshot slot
 LineCacheCount: db 0
-LineCacheLineNo: ds LineCacheMax * 2    ; rendered line number
-LineCacheDocOff: ds LineCacheMax * 2    ; matching DocOffset + (cursor - FileBuf)
-LineCacheState:  ds LineCacheMax * LineCacheStateSz   ; packed parser state
+; LineCacheLineNo / LineCacheDocOff / LineCacheState moved past FileEnd:.
 
 ; LineCacheLookupOffset scratch (Phase 7 fix). Lives in RAM so the
 ; lookup loop's bookkeeping doesn't have to juggle stack pushes
@@ -16059,12 +16044,9 @@ ParserCursor:   dw 0                    ; saved parser HL at DispatchTag entry;
                                         ; only TagTableTag's column prescan).
 HtmlSavedBold:  db 0                    ; scratch: STYLE_BOLD state before <th>
 HtmlFg:         db 3                    ; current text fg palette index (default BLACK=3)
-HtmlFgStack:    ds 4                    ; <font> stack of previous fg values
 HtmlFgDepth:    db 0                    ; current <font> nesting depth
 CurrentFontLUT: dw FontLUT              ; pointer to active LUT (updated by <font>)
 HtmlCurHrefLen: db 0                    ; length of the current href being captured
-HtmlCurHref:    ds LINK_URL_MAX + 1     ; NUL-terminated href of the *open* <a>
-HtmlFormAction: ds FORM_ACTION_MAX + 1  ; action= URL of the open <form>; empty = no form
 HtmlImgWidth:   dw 0                    ; <img width="…"> in pixels (0 = unset)
 HtmlImgHeight:  dw 0                    ; <img height="…"> in pixels (0 = unset)
 HtmlImgOriginY: db 0                    ; TextY at TagImg entry (image-map origin)
@@ -16105,8 +16087,6 @@ HtmlSelectFound: db 0
 ; currently-shown option's text.
 HtmlOptCurIdx:   db 0
 HtmlOptCapturing: db 0
-FormSelectIdx:   ds FORM_MAX
-FormOptCount:    ds FORM_MAX
 
 ; ---------------------------------------------------------------------------
 ; Form-field slot table. One slot per <input> we want to remember after
@@ -16125,15 +16105,10 @@ FORM_VALUE_MAX  equ 18                       ; matches TI_TEXT_DEFAULT_W
 
 FormCount:      db 0                         ; live slots in [0..FormCount)
 HtmlFormFocus:  db 0xFF                      ; slot index, or 0xFF = none
-FormType:       ds FORM_MAX                  ; 'T','P','S','C','R','B','I','H'
-FormWidth:      ds FORM_MAX                  ; visible width in chars (text/pass)
-FormName:       ds FORM_MAX * (FORM_NAME_MAX + 1)
-FormValue:      ds FORM_MAX * (FORM_VALUE_MAX + 1)
 
 ; HtmlNameAttr is captured by ScanHrefAttr from a NAME=... attribute
 ; on the current tag. TagInput then copies it into FormName[slot] when
 ; allocating a form slot.
-HtmlNameAttr:   ds FORM_NAME_MAX + 1
 
 ; Image-map scratch. `<map>` begins a block of `<area>` rects; their
 ; coords are page-local (relative to the chunk's top-left). When the
@@ -16143,20 +16118,7 @@ HtmlNameAttr:   ds FORM_NAME_MAX + 1
 MAP_AREA_MAX    equ 8
 AreaCoords:     dw 0, 0, 0, 0           ; x1, y1, x2, y2 from coords="…"
 PendingAreaCount: db 0
-PendingAreaX1:  ds 2 * MAP_AREA_MAX
-PendingAreaY1:  ds MAP_AREA_MAX
-PendingAreaX2:  ds 2 * MAP_AREA_MAX
-PendingAreaY2:  ds MAP_AREA_MAX
-PendingAreaUrl: ds MAP_AREA_MAX * (LINK_URL_MAX + 1)
 LinkCount:      db 0                    ; number of live link rects
-LinkStartX:     ds 2 * LINK_MAX
-LinkStartY:     ds LINK_MAX
-LinkEndX:       ds 2 * LINK_MAX
-LinkEndY:       ds LINK_MAX
-LinkUrls:       ds (LINK_URL_MAX + 1) * LINK_MAX
-HtmlTitleBuf:   ds TITLE_BUF_MAX + 1    ; NUL-terminated
-HtmlTagName:    ds 12                   ; up to 11 chars + NUL (TEXTAREA = 8)
-HtmlEntityName: ds 6                    ; up to 5 chars + NUL
 FastCgSlot:     db 0                    ; cached CGPNT[0] for ExtractFont
 
 ; Multi-step back/forward history. Ring buffer of HISTORY_MAX URL slots.
@@ -16167,7 +16129,6 @@ FastCgSlot:     db 0                    ; cached CGPNT[0] for ExtractFont
 HISTORY_MAX     equ 8                   ; must be a power of two (for `and` mask)
 HISTORY_SLOT    equ URL_MAX + 1         ; bytes per slot
 
-HistoryBuf:     ds HISTORY_SLOT * HISTORY_MAX
 HistoryOldest:  db 0
 HistoryCount:   db 0
 HistoryCursor:  db 0
@@ -16179,7 +16140,6 @@ On404:          db 0                    ; 1 while the synthetic 404 page is in v
 ; IsoJoin != 0 here; on any boundary char (or newline) the buffer is
 ; shape-resolved and emitted reversed to EmitRaw.
 AR_BUF_MAX      equ 32
-ArBuf:          ds AR_BUF_MAX
 ArLen:          db 0
 ArCurr:         db 0                    ; ShapePick scratch: byte being shaped
 ArCurrFlags:    db 0                    ; ShapePick scratch: curr's IsoJoin flags
@@ -16198,8 +16158,6 @@ CELL_NEUTRAL    equ 0x02                ; space/punct — direction from context
 CELL_FG_SHIFT   equ 4
 CELL_FG_MASK    equ 0x30
 LineLen:        db 0
-LineGlyph:      ds LINE_BUF_MAX
-LineAttr:       ds LINE_BUF_MAX
 ; 0xFF = "compute start column from HtmlAlign/HtmlIndent". Anything else
 ; pins LineDrawCells to that byte column for the next flush, used by
 ; table cells that need to land at a specific column X regardless of the
@@ -16218,8 +16176,6 @@ BorderHeight:   db 0
 LineLastSpace:  db 0xFF
 ; Scratch used by SmartWrap to hold the trailing word that gets carried
 ; over to the next line when we backtrack to the last space.
-TailGlyph:      ds LINE_BUF_MAX
-TailAttr:       ds LINE_BUF_MAX
 TailLen:        db 0
 EmitCellAttr:   db 0                    ; attr byte EmitRaw applies to next cell
 HtmlAlign:      db 0                    ; 0=left, 1=right, 2=center
@@ -16247,41 +16203,90 @@ FileEnd:
     SAVEBIN "dist/mwbro.com", 0x0100, FileEnd - 0x0100
 
 ; ──────────────────────────────────────────────────────────────────
+; Runtime RAM region (post-SAVEBIN reservations).
+;
+; These `Label: ds N` blocks were previously interleaved through the
+; assembled image; SjASMPlus emits zero bytes for each `ds`, so the
+; .COM ended up carrying ~17 KB of zero padding -- enough to push
+; the binary well past the AX-370's ~15565 byte TPA cap (CLAUDE.md)
+; and produce a "DI; HALT detected" hang on boot.
+;
+; Moving them past FileEnd: keeps every label's runtime address
+; intact (the assembler's PC advances normally over `ds`) but takes
+; them out of the SAVEBIN range, so the .COM file stops carrying
+; the zero bytes. Each consumer already writes before reading, so
+; "uninitialised" is the right semantic.
+;
+; Source order matches the original placement so a regression diff
+; against the pre-move layout is straightforward to read.
+
+RuntimeRamBase:
+RmbLabelBuf:        ds 31
+BmpPal16:           ds 16
+ImgNameBuf:         ds IMG_NAME_MAX + 1
+ExtImgRemap:        ds 256
+FormScreenX:        ds FORM_MAX * 2
+FormScreenY:        ds FORM_MAX
+FormScreenW:        ds FORM_MAX * 2
+TitleDrawBuf:       ds TITLE_BUF_MAX + 1
+UrlBuf:             ds URL_MAX + 1
+ChunkCmdBuf:        ds 16
+CursorBg:           ds 16
+Fcb:                ds 37
+LineCacheLineNo:    ds LineCacheMax * 2
+LineCacheDocOff:    ds LineCacheMax * 2
+LineCacheState:     ds LineCacheMax * LineCacheStateSz
+HtmlFgStack:        ds 4
+HtmlCurHref:        ds LINK_URL_MAX + 1
+HtmlFormAction:     ds FORM_ACTION_MAX + 1
+FormSelectIdx:      ds FORM_MAX
+FormOptCount:       ds FORM_MAX
+FormType:           ds FORM_MAX
+FormWidth:          ds FORM_MAX
+FormName:           ds FORM_MAX * (FORM_NAME_MAX + 1)
+FormValue:          ds FORM_MAX * (FORM_VALUE_MAX + 1)
+HtmlNameAttr:       ds FORM_NAME_MAX + 1
+PendingAreaX1:      ds 2 * MAP_AREA_MAX
+PendingAreaY1:      ds MAP_AREA_MAX
+PendingAreaX2:      ds 2 * MAP_AREA_MAX
+PendingAreaY2:      ds MAP_AREA_MAX
+PendingAreaUrl:     ds MAP_AREA_MAX * (LINK_URL_MAX + 1)
+LinkStartX:         ds 2 * LINK_MAX
+LinkStartY:         ds LINK_MAX
+LinkEndX:           ds 2 * LINK_MAX
+LinkEndY:           ds LINK_MAX
+LinkUrls:           ds (LINK_URL_MAX + 1) * LINK_MAX
+HtmlTitleBuf:       ds TITLE_BUF_MAX + 1
+HtmlTagName:        ds 12
+HtmlEntityName:     ds 6
+HistoryBuf:         ds HISTORY_SLOT * HISTORY_MAX
+ArBuf:              ds AR_BUF_MAX
+LineGlyph:          ds LINE_BUF_MAX
+LineAttr:           ds LINE_BUF_MAX
+TailGlyph:          ds LINE_BUF_MAX
+TailAttr:           ds LINE_BUF_MAX
+RuntimeRamEnd:
+
+; ──────────────────────────────────────────────────────────────────
 ; FileBuf / FontBuf / ImgBuf are runtime-only RAM regions placed
-; ABOVE the .COM image's last loaded byte (FileEnd). Declared via
-; `equ` so no bytes are emitted into the .COM file -- the runtime
-; RAM at these addresses is uninitialised at boot, which is fine
-; because every consumer writes before reading:
+; ABOVE the runtime-RAM block (and therefore ABOVE the .COM image
+; loaded from disk). Declared via `equ` so no bytes are emitted to
+; the .COM -- every consumer writes before reading:
 ;     FileBuf  -> LoadFile / RemoteLoadFile / TryFetchMore
 ;     FontBuf  -> ExtractFont (called once at startup)
 ;     ImgBuf   -> ImgStream (DMA scratch, written before each read)
 ;
-; Bug history (round-1 optimisation): this block was previously
-; `ORG 0x6800 / ds FILE_BUF_SIZE / ...`, with a written-down rule
-; that "FileBuf must sit ABOVE the last ds-allocated global". As the
-; .COM grew past ~26 KB, the preceding globals (HtmlTitleBuf,
-; HistoryBuf, ArBuf, PlainTextMode, LineGlyph, ...) drifted into
-; address range 0x8762..0x9293 -- *inside* the FileBuf reservation
-; at 0x6800..0xC7FF. Loading any file > ~8 KB into FileBuf then
-; silently overwrote those globals with file content, manifesting
-; as garbled rendering on large pages (BENCHTX.HTM / wikipedia).
-;
-; The fix: switch to `equ` (no overlap possible because we don't
-; emit bytes), pin FILEBUF_BASE clearly past FileEnd, and ASSERT
-; the budget at build time so future code growth fails the build
-; instead of regressing silently.
+; Bug history: pre-move, `ORG 0x6800 / ds FILE_BUF_SIZE / ...` mixed
+; FileBuf into the same address space as the inline `ds` globals.
+; Moving the globals past FileEnd: (and switching FileBuf-friends
+; to `equ`) eliminates the overlap risk and shrinks the .COM by the
+; ~17 KB of zero bytes the inline `ds` blocks were emitting.
 
-FILEBUF_BASE   equ 0x9A00              ; aligned past current FileEnd
-                                       ; (~0x99xx after Phase 7-fix's
-                                       ; LineCacheLookupOffset +
-                                       ; SlideAlignTarget + the
-                                       ; PrintFileContent restore hook
-                                       ; added ~160 B); bump further
-                                       ; if the ASSERT below trips.
-                                       ; (~0x9755 after Phase 4's parser-
-                                       ; state Snapshot/Restore + 256 B of
-                                       ; LineCacheState added ~340 B);
-                                       ; bump further if the ASSERT trips.
+FILEBUF_BASE   equ (RuntimeRamEnd + 0xFF) & 0xFF00
+                                       ; first 256-aligned byte past
+                                       ; the runtime RAM block; moves
+                                       ; up automatically as that block
+                                       ; grows.
 
 FileBuf        equ FILEBUF_BASE
 FontBuf        equ FileBuf + FILE_BUF_SIZE
