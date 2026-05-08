@@ -271,9 +271,17 @@ MainLoop:
     ;   - ~16-20 ms between keyboard peeks (still imperceptible),
     ;   - 0 % CPU between events on emulators / real hardware,
     ;   - and no busy-spin pinning openMSX's host thread at 100 %.
-    ; Interrupts are left enabled by MSX-DOS during a .COM session
-    ; so the EI guard isn't needed here. (Reference: MSX Assembly
-    ; Page summary §2 -- "EI/HALT is the canonical MSX vsync wait".)
+    ;
+    ; The canonical MSX vsync wait is "EI / HALT". Earlier versions of
+    ; this loop relied on "MSX-DOS leaves interrupts enabled during a
+    ; .COM session" and dropped the EI -- that holds on HB-F1XD but
+    ; NOT on Sony HB-F700D / Al-Alamiah AX-370 (and likely other MSX2
+    ; models), where openMSX caught the bare HALT with IFF=0 and
+    ; logged "DI; HALT detected, which means a hang" because the
+    ; CPU could never wake up. The Z80 architecture guarantees EI's
+    ; effect is delayed by one instruction, so the HALT here always
+    ; sees IFF=1 and the next VBLANK reliably exits.
+    ei
     halt
     call    PollMouse
 
