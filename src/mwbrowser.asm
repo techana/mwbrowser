@@ -167,7 +167,7 @@ URL_MAX        equ 255         ; address-bar / fetch-target buffer cap (chars
                                ; before NUL). Bumped from 95 because real
                                ; mirror.aratab.com URLs run past the 100-char
                                ; line and got truncated on click.
-FILE_BUF_SIZE  equ 0x3300      ; 12.75 KB. Sized so FILEBUF_BASE (0x9900) +
+FILE_BUF_SIZE  equ 0x3200      ; 12.5 KB. Sized so FILEBUF_BASE (0x9A00) +
                                ; FILE_BUF_SIZE + FONT_BUF_SIZE + 128 lands
                                ; at 0xD480 -- below both MSX-DOS 1.03's
                                ; *runtime* HIMEM (~0xDF94 on Sony HB-F1XD,
@@ -3457,6 +3457,31 @@ PrintFileContent:
 
     ld      hl, FileBuf
 
+    ; Phase 7-fix: a slide may have aligned its target to a cached
+    ; safe boundary in the OLD window. The matching parser-state
+    ; snapshot lives at LineCacheState[slot * 8] -- LineCacheReset
+    ; only zeroed the count, the slot bytes survived. Apply the
+    ; snapshot now (after the reset block, before the parser walks
+    ; FileBuf) so persistent state -- HtmlListKind / HtmlIndent /
+    ; HtmlAlign / HtmlDir / HtmlOlCounter / HtmlFg / HtmlScaleY --
+    ; is correct at byte 0 of the new window. Without this hook the
+    ; first lines of a slid-into chunk render with the reset
+    ; defaults, breaking <ul> / <font> / <blockquote> scopes that
+    ; spanned the slide boundary.
+    ;
+    ; Consumed (cleared back to 0xFF) so a subsequent same-window
+    ; re-render (e.g. ScrollDown without slide) doesn't wrongly
+    ; restore again.
+    ld      a, [PendingRestoreSlot]
+    cp      0xFF
+    jr      z, .pfcNoRestore
+    push    hl
+    call    LineCacheRestore
+    pop     hl
+    ld      a, 0xFF
+    ld      [PendingRestoreSlot], a
+.pfcNoRestore:
+
 .loop:
     ; Mirror the parser cursor into ParserCursor so any handler that
     ; needs to know "where am I in the document?" -- LineCache append,
@@ -5403,6 +5428,117 @@ LineCacheRestore:
 LineCacheReset:
     xor     a
     ld      [LineCacheCount], a
+    ret
+
+; LineCacheLookupOffset: find the cached slot whose stored doc_offset
+; is the largest one not exceeding the requested target. Returns A =
+; slot index (0..LineCacheCount-1), or A = 0xFF if no slot qualifies
+; (cache empty, or every entry's doc_offset > target).
+;
+; In:  HL = target_doc_offset
+; Out: A  = best slot, or 0xFF
+;      HL/DE/BC preserved (callee saves)
+;
+; Walks every populated slot once -- LineCacheMax is 32 so the linear
+; scan finishes in <~600 T-states even at full count, called rarely
+; (once per slide). Uses a small RAM scratch block (LcloTarget /
+; LcloBestOff / LcloBestIdx) to keep the loop state out of the
+; pushed-stack-juggling that 16-bit compares would otherwise need.
+LineCacheLookupOffset:
+    push    hl
+    push    de
+    push    bc
+    ld      [LcloTarget], hl
+    ld      a, 0xFF
+    ld      [LcloBestIdx], a
+    xor     a
+    ld      [LcloBestOff], a
+    ld      [LcloBestOff + 1], a
+    ld      a, [LineCacheCount]
+    or      a
+    jr      z, .lcloDone
+    ld      b, a                        ; B = remaining slots to scan
+    ld      c, 0                        ; C = current slot index
+.lcloIter:
+    ; Read entry doc_offset into DE.
+    ld      a, c
+    add     a, a
+    ld      e, a
+    ld      d, 0
+    ld      hl, LineCacheDocOff
+    add     hl, de
+    ld      e, [hl]
+    inc     hl
+    ld      d, [hl]                     ; DE = entry.doc_offset
+    ; Test entry <= target.
+    ld      hl, [LcloTarget]
+    or      a
+    sbc     hl, de                      ; HL = target - entry; CF=1 if entry > target
+    jr      c, .lcloSkip
+    ; Test entry > best (so we keep the largest qualifying entry).
+    ld      hl, [LcloBestOff]
+    or      a
+    sbc     hl, de                      ; HL = best - entry; CF=1 if entry > best
+    jr      nc, .lcloSkip
+    ; Update best.
+    ld      hl, LcloBestOff
+    ld      [hl], e
+    inc     hl
+    ld      [hl], d
+    ld      a, c
+    ld      [LcloBestIdx], a
+.lcloSkip:
+    inc     c
+    djnz    .lcloIter
+.lcloDone:
+    ld      a, [LcloBestIdx]
+    pop     bc
+    pop     de
+    pop     hl
+    ret
+
+; SlideAlignTarget: cache-align a slide's desired byte-offset to a
+; cached safe boundary at or before that offset, so the post-slide
+; render can pick up parser state from the matching snapshot. If no
+; cached entry qualifies, the target stays unchanged and
+; PendingRestoreSlot is left at 0xFF -- the slide proceeds with the
+; pre-Phase-7-fix behaviour (default state, possible <ul>/<font>
+; reset).
+;
+; In:  HL = desired_target_doc_offset
+; Out: HL = adjusted target (entry.doc_offset if cache hit; unchanged
+;      otherwise)
+;      [PendingRestoreSlot] = slot index, or 0xFF = no restore
+;      DE/BC preserved
+SlideAlignTarget:
+    push    de
+    push    bc
+    push    hl                          ; preserve desired target
+    call    LineCacheLookupOffset
+    cp      0xFF
+    jr      z, .satNoCache
+    ld      [PendingRestoreSlot], a
+    ; HL = LineCacheDocOff[slot]
+    add     a, a
+    ld      e, a
+    ld      d, 0
+    ld      hl, LineCacheDocOff
+    add     hl, de
+    ld      e, [hl]
+    inc     hl
+    ld      d, [hl]                     ; DE = entry.doc_offset
+    pop     hl                          ; discard saved desired
+    push    de
+    pop     hl                          ; HL = entry.doc_offset
+    pop     bc
+    pop     de
+    ret
+.satNoCache:
+    ld      a, 0xFF
+    ld      [PendingRestoreSlot], a
+    pop     hl                          ; HL = desired target (unchanged)
+    pop     bc
+    pop     de
     ret
 
 ; EmitBlankLine: ensure we're at start of a line and leave one blank line
@@ -12793,11 +12929,11 @@ PageDown:
 ;     correctly. A future refinement will use cached snapshots
 ;     to bridge across slides cleanly.
 SlideForwardLocal:
-    ; new_target = DocOffset + WindowLen
+    ; desired_target = DocOffset + WindowLen
     ld      hl, [DocOffset]
     ld      de, [WindowLen]
     add     hl, de
-    ; Bail if new_target >= DocSize (nothing left to fetch).
+    ; Bail if desired_target >= DocSize (nothing left to fetch).
     ld      de, [DocSize]
     push    hl
     or      a
@@ -12807,6 +12943,12 @@ SlideForwardLocal:
     scf
     ret
 .sflFetch:
+    ; Cache-align: if a cached safe boundary sits at or before
+    ; desired_target, slide to *that* offset instead so the matching
+    ; parser-state snapshot can be restored after the slide. Otherwise
+    ; HL is unchanged and PendingRestoreSlot stays at 0xFF (the
+    ; pre-Phase-7-fix path -- defaults at the boundary).
+    call    SlideAlignTarget
     call    EnsureWindowLocal
     or      a
     jr      nz, .sflFail
@@ -12830,7 +12972,11 @@ SlideForwardLocal:
 SlideForwardRemote:
     ld      hl, [DocOffset]
     ld      de, [WindowLen]
-    add     hl, de                       ; HL = next byte after window
+    add     hl, de                       ; HL = desired_target
+    ; Cache-align identically to SlideForwardLocal so the post-slide
+    ; render's restore hook can rebuild the parser scope across the
+    ; boundary.
+    call    SlideAlignTarget
     call    EnsureWindowRemote
     or      a
     jr      nz, .sfrFail
@@ -15828,6 +15974,25 @@ LineCacheLineNo: ds LineCacheMax * 2    ; rendered line number
 LineCacheDocOff: ds LineCacheMax * 2    ; matching DocOffset + (cursor - FileBuf)
 LineCacheState:  ds LineCacheMax * LineCacheStateSz   ; packed parser state
 
+; LineCacheLookupOffset scratch (Phase 7 fix). Lives in RAM so the
+; lookup loop's bookkeeping doesn't have to juggle stack pushes
+; through 16-bit comparisons. Only touched while the routine runs;
+; nobody reads these afterwards.
+LcloTarget:     dw 0                    ; saved target_doc_offset
+LcloBestOff:    dw 0                    ; best entry doc_offset so far
+LcloBestIdx:    db 0xFF                 ; best entry slot, or 0xFF = none
+
+; Slide -> render parser-state hand-off (Phase 7 fix). When a slide
+; aligns its target to a cached safe boundary, we save the slot
+; index here. PrintFileContent reads it after its reset block and
+; calls LineCacheRestore to rebuild persistent parser state
+; (HtmlListKind, HtmlIndent, HtmlAlign, HtmlDir, HtmlOlCounter,
+; HtmlFg) so the first lines of the new chunk render with the
+; right scope context instead of the reset block's defaults.
+;
+; 0xFF = no pending restore (initial / consumed).
+PendingRestoreSlot: db 0xFF
+
 ScrollLine:     dw 0                    ; first visible line (0 = top of file)
 TotalLines:     dw 0                    ; rendered line count for thumb math
 ThumbTop:       db THUMB_Y0             ; current thumb top y (set by ComputeThumb)
@@ -16106,12 +16271,13 @@ FileEnd:
 ; the budget at build time so future code growth fails the build
 ; instead of regressing silently.
 
-FILEBUF_BASE   equ 0x9900              ; aligned past current FileEnd
-                                       ; (~0x98xx after Phase 6's
-                                       ; EnsureWindowRemote +
-                                       ; Format5Decimal helpers added
-                                       ; ~230 B); bump further if the
-                                       ; ASSERT below trips.
+FILEBUF_BASE   equ 0x9A00              ; aligned past current FileEnd
+                                       ; (~0x99xx after Phase 7-fix's
+                                       ; LineCacheLookupOffset +
+                                       ; SlideAlignTarget + the
+                                       ; PrintFileContent restore hook
+                                       ; added ~160 B); bump further
+                                       ; if the ASSERT below trips.
                                        ; (~0x9755 after Phase 4's parser-
                                        ; state Snapshot/Restore + 256 B of
                                        ; LineCacheState added ~340 B);
