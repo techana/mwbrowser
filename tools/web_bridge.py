@@ -4395,25 +4395,65 @@ SCREEN6_VIEW_H = 183                     # content rows: y = 29..211
 SCREEN6_VIEW_BYTES = SCREEN6_VIEW_W * SCREEN6_VIEW_H // 4
 
 
+# Candidate TrueType fonts for the bitmap text path. PIL's bundled
+# default bitmap font is ~6x11 and renders as a condensed blur on a
+# 512px-wide viewport; a 14-15 px monospace TTF gives crisp,
+# readable text. Probe a short list of common system paths and fall
+# back to the bitmap default if none load.
+_BMP_FONT_CANDIDATES = (
+    "/System/Library/Fonts/Menlo.ttc",
+    "/System/Library/Fonts/Monaco.ttf",
+    "/System/Library/Fonts/Supplemental/Courier New.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+    "/Library/Fonts/Andale Mono.ttf",
+)
+_BMP_FONT_SIZE = 14
+
+
+def _bmp_load_font():
+    from PIL import ImageFont
+    for path in _BMP_FONT_CANDIDATES:
+        try:
+            return ImageFont.truetype(path, _BMP_FONT_SIZE)
+        except Exception:
+            continue
+    try:
+        return ImageFont.load_default()
+    except Exception:
+        return None
+
+
 def _bmp_render_text_to_screen6(text):
     """Render a string into a 512x183 grayscale image (black on white)
     and pack as 2-bpp Screen-6 bytes. Word-wraps at the viewport width
-    using PIL's default bitmap font (~6x11). Output is the raw pixel
-    payload that streams over the wire and gets blitted straight to
-    VRAM by the on-MSX RenderRemoteBitmap routine."""
-    from PIL import Image, ImageDraw, ImageFont
-    try:
-        font = ImageFont.load_default()
-    except Exception:
-        font = None
+    using a real TrueType monospace font when available -- the bundled
+    PIL default is too small/condensed to read at 512px-wide. Output
+    is the raw pixel payload that streams over the wire and gets
+    blitted straight to VRAM by RenderRemoteBitmap. Pixels are packed
+    with a hard 50% luminance threshold (no dither): text antialias
+    fringes go either fully black or fully white, which keeps glyph
+    edges sharp on a 4-colour panel where dithered greys read as
+    blur."""
+    from PIL import Image, ImageDraw
+    font = _bmp_load_font()
     im = Image.new("L", (SCREEN6_VIEW_W, SCREEN6_VIEW_H), 255)
     draw = ImageDraw.Draw(im)
-    # Approximate glyph width for word-wrap.
-    glyph_w = 6
-    cols = SCREEN6_VIEW_W // glyph_w
-    line_h = 11
-    rows = SCREEN6_VIEW_H // line_h
-    # Word-wrap.
+    # Measure one glyph to get a stable cell size for word-wrap and
+    # line stride. Monospace fonts give exact answers; proportional
+    # fallbacks under-estimate slightly which is fine -- we just wrap
+    # a few chars early.
+    if font is not None:
+        try:
+            bbox = font.getbbox("M")
+            glyph_w = max(1, bbox[2] - bbox[0])
+            line_h = max(1, (bbox[3] - bbox[1]) + 4)
+        except Exception:
+            glyph_w, line_h = 8, _BMP_FONT_SIZE + 4
+    else:
+        glyph_w, line_h = 6, 12
+    cols = max(1, SCREEN6_VIEW_W // glyph_w)
+    rows = max(1, SCREEN6_VIEW_H // line_h)
     out_lines = []
     for paragraph in text.split("\n"):
         if not paragraph.strip():
@@ -4431,13 +4471,41 @@ def _bmp_render_text_to_screen6(text):
                 cur = cand
         if cur:
             out_lines.append(cur)
-    # Render up to `rows` lines.
     for i, line in enumerate(out_lines[:rows]):
+        y = i * line_h
         try:
-            draw.text((0, i * line_h), line, fill=0, font=font)
+            draw.text((0, y), line, fill=0, font=font)
         except Exception:
-            draw.text((0, i * line_h), line, fill=0)
-    return _pack_2bpp(im)
+            draw.text((0, y), line, fill=0)
+    return _pack_2bpp_threshold(im)
+
+
+def _pack_2bpp_threshold(im):
+    """Pack a grayscale image as 2-bpp Screen-6 bytes using a hard
+    50% luminance threshold. Black pixels land on slot 3 (renders as
+    black), white pixels on slot 2 (renders as white). No dithering
+    -- text rendering needs sharp edges, not error-diffused fringes
+    that read as blur on the limited Screen-6 palette."""
+    if im.mode != "L":
+        im = im.convert("L")
+    w, h = im.size
+    row_bytes = w // 4
+    src = im.tobytes()
+    out = bytearray(h * row_bytes)
+    # Slot 3 = black, slot 2 = white (see CLAUDE.md palette table).
+    BLACK_SLOT = 3
+    WHITE_SLOT = 2
+    for y in range(h):
+        row_off = y * w
+        out_off = y * row_bytes
+        for xb in range(row_bytes):
+            base = row_off + xb * 4
+            b0 = BLACK_SLOT if src[base    ] < 128 else WHITE_SLOT
+            b1 = BLACK_SLOT if src[base + 1] < 128 else WHITE_SLOT
+            b2 = BLACK_SLOT if src[base + 2] < 128 else WHITE_SLOT
+            b3 = BLACK_SLOT if src[base + 3] < 128 else WHITE_SLOT
+            out[out_off + xb] = (b0 << 6) | (b1 << 4) | (b2 << 2) | b3
+    return bytes(out)
 
 
 def _pack_2bpp(im):
