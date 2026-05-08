@@ -12746,7 +12746,16 @@ PageDown:
     or      a
     jr      z, .pdLocalSlide
     call    TryFetchMore
-    ret     c
+    jr      nc, .pdRemoteAppend
+    ; TryFetchMore returned CF=1: either we've drained the bridge's
+    ; pixel-paginated chunks (SerialPage == SerialPageTotal) or the
+    ; next chunk wouldn't fit in FileBuf. In both cases, attempt a
+    ; byte-range slide via GET CHUNK at the next unread offset; if
+    ; the bridge has body bytes there, we land on a fresh window.
+    call    SlideForwardRemote
+    jr      nc, .pdRemoteSlid
+    ret                                  ; genuinely at end-of-document
+.pdRemoteAppend:
     ld      hl, [ScrollLine]
     ld      bc, PAGE_SCROLL_STEP
     add     hl, bc
@@ -12754,6 +12763,10 @@ PageDown:
     call    RefreshAfterScroll
     call    StoreTotalLinesWithPages
     ret
+.pdRemoteSlid:
+    ld      hl, 0
+    ld      [ScrollLine], hl
+    jp      RefreshAfterScroll
 .pdLocalSlide:
     call    SlideForwardLocal
     ret     c
@@ -12803,6 +12816,30 @@ SlideForwardLocal:
     scf
     ret
 
+; SlideForwardRemote: remote analogue of SlideForwardLocal. Sends GET
+; CHUNK at the byte just past the current window. The bridge returns
+; 404 (-> A != 0 from EnsureWindowRemote) when the offset is at or
+; past the cached body's EOF, which we surface as CF=1 so the caller
+; stops trying to advance.
+;
+; Used by PageDown / ScrollDown's remote .pdMaybeFetch tail when
+; TryFetchMore can no longer append (either SerialPage ==
+; SerialPageTotal or the buffer would overflow). Replaces FileBuf
+; contents with the next byte-range chunk, similar to
+; SlideForwardLocal.
+SlideForwardRemote:
+    ld      hl, [DocOffset]
+    ld      de, [WindowLen]
+    add     hl, de                       ; HL = next byte after window
+    call    EnsureWindowRemote
+    or      a
+    jr      nz, .sfrFail
+    or      a                            ; CF = 0 success
+    ret
+.sfrFail:
+    scf
+    ret
+
 ; ScrollDown: if there's more content below the viewport, bump ScrollLine
 ; and refresh. Clamps at max(0, TotalLines - TEXT_MAX_LINES) so the
 ; viewport never bottoms out with a mostly-blank canvas.
@@ -12833,13 +12870,22 @@ ScrollDown:
     or      a
     jr      z, .sdLocalSlide
     call    TryFetchMore
-    ret     c
+    jr      nc, .sdRemoteAppend
+    ; TryFetchMore CF=1: try forward slide via GET CHUNK (Phase 6).
+    call    SlideForwardRemote
+    jr      nc, .sdRemoteSlid
+    ret                                  ; genuinely at end-of-document
+.sdRemoteAppend:
     ld      hl, [ScrollLine]
     inc     hl
     ld      [ScrollLine], hl
     call    RefreshAfterScroll
     call    StoreTotalLinesWithPages
     ret
+.sdRemoteSlid:
+    ld      hl, 0
+    ld      [ScrollLine], hl
+    jp      RefreshAfterScroll
 .sdLocalSlide:
     call    SlideForwardLocal
     ret     c

@@ -280,9 +280,31 @@ must not regress it.
 
 ## Status
 
-Phases 1, 2, 3 shipped on `file_load_architecture`. Phases 1–3 are
-plumbing-only (no observable rendering change); the abstraction is
-in place so Phase 4 can land on top without touching unrelated code.
-Branch verified compatible with the existing bridge↔browser
-pagination handshake. Phase 4 (parser-state snapshot + restore) is
-the next code commit.
+**Phases 1–7 shipped on `file_load_architecture`.**
+
+| Phase | Status | What it delivered |
+|---|---|---|
+| 1 | ✅ committed | `WindowLen` rename + `DocOffset` global. Pure plumbing. |
+| 2 | ✅ committed | `LoadFileChunk(doc_offset, byte_count)` + `DOS_RDRND` wrapper. |
+| 3 | ✅ committed | `LineCache` 32-slot (line_no, doc_offset) cache; populated at every `EmitNewline` during initial render; reset at every load. |
+| 4 | ✅ committed | `LineCacheSnapshot` / `LineCacheRestore` + `IsLineCacheStateSafe` predicate. Snapshot half wired into the cache append; restore half built but no live caller yet. |
+| 5 | ✅ committed | `EnsureWindowLocal` + `SlideForwardLocal`. PageDown / ScrollDown's `.pdMaybeFetch` slide forward for local docs > 13 KB. Verified on a 30 KB synthetic fixture. |
+| 6 | ✅ committed | Bridge `GET CHUNK <offset>` + on-MSX `EnsureWindowRemote` + `Format5Decimal`. Plumbing-only. |
+| 7 | ✅ committed | `SlideForwardRemote` wired into PageDown / ScrollDown's remote path. Phase 6's primitive now has live callers; multi-chunk remote pages can keep streaming after `TryFetchMore` exhausts. |
+
+**Memory budget after Phase 7:**
+
+| | Value |
+|---|---|
+| FILEBUF_BASE | 0x9900 |
+| FILE_BUF_SIZE | 0x3300 (12.75 KB) |
+| FontBuf | 0xCC00 |
+| ImgBuf | 0xD400 |
+| ImgBuf+128 cap | 0xD480 (≤ 0xD500 ✓) |
+
+**Known limitations deferred past Phase 7:**
+
+- **Cross-chunk render glitch.** Slides land at `round_down(target, 128)` and re-render with parser-state defaults (`HtmlListKind=0`, `HtmlScaleY=1`, etc.). If a `<ul>` / `<font>` / `<a>` / `<b>` was open at the slide boundary, that scope starts over. Phase 4's `LineCacheRestore` already exists; the fix is to find the cached entry whose `doc_offset` is closest to (and ≤) the slide target, snapshot it OUT of the cache before `LineCacheReset` evicts it, slide, and re-apply via `LineCacheRestore` after `PrintFileContent`'s state-reset pass.
+- **Backward slide.** `ScrollUp` / `PageUp` at `ScrollLine == 0` with `DocOffset > 0` could slide the window backward (target = max(0, DocOffset - FILE_BUF_SIZE)) so the user can revisit content before the current chunk. Today they get a no-op and have to Refresh to start over. Both `EnsureWindowLocal` and `EnsureWindowRemote` already handle smaller-target inputs, so the wiring is purely a scroll-dispatch addition.
+- **24-bit `DocOffset` / `DocSize`.** Today both are 16-bit, so docs cap at 64 KB. Wikipedia articles routinely run past that. Widening to 24-bit needs a `Format8Decimal` (or hex-on-wire), an updated record-number seed in `LoadFileChunk` (`R0/R1/R2` widened from one byte to three), and matching changes in `EnsureWindow*` math.
+- **Live wiki validation.** Local 30 KB BIGBENCH path is verified end-to-end via `tools/shot_slide_trace.tcl`. The remote slide path (TryFetchMore-refused → `SlideForwardRemote` → `EnsureWindowRemote` → bridge `GET CHUNK`) is wired but has no automated test — needs a running `tools/web_bridge.py` against a real wiki article. Manual validation TODO.
