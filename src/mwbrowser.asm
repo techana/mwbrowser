@@ -12811,26 +12811,30 @@ InPlaceRender:  db 0                    ; 1 = current render can skip redraws
                                         ; that the previous pass already left on
                                         ; VRAM (e.g. image bitmaps).
 
-; ScrollUp: decrement ScrollLine if > 0, refresh.
+; ScrollUp: decrement ScrollLine if > 0; at ScrollLine == 0 with a
+; non-zero DocOffset (i.e. user is at the top of a window that was
+; slid forward through a long doc), slide the window backward by one
+; chunk so the user can reach earlier content without having to
+; Refresh from byte 0.
 ScrollUp:
     ld      hl, [ScrollLine]
     ld      a, h
     or      l
-    ret     z
+    jr      z, .suMaybeBack
     dec     hl
     ld      [ScrollLine], hl
     jp      RefreshAfterScroll
+.suMaybeBack:
+    jp      MaybeSlideBackward
 
 ; PageUp: subtract PAGE_SCROLL_STEP from ScrollLine (clamping to 0), refresh.
-; Early-out at ScrollLine == 0 -- pressing N at the top of the document
-; should be a hard no-op (no flicker, no re-render). The previous code
-; would still write 0 back and call RefreshAfterScroll, which repainted
-; the same viewport for nothing.
+; ScrollLine == 0 path: if DocOffset > 0, slide backward (mirror of
+; PageDown's .pdMaybeFetch). Otherwise no-op.
 PageUp:
     ld      hl, [ScrollLine]
     ld      a, h
     or      l
-    ret     z
+    jr      z, .puMaybeBack
     ld      de, PAGE_SCROLL_STEP
     and     a
     sbc     hl, de
@@ -12839,6 +12843,121 @@ PageUp:
 .puStore:
     ld      [ScrollLine], hl
     jp      RefreshAfterScroll
+.puMaybeBack:
+    jp      MaybeSlideBackward
+
+; MaybeSlideBackward: at ScrollLine == 0, attempt to load the chunk
+; immediately before the current window so the user lands on adjacent
+; content. Returns silently if DocOffset is already 0 (genuinely at
+; top of doc) or if the slide fetch fails.
+;
+; After a successful slide, runs a 2-pass render: pass 1 walks the new
+; window with HtmlLineSkip = 0xFFFE (all lines suppressed) just to
+; populate HtmlLineCount. Pass 2 sets ScrollLine = HtmlLineCount -
+; TEXT_MAX_LINES so the viewport lands at the BOTTOM of the new
+; window (continuity from where the user was looking). Without the
+; clamp, ScrollLine = 0 would reset to the top of the previous chunk
+; -- the user would have to PageDown several times to reach where
+; they were.
+;
+; Tail-jumps to RefreshAfterScroll on success; returns with CF
+; cleared on failure (caller treats as no-op).
+MaybeSlideBackward:
+    ld      hl, [DocOffset]
+    ld      a, h
+    or      l
+    ret     z                            ; already at byte 0 of doc
+    ld      a, [IsRemoteSession]
+    or      a
+    jr      z, .msbLocal
+    call    SlideBackwardRemote
+    jr      .msbCheck
+.msbLocal:
+    call    SlideBackwardLocal
+.msbCheck:
+    ret     c                            ; slide failed -> caller no-ops
+    ; SlideAlignTarget left PendingRestoreSlot pointing at the cached
+    ; safe boundary for this slide. Pass 1's PrintFileContent will
+    ; consume that pending slot (clear it back to 0xFF) -- but pass 2
+    ; needs the same restore to render correctly. Cache the slot
+    ; index across the two passes so pass 2 sees the same state hand-
+    ; off pass 1 saw.
+    ld      a, [PendingRestoreSlot]
+    push    af
+    ; Pass 1: count-only render. Set ScrollLine to a value the
+    ; parser treats as "skip every line" so VRAM stays as the old
+    ; window's content (no blank flash while we count) and
+    ; LineCacheMaybeAppend skips its append branch (HtmlLineSkip != 0
+    ; predicate). PrintFileContent still accumulates HtmlLineCount,
+    ; which is what we need.
+    ld      hl, 0xFFFE
+    ld      [ScrollLine], hl
+    call    PrintFileContent
+    ; Re-arm PendingRestoreSlot for pass 2.
+    pop     af
+    ld      [PendingRestoreSlot], a
+    ; Pass 2: clamp ScrollLine to the bottom of the new window and
+    ; do a normal RefreshAfterScroll (clear + render + thumb math).
+    ; The clamp lands the viewport on the LAST TEXT_MAX_LINES rows
+    ; of the new window, which corresponds (modulo wrap) to the
+    ; bytes immediately before the slide boundary -- i.e. the
+    ; content the user expected to find when they pressed Up.
+    ld      hl, [HtmlLineCount]
+    ld      de, TEXT_MAX_LINES
+    or      a
+    sbc     hl, de
+    jr      nc, .msbClampOk
+    ld      hl, 0                        ; tiny window -> just show all of it
+.msbClampOk:
+    ld      [ScrollLine], hl
+    jp      RefreshAfterScroll
+
+; SlideBackwardLocal: shift the FileBuf window one chunk backward
+; through the open local file. target = max(0, DocOffset - FILE_BUF_SIZE).
+; Cache-aligns through SlideAlignTarget so the post-slide render
+; restores parser state at the boundary (same Phase 7-fix machinery
+; as the forward slide).
+;
+; Returns CF=0 on slide success, CF=1 on EnsureWindow failure.
+SlideBackwardLocal:
+    ld      hl, [DocOffset]
+    ld      de, FILE_BUF_SIZE
+    or      a
+    sbc     hl, de
+    jr      nc, .sbloAlign
+    ld      hl, 0                        ; clamp to byte 0
+.sbloAlign:
+    call    SlideAlignTarget
+    call    EnsureWindowLocal
+    or      a
+    jr      nz, .sbloFail
+    or      a                            ; CF = 0 success
+    ret
+.sbloFail:
+    scf
+    ret
+
+; SlideBackwardRemote: remote analogue. The bridge's GET CHUNK
+; <offset> can serve any byte range of the cached body, so backward
+; navigation works the same way as forward slide -- just with a
+; smaller target.
+SlideBackwardRemote:
+    ld      hl, [DocOffset]
+    ld      de, FILE_BUF_SIZE
+    or      a
+    sbc     hl, de
+    jr      nc, .sbroAlign
+    ld      hl, 0
+.sbroAlign:
+    call    SlideAlignTarget
+    call    EnsureWindowRemote
+    or      a
+    jr      nz, .sbroFail
+    or      a
+    ret
+.sbroFail:
+    scf
+    ret
 
 ; PageDown: advance ScrollLine by TEXT_MAX_LINES - 1 and clamp the target
 ; so the viewport stays full -- the final page pins to
