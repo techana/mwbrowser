@@ -25,6 +25,11 @@ mcopy -i "$DISK" -o samples/test4.htm  ::/TEST4.HTM
 # count moved off the hardcoded 5.
 [ -f samples/rtltab.htm ] && \
     mcopy -i "$DISK" -o samples/rtltab.htm ::/RTLTAB.HTM 2>/dev/null || true
+# BIGBENCH: ~30 KB local-only fixture for the file_load_architecture
+# Phase 5 forward-slide path. Larger than FILE_BUF_SIZE so PageDown
+# at the bottom of the first chunk has to slide the window forward.
+[ -f samples/BIGBENCH.HTM ] && \
+    mcopy -i "$DISK" -o samples/BIGBENCH.HTM ::/BIGBENCH.HTM 2>/dev/null || true
 # AUTOEXEC.BAT: MSX-DOS 1 reads this when the disk is booted from
 # (or when the user runs `command` interactively). Contains a single
 # `MWBRO` line so the browser auto-launches.

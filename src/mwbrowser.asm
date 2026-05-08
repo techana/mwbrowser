@@ -3047,15 +3047,21 @@ LoadFile:
     or      a
     ret     nz
 
+    ; Latch the file's full size from FCB+16 before we start reading.
+    ; EnsureWindowLocal needs DocSize to know when a forward slide
+    ; would actually fetch new content vs land past EOF.
+    ld      hl, [Fcb + 16]
+    ld      [DocSize], hl
+
     ; A fresh document invalidates every previously cached
     ; (line_no, doc_offset) entry. Reset before the read so the
     ; subsequent render's EmitNewlines start from an empty cache.
     call    LineCacheReset
 
     ; LoadFile is the "open whole document at byte 0" call: hand off
-    ; to LoadFileChunk(doc_offset=0, byte_count=FILE_BUF_SIZE). Phase 5
-    ; will introduce non-zero offsets via the same primitive when scroll
-    ; dispatch needs to slide the window.
+    ; to LoadFileChunk(doc_offset=0, byte_count=FILE_BUF_SIZE).
+    ; EnsureWindowLocal handles non-zero offsets when scroll dispatch
+    ; slides the window past the initial chunk.
     ld      de, 0                       ; doc_offset
     ld      hl, FILE_BUF_SIZE           ; byte_count
     call    LoadFileChunk
@@ -3222,6 +3228,99 @@ ClearContentArea:
     ld      e, CONTENT_Y1 - CONTENT_Y0 + 1
     ld      a, COL_WHITE
     jp      FillRect
+
+; EnsureWindowLocal: slide FileBuf so it covers `target_doc_offset`.
+;
+; Inputs:
+;   HL = target_doc_offset (16-bit; today's docs cap at 64 KB)
+;   FCB+0..15 still carries the file's drive/name (LoadFile leaves
+;   those untouched; ResetFcbTail only zeros 12..35).
+;
+; Outputs:
+;   FileBuf populated with up to FILE_BUF_SIZE bytes starting at
+;   round_down(target_doc_offset, 128). DocOffset / WindowLen
+;   updated by LoadFileChunk. LineCacheCount reset to 0 (the prior
+;   slot offsets pointed into bytes that no longer live in FileBuf).
+;   A = 0 on success, !=0 on FCB reopen / read failure.
+;
+; No-op fast path: if target already lives in [DocOffset,
+; DocOffset + WindowLen), return success immediately. The caller
+; (PageDown's local-slide path) gates on DocOffset+WindowLen <
+; DocSize before calling, so target == DocOffset+WindowLen always
+; means "fetch the next chunk".
+;
+; Strategy: reopen the FCB (ResetFcbTail + DOS_OPEN), drive
+; LoadFileChunk with the aligned target offset, close. The
+; per-call open/close cost is ~one BDOS hop pair plus the seek
+; setup inside LoadFileChunk; on a real floppy this is dwarfed
+; by the actual record reads.
+EnsureWindowLocal:
+    push    bc
+    push    de
+    push    hl                           ; save target
+    ld      de, [DocOffset]
+    or      a
+    sbc     hl, de                       ; HL = target - DocOffset
+    jr      c, .ewlSlide                 ; target < DocOffset -> slide back
+    ld      de, [WindowLen]
+    sbc     hl, de
+    jr      c, .ewlAlreadyIn             ; in current window -> no-op
+.ewlSlide:
+    ; Round target down to a 128-byte record boundary so LoadFileChunk
+    ; doesn't need its byte_remainder branch (deferred to a later
+    ; refinement). HL still has the original target (we restored on
+    ; the .ewlSlide path before adjusting only the DE). Wait -- HL was
+    ; mutated by the sbc pair above, so reload from the saved copy.
+    pop     hl                           ; HL = target_doc_offset (saved)
+    push    hl                           ; re-save (we still need it for cleanup)
+    ld      a, l
+    and     0x80                         ; keep bit 7, zero bits 0..6
+    ld      l, a                         ; HL aligned down to 128
+
+    ; Reopen FCB. ResetFcbTail clears CR / R0..R2 / extent state but
+    ; leaves the drive/name fields LoadFile / BuildFcbFromUrl
+    ; populated, so DOS_OPEN finds the same file again.
+    push    hl                           ; save aligned offset
+    call    ResetFcbTail
+    ld      c, DOS_OPEN
+    ld      de, Fcb
+    call    BDOS_ENTRY
+    pop     hl                           ; aligned offset back
+    or      a
+    jr      nz, .ewlOpenFail
+
+    ; Slide invalidates LineCache: the old (line_no, doc_offset)
+    ; entries refer to bytes that no longer live in FileBuf. Reset
+    ; before the read so the post-render's EmitNewlines start from
+    ; an empty cache and repopulate for the new window.
+    push    hl
+    call    LineCacheReset
+    pop     hl
+
+    ex      de, hl                       ; DE = aligned doc_offset
+    ld      hl, FILE_BUF_SIZE            ; byte_count
+    call    LoadFileChunk
+    push    af
+    ld      c, DOS_CLOSE
+    ld      de, Fcb
+    call    BDOS_ENTRY
+    pop     af
+
+.ewlExit:
+    pop     hl
+    pop     de
+    pop     bc
+    ret
+
+.ewlAlreadyIn:
+    ; HL got mangled by the bounds-check sbc; restore from the saved
+    ; copy and exit clean.
+    xor     a
+    jr      .ewlExit
+
+.ewlOpenFail:
+    or      1                            ; ensure A != 0 for the caller
+    jr      .ewlExit
 
 ; ============================================================================
 ; Step 3: HTML 2.0 parser + renderer
@@ -12633,12 +12732,19 @@ PageDown:
     jp      RefreshAfterScroll
 .pdAtMax:
 .pdMaybeFetch:
-    ; Already at the bottom of the buffered content. If the bridge
-    ; has more pages waiting, pull one chunk, advance ScrollLine over
-    ; the now-stale current viewport, and refresh. The render will
-    ; recount HtmlLineCount which we latch back into TotalLines plus
-    ; the remaining-pages estimate so the scrollbar shrinks as we
-    ; fetch the rest of the document.
+    ; Already at the bottom of the buffered content. Two ways to
+    ; advance:
+    ;   (a) Remote session: TryFetchMore pulls the next "GET MORE"
+    ;       chunk, which APPENDS to FileBuf at the current WindowLen.
+    ;       ScrollLine bumps by PAGE_SCROLL_STEP because the user's
+    ;       previous viewport is still in the buffer.
+    ;   (b) Local session past initial chunk: SlideForwardLocal
+    ;       slides the FileBuf window to the next FILE_BUF_SIZE chunk
+    ;       of the file. The OLD viewport is gone, so ScrollLine
+    ;       resets to 0 (top of new chunk).
+    ld      a, [IsRemoteSession]
+    or      a
+    jr      z, .pdLocalSlide
     call    TryFetchMore
     ret     c
     ld      hl, [ScrollLine]
@@ -12647,6 +12753,54 @@ PageDown:
     ld      [ScrollLine], hl
     call    RefreshAfterScroll
     call    StoreTotalLinesWithPages
+    ret
+.pdLocalSlide:
+    call    SlideForwardLocal
+    ret     c
+    ld      hl, 0
+    ld      [ScrollLine], hl
+    jp      RefreshAfterScroll
+
+; SlideForwardLocal: shift the FileBuf window one chunk forward
+; through the open local file. Used by PageDown / ScrollDown when
+; the user has paged past the buffered content but the file has
+; more bytes left.
+;
+; Returns CF=0 on slide success (DocOffset / WindowLen advanced),
+; CF=1 if the file has no more bytes past the current window.
+;
+; Scope notes:
+;   - Local-only. Caller checks IsRemoteSession before invoking.
+;   - The "next chunk" is FILE_BUF_SIZE bytes starting at
+;     DocOffset + WindowLen, with no overlap. The first line of
+;     the new chunk may render with parser-state defaults (no
+;     <ul>/<font>/<a> context restored) since we just reset the
+;     LineCache; cosmetically the user might see one slightly-off
+;     line at the top of the new chunk before paragraphs flow
+;     correctly. A future refinement will use cached snapshots
+;     to bridge across slides cleanly.
+SlideForwardLocal:
+    ; new_target = DocOffset + WindowLen
+    ld      hl, [DocOffset]
+    ld      de, [WindowLen]
+    add     hl, de
+    ; Bail if new_target >= DocSize (nothing left to fetch).
+    ld      de, [DocSize]
+    push    hl
+    or      a
+    sbc     hl, de
+    pop     hl
+    jr      c, .sflFetch
+    scf
+    ret
+.sflFetch:
+    call    EnsureWindowLocal
+    or      a
+    jr      nz, .sflFail
+    or      a                            ; CF = 0 success
+    ret
+.sflFail:
+    scf
     ret
 
 ; ScrollDown: if there's more content below the viewport, bump ScrollLine
@@ -12671,9 +12825,13 @@ ScrollDown:
     ld      [ScrollLine], hl
     jp      RefreshAfterScroll
 .sdAtMax:
-    ; Bottom of buffered content. If the bridge has more pages queued,
-    ; pull the next chunk, advance ScrollLine over the fresh content,
-    ; and re-render. Otherwise this is genuinely the end of the doc.
+    ; Bottom of buffered content. Same two-path branch as PageDown:
+    ; remote sessions append via TryFetchMore (advance by 1 line for
+    ; line-by-line scroll), local sessions slide the window forward
+    ; one chunk and reset ScrollLine.
+    ld      a, [IsRemoteSession]
+    or      a
+    jr      z, .sdLocalSlide
     call    TryFetchMore
     ret     c
     ld      hl, [ScrollLine]
@@ -12682,6 +12840,12 @@ ScrollDown:
     call    RefreshAfterScroll
     call    StoreTotalLinesWithPages
     ret
+.sdLocalSlide:
+    call    SlideForwardLocal
+    ret     c
+    ld      hl, 0
+    ld      [ScrollLine], hl
+    jp      RefreshAfterScroll
 
 ; ============================================================================
 ; Step 2.5: Mouse (direct PSG reads on joyporta) + click dispatch
@@ -15404,6 +15568,13 @@ Fcb:            ds 37                   ; MSX-DOS 1 FCB (36 bytes + 1 pad)
 ;
 WindowLen:      dw 0                    ; bytes currently in the FileBuf window
 DocOffset:      dw 0                    ; FileBuf[0] = byte DocOffset of doc
+DocSize:        dw 0                    ; total document length in bytes; set
+                                        ; from FCB+16 at LoadFile / from
+                                        ; SerialLen on the first remote
+                                        ; frame (best-effort there). Read by
+                                        ; EnsureWindowLocal to decide
+                                        ; whether a forward slide has any
+                                        ; bytes left to fetch.
 
 ; Restart-point cache (file_load_architecture Phases 3 + 4).
 ;
