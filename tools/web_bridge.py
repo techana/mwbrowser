@@ -4813,10 +4813,17 @@ def _serial_split_into_chunks(body):
     return chunks if chunks else [body]
 
 
-# Regex matching transform_html's <img src="/img/<URL>?_w=&_h="> output.
-# We rewrite those proxy URLs into imNN.pcx handles so the on-MSX side
-# only ever sees handles it knows how to fetch over the serial wire.
-_PROXY_IMG_SRC_RE = re.compile(r'src="(/img/[^"]+)"')
+# Regex matching transform_html's `<img src=".../img/<URL>?_w=&_h=">`
+# output. transform_html builds the URL via _proxy_img, which is
+# `http://{proxy_host}/img/<unquoted_url>?_w=W&_h=H` -- absolute, with
+# the proxy_host string the caller passed in (`"msx-serial"` for the
+# serial path). The regex matches both the absolute form and the
+# legacy relative `/img/...` form some older code paths still emit.
+# Group 1 is the part starting at "/img/" (the part after the proxy
+# hostname), so the rewrite logic stays the same regardless of
+# whether the input was absolute or relative.
+_PROXY_IMG_SRC_RE = re.compile(
+    r'src="(?:[a-z]+://[^/"]+)?(/img/[^"]+)"', re.I)
 
 
 class MsxSession:
