@@ -167,7 +167,7 @@ URL_MAX        equ 255         ; address-bar / fetch-target buffer cap (chars
                                ; before NUL). Bumped from 95 because real
                                ; mirror.aratab.com URLs run past the 100-char
                                ; line and got truncated on click.
-FILE_BUF_SIZE  equ 0x3200      ; 12.5 KB. Sized so FILEBUF_BASE (0x9A00) +
+FILE_BUF_SIZE  equ 0x3100      ; 12.25 KB. Sized so FILEBUF_BASE (0x9B00) +
                                ; FILE_BUF_SIZE + FONT_BUF_SIZE + 128 lands
                                ; at 0xD480 -- below both MSX-DOS 1.03's
                                ; *runtime* HIMEM (~0xDF94 on Sony HB-F1XD,
@@ -5259,20 +5259,42 @@ LineCacheMaybeAppend:
     ld      a, [HtmlLineSkip + 1]
     or      b
     ret     nz                          ; scrolled render -> skip
-    ld      a, [LineCacheCount]
-    cp      LineCacheMax
-    ret     nc                          ; cache full -> skip
     call    IsLineCacheStateSafe
     ret     nz                          ; unsafe scope open -> skip
     push    hl
     push    de
     push    bc
+    ; Pick the slot index. Two cases:
+    ;   count < LineCacheMax  -> append at slot[count], bump count.
+    ;   count == LineCacheMax -> ring-buffer eviction: write to
+    ;       slot[head], advance head modulo Max. Count stays at Max.
+    ; Either way C ends up holding the chosen slot index, which then
+    ; gets multiplied for the line_no / doc_offset / state strides.
     ld      a, [LineCacheCount]
-    ; Index byte = count * 2 (word stride for line_no and doc_offset).
-    add     a, a
-    ld      c, a
+    cp      LineCacheMax
+    jr      c, .lcmaPartial
+    ; Full: ring eviction. Slot = head; advance head.
+    ld      a, [LineCacheHead]
+    ld      c, a                        ; C = slot index
+    inc     a
+    cp      LineCacheMax
+    jr      c, .lcmaHeadOk
+    xor     a                           ; wrap to 0
+.lcmaHeadOk:
+    ld      [LineCacheHead], a
+    jr      .lcmaWrite
+.lcmaPartial:
+    ld      c, a                        ; C = slot index = current count
+    inc     a
+    ld      [LineCacheCount], a
+.lcmaWrite:
+    ; Save slot index for the snapshot call below.
+    ld      a, c
+    ld      [LineCacheWriteSlot], a
+    ; Index byte = slot * 2 (word stride).
+    sla     c
     ld      b, 0
-    ; Slot 1: line_no -> LineCacheLineNo[count]
+    ; Slot 1: line_no -> LineCacheLineNo[slot]
     ld      hl, LineCacheLineNo
     add     hl, bc
     ld      de, [HtmlLineCount]
@@ -5292,21 +5314,14 @@ LineCacheMaybeAppend:
     ld      [hl], e
     inc     hl
     ld      [hl], d
-    ; Slot 3: parser state snapshot (8 bytes, LineCacheState +
-    ; count*8). LineCacheCount is unbumped at this point, so the
-    ; snapshot goes into the same slot as the line_no/doc_offset
-    ; we just wrote.
+    ; Slot 3: parser state snapshot. LineCacheSnapshot reads
+    ; LineCacheWriteSlot for the slot index (was using LineCacheCount
+    ; before ring eviction landed; ring writes target an arbitrary
+    ; slot, not always next-available).
     pop     bc
     pop     de
     pop     hl
-    call    LineCacheSnapshot
-    ; Bump LineCacheCount only after both halves landed cleanly so a
-    ; partially-written slot can never be observed.
-    push    hl
-    ld      hl, LineCacheCount
-    inc     [hl]
-    pop     hl
-    ret
+    jp      LineCacheSnapshot           ; tail-call
 
 ; IsLineCacheStateSafe: returns Z (with A=0) when the parser's "open
 ; scopes" are all at default values, NZ otherwise. Safe scope means
@@ -5365,8 +5380,8 @@ IsLineCacheStateSafe:
 ; Clobbers A, HL, DE.
 LineCacheSnapshot:
     push    bc
-    ld      a, [LineCacheCount]
-    ; index = count * 8 = count << 3
+    ld      a, [LineCacheWriteSlot]
+    ; index = slot * 8 = slot << 3
     add     a, a
     add     a, a
     add     a, a
@@ -5444,11 +5459,12 @@ LineCacheRestore:
 ; on every fresh document load -- prior offsets refer to bytes that
 ; have been overwritten in FileBuf and would point into the wrong
 ; document if we tried to use them post-load. We leave the byte
-; arrays uncleared (LineCacheCount gates reads) so the reset is one
-; instruction.
+; arrays uncleared (LineCacheCount gates reads) so the reset is two
+; instructions: zero count and head together.
 LineCacheReset:
     xor     a
     ld      [LineCacheCount], a
+    ld      [LineCacheHead], a
     ret
 
 ; LineCacheLookupOffset: find the cached slot whose stored doc_offset
@@ -16097,6 +16113,13 @@ DocSize:        dw 0                    ; total document length in bytes; set
 LineCacheMax     equ 32
 LineCacheStateSz equ 8                  ; bytes per snapshot slot
 LineCacheCount: db 0
+; Ring-buffer head (oldest entry index, 0..LineCacheMax-1). Only
+; consulted when LineCacheCount has reached LineCacheMax: the next
+; append overwrites slot[head] and advances head modulo Max. Reset
+; alongside LineCacheCount on every fresh load. Pre-fill state
+; (count < max) doesn't use head -- new entries land at slot[count]
+; and head stays at 0.
+LineCacheHead:  db 0
 ; LineCacheLineNo / LineCacheDocOff / LineCacheState moved past FileEnd:.
 
 ; LineCacheLookupOffset scratch (Phase 7 fix). Lives in RAM so the
@@ -16376,6 +16399,11 @@ Fcb:                ds 37
 LineCacheLineNo:    ds LineCacheMax * 2
 LineCacheDocOff:    ds LineCacheMax * 2
 LineCacheState:     ds LineCacheMax * LineCacheStateSz
+LineCacheWriteSlot: ds 1                ; slot index LineCacheSnapshot
+                                         ; should write to (set by
+                                         ; LineCacheMaybeAppend; was
+                                         ; LineCacheCount before ring
+                                         ; eviction landed)
 HtmlFgStack:        ds 4
 HtmlCurHref:        ds LINK_URL_MAX + 1
 HtmlFormAction:     ds FORM_ACTION_MAX + 1
