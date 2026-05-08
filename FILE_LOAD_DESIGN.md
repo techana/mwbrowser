@@ -302,9 +302,36 @@ must not regress it.
 | ImgBuf | 0xD400 |
 | ImgBuf+128 cap | 0xD480 (≤ 0xD500 ✓) |
 
-**Known limitations deferred past Phase 7:**
+**Status updates (commits ad8904d..1a0ab98 + 720c822 + 97c2307):**
 
-- **Cross-chunk render glitch.** Slides land at `round_down(target, 128)` and re-render with parser-state defaults (`HtmlListKind=0`, `HtmlScaleY=1`, etc.). If a `<ul>` / `<font>` / `<a>` / `<b>` was open at the slide boundary, that scope starts over. Phase 4's `LineCacheRestore` already exists; the fix is to find the cached entry whose `doc_offset` is closest to (and ≤) the slide target, snapshot it OUT of the cache before `LineCacheReset` evicts it, slide, and re-apply via `LineCacheRestore` after `PrintFileContent`'s state-reset pass.
-- **Backward slide.** `ScrollUp` / `PageUp` at `ScrollLine == 0` with `DocOffset > 0` could slide the window backward (target = max(0, DocOffset - FILE_BUF_SIZE)) so the user can revisit content before the current chunk. Today they get a no-op and have to Refresh to start over. Both `EnsureWindowLocal` and `EnsureWindowRemote` already handle smaller-target inputs, so the wiring is purely a scroll-dispatch addition.
-- **24-bit `DocOffset` / `DocSize`.** Today both are 16-bit, so docs cap at 64 KB. Wikipedia articles routinely run past that. Widening to 24-bit needs a `Format8Decimal` (or hex-on-wire), an updated record-number seed in `LoadFileChunk` (`R0/R1/R2` widened from one byte to three), and matching changes in `EnsureWindow*` math.
-- **Live wiki validation.** Local 30 KB BIGBENCH path is verified end-to-end via `tools/shot_slide_trace.tcl`. The remote slide path (TryFetchMore-refused → `SlideForwardRemote` → `EnsureWindowRemote` → bridge `GET CHUNK`) is wired but has no automated test — needs a running `tools/web_bridge.py` against a real wiki article. Manual validation TODO.
+- ✅ **Cross-chunk render glitch fixed** — `SlideAlignTarget` now snaps the slide target to the closest cached safe boundary (`LineCacheLookupOffset`) and `PendingRestoreSlot` carries the slot through to `PrintFileContent`'s post-reset hook, where `LineCacheRestore` rebuilds the persistent parser state. (Commit `f81552d`.)
+- ✅ **Backward slide shipped** — `ScrollUp` / `PageUp` at `ScrollLine == 0` of a non-zero-`DocOffset` window now triggers `SlideBackward{Local,Remote}` and lands the viewport at the *bottom* of the previous window (continuity with where the user was). 2-pass render needed because the new window's `HtmlLineCount` is unknown at slide time. (Commit `1a0ab98`.)
+- ✅ **EI/HALT bug fixed (separate from this branch's scope)** — bare `halt` in MainLoop was hanging on HB-F700D / AX-370. Fix: canonical `ei / halt`. The whole "AX-370 ~15565 B TPA cap" theory in the original CLAUDE.md was a misdiagnosis. (Commit `ae55bb7`, see CLAUDE.md.)
+- ✅ **17 KB shrink** — moved 44 inline `ds` reservations past `FileEnd:` so SAVEBIN doesn't carry their zero bytes. .COM 39 KB → 22 KB. Independent of the EI/HALT fix; smaller binaries are good hygiene. (Commit `ad8904d`.)
+- ✅ **Cache eviction policy** — `LineCacheMaybeAppend` now uses ring-buffer eviction so the cache holds the **latest** 32 safe boundaries instead of the **first** 32. `SlideAlignTarget` snaps forward-slide targets to entries near the slide boundary instead of forcing the user to re-read from doc start. (Commit `97c2307`.)
+
+**Still deferred:**
+
+- **24-bit `DocOffset` / `DocSize` for docs > 64 KB.** Today both are 16-bit so docs cap at 64 KB. Wikipedia articles routinely run past that. The widening is mechanically straightforward but touches ~20 sites, with each requiring careful 16→24-bit upgrade. Storage was tentatively widened during the file_load_architecture session (`db 0,0,0` instead of `dw 0`) but reverted because the inline math sites stayed 16-bit and would have been a half-fix. **Inventory of sites to update when we pick this up:**
+
+  Storage (already laid out, just toggle from `dw` to 3-byte `db`):
+  - `DocOffset`, `DocSize`, `LcloTarget`, `LcloBestOff` in the runtime-RAM block.
+  - `LineCacheDocOff: ds LineCacheMax * 2` → `ds LineCacheMax * 3` (+32 B RAM).
+
+  Code (every `ld hl, [DocOffset]` / `ld [DocOffset], hl` becomes a 3-byte load/store):
+  - `LoadFile` (DocSize from FCB+16, DocOffset = 0).
+  - `LoadFileChunk` (`Fcb+33..35` random-record seed: 24-bit shift right 7 instead of 16-bit).
+  - `RemoteLoadFile` (DocOffset = 0 init).
+  - `EnsureWindowLocal` / `EnsureWindowRemote` (target compare; 24-bit no-op fast-path).
+  - `SlideForwardLocal` / `SlideForwardRemote` (DocOffset+WindowLen vs DocSize).
+  - `SlideBackwardLocal` / `SlideBackwardRemote` (DocOffset − FILE_BUF_SIZE, clamp at 0).
+  - `SlideAlignTarget` (24-bit target passed down).
+  - `LineCacheMaybeAppend` (24-bit doc_offset write per slot).
+  - `LineCacheLookupOffset` (24-bit comparison loop using `LcloTarget` / `LcloBestOff`).
+
+  Wire format:
+  - `EnsureWindowRemote` builds `"CHUNK <decimal_offset>"` via `Format5Decimal` (5 digits, 99999 max). Replace with `Format6Hex` (24-bit → 6 hex digits + NUL, ~20 B). Bridge accepts hex via `int(target[6:].strip(), 16)`.
+
+  Estimated cost: ~250 B of new MSX code + ~32 B RAM (LineCacheDocOff stride). Tight against the ImgBuf+128 ≤ 0xD500 cap — likely needs another `FILE_BUF_SIZE` shrink (0x3100 → 0x3000 or 0x2F00).
+
+- **Live wiki bridge validation.** Local 30 KB BIGBENCH path is verified end-to-end via `tools/shot_slide_trace.tcl`. The remote slide path (TryFetchMore-refused → `SlideForwardRemote` → bridge `GET CHUNK`) is wired but has no automated test — needs a running `tools/web_bridge.py` against a real wiki article. Useful with the current 16-bit limit only for articles < 64 KB; full validation with long Featured Articles waits on the 24-bit widening above.
