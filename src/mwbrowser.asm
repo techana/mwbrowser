@@ -4660,6 +4660,36 @@ EmitRaw:
 
     ld      b, a                        ; B = glyph
 
+    ; Inside a <table> cell, clip text at the cell's right edge
+    ; instead of wrap-to-next-row. Wrapping while in a cell sent
+    ; the overflow to the next row at HtmlIndent (column 0),
+    ; visually displacing it outside the table -- the user-reported
+    ; "text outside table" bug on benchtx's Field/Value/Note table
+    ; where the long Note text bled past the cell into the next
+    ; row's first column. Truncating means the cell shows only as
+    ; much text as fits, but never bleeds outside the column.
+    ld      a, [HtmlInTable]
+    or      a
+    jr      z, .erCanvasWrap
+    ld      hl, [CellEndX]
+    ld      a, h
+    or      l
+    jr      z, .erCanvasWrap            ; CellEndX uninitialised -> defer to canvas
+    ld      de, 6                       ; mirror the 6-px slack used canvas-wide
+    or      a
+    sbc     hl, de
+    ld      de, [TextX]
+    or      a
+    sbc     hl, de
+    jr      c, .erDrop                  ; TextX >= CellEndX - 6 -> drop char
+    jr      .posOk
+
+.erDrop:
+    pop     bc
+    pop     hl
+    ret
+
+.erCanvasWrap:
     ; Wrap check runs in both render and skip-scroll phases so the line
     ; count that backs HtmlLineSkip includes wrap breaks, not only
     ; tag-driven EmitNewlines. Without this a scroll step skips past
