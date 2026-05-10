@@ -16107,35 +16107,23 @@ HasScheme:
     or      1
     ret
 
-; IsLocalUrl: HL -> NUL URL. Returns Z when the URL looks like an
-; MSX-DOS drive-letter path (single letter then ':'), NZ otherwise.
-; Used by LoadFile to route "C:HOME.HTM" through MSX-DOS while sending
-; bare hostnames like "frogfind.com" or schemed URLs to the bridge.
+; IsLocalUrl: HL -> NUL URL. Returns Z when the URL's second character
+; is ':' (i.e. looks like an MSX-DOS drive-letter path "X:..."); NZ
+; otherwise. Anything else routes to the web bridge -- bare names like
+; "INDEX.HTM", IP literals like "127.0.0.1", and schemed URLs like
+; "https://msn.com" all flow over serial. The first-char-letter check
+; that earlier versions added (A..Z or a..z before the ':') was
+; tightened away after the user reported wanting the bridge to handle
+; everything except an explicit drive prefix.
 IsLocalUrl:
     ld      a, [hl]
     or      a
     jr      z, .iulNo                   ; empty -> not local
-    push    hl
     inc     hl
-    ld      c, [hl]                     ; C = second char
-    pop     hl
-    ld      a, [hl]                     ; A = first char
-    ; First char must be A..Z or a..z.
-    cp      'a'
-    jr      c, .iulCheckUpper
-    cp      'z' + 1
-    jr      nc, .iulNo
-    jr      .iulFirstOk
-.iulCheckUpper:
-    cp      'A'
-    jr      c, .iulNo
-    cp      'Z' + 1
-    jr      nc, .iulNo
-.iulFirstOk:
-    ; Second char must be ':' to count as a drive letter.
-    ld      a, c
+    ld      a, [hl]                     ; A = second char
+    dec     hl
     cp      ':'
-    ret     z                           ; Z = local
+    ret     z                           ; Z = local (drive-letter form)
 .iulNo:
     or      1
     ret
