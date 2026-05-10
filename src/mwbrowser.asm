@@ -1935,9 +1935,40 @@ ClearContent:
 VdpSetR14Zero:
     xor     a
 VdpSetR14:
+    ; quick_screen_draw / lesson #4: when WritesToPage is set,
+    ; add 2 to the front-page R14 base so VRAM writes land in the
+    ; off-screen page-1 region (R14 = 2 + first/second-half bit).
+    ; Page 0 covers VRAM 0x00000..0x07FFF (R14=0,1); page 1 covers
+    ; 0x08000..0x0FFFF (R14=2,3). After a render to back, a flip
+    ; via VdpSetDisplayPage swaps which page the V9938 actually
+    ; outputs to the screen.
+    push    bc
+    ld      b, a                         ; B = front R14
+    ld      a, [WritesToPage]
+    add     a, a                         ; A = 0 or 2
+    add     a, b                         ; A = front R14 + offset
+    pop     bc
     di
     out     (VDP_CMD), a
     ld      a, 0x80 | 14
+    out     (VDP_CMD), a
+    ei
+    ret
+
+; VdpSetDisplayPage: write R2 to switch which Screen-6 page the V9938
+; sends to the screen. 0 = page 0 (default after CHGMOD 6, R2 = 0x1F),
+; 1 = page 1 (R2 = 0x3F -- bit 5 selects the higher 32 KB region).
+;   A = 0 or 1.
+VdpSetDisplayPage:
+    ld      [DisplayedPage], a
+    or      a
+    ld      a, 0x1F                      ; page 0
+    jr      z, .vsdpHave
+    ld      a, 0x3F                      ; page 1
+.vsdpHave:
+    di
+    out     (VDP_CMD), a
+    ld      a, 0x80 | 2
     out     (VDP_CMD), a
     ei
     ret
@@ -1991,6 +2022,15 @@ VdpWriteR1:
     ret
 
 VdpR1Saved:     db VdpR1Default  ; last R1 value the caller asked for
+; quick_screen_draw / lesson #4 plumbing: a Screen-6 back-buffer in
+; VRAM page 1 lets RefreshAfterScroll render the next viewport off-
+; screen and page-flip when ready, eliminating the "white blank"
+; the user sees during the render. WritesToPage=1 redirects all
+; VdpSetR14-driven writes to page 1's R14 region (offset by +2).
+; DisplayedPage tracks which page the V9938 is currently outputting
+; (0 or 1). FlipDisplayPage toggles them.
+WritesToPage: db 0
+DisplayedPage:    db 0
                                  ; (snapshotted by VdpBlank, restored
                                  ; by VdpUnblank). Initialised to the
                                  ; default so VdpUnblank without a
@@ -13784,11 +13824,9 @@ RefreshAfterScroll:
     ; Scroll-overshoot snap-back: when the extrapolated HtmlLineCount
     ; let PageDown push ScrollLine past the actual document end,
     ; PrintFileContent reaches natural EOF with HtmlLineSkip still
-    ; non-zero (it never drained because there weren't that many
-    ; rendered lines to skip). actual_total = ScrollLine -
-    ; HtmlLineSkip. Latch that into HtmlLineCount so future
-    ; PageDowns clamp correctly, snap ScrollLine to the last full
-    ; viewport, and re-render once.
+    ; non-zero. actual_total = ScrollLine - HtmlLineSkip. Latch that
+    ; into HtmlLineCount, snap ScrollLine to the last full viewport,
+    ; and re-render once.
     ld      hl, [HtmlLineSkip]
     ld      a, h
     or      l
@@ -13797,21 +13835,16 @@ RefreshAfterScroll:
     ld      a, d
     or      e
     ret     z                            ; ScrollLine == 0, doc shorter than viewport
-    ; actual_total = ScrollLine - HtmlLineSkip
-    ex      de, hl                       ; HL = ScrollLine, DE = HtmlLineSkip
+    ex      de, hl
     or      a
     sbc     hl, de
-    ; Underflow guard (paranoia; HtmlLineSkip <= ScrollLine by construction).
     jr      nc, .rasNoUnderflow
     ld      hl, 0
 .rasNoUnderflow:
-    ld      [HtmlLineCount], hl          ; refine count to true value
-    ld      [TotalLines], hl             ; lock thumb math to exact count
+    ld      [HtmlLineCount], hl
+    ld      [TotalLines], hl
     ld      a, 1
-    ld      [HtmlLineCountAccurate], a   ; lock count: ExtrapolateHtmlLineCountIfShort no-ops next time
-    ; new ScrollLine = max(0, actual_total - TEXT_MAX_LINES) -- mirrors
-    ; PageDown's clamp formula so the viewport lands on the last
-    ; full page rather than one row past it.
+    ld      [HtmlLineCountAccurate], a
     ld      de, TEXT_MAX_LINES
     or      a
     sbc     hl, de
