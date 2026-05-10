@@ -167,7 +167,7 @@ URL_MAX        equ 255         ; address-bar / fetch-target buffer cap (chars
                                ; before NUL). Bumped from 95 because real
                                ; mirror.aratab.com URLs run past the 100-char
                                ; line and got truncated on click.
-FILE_BUF_SIZE  equ 0x2200      ; 8.5 KB. Sized so FILEBUF_BASE (0xA000) +
+FILE_BUF_SIZE  equ 0x2100      ; 8.25 KB. Sized so FILEBUF_BASE (0xA100) +
                                ; FILE_BUF_SIZE + FONT_BUF_SIZE + 128 +
                                ; 512 B (FastLutHi+FastLutLo, lesson #1) +
                                ; 2 KB (TransposedFontBuf, lesson #3, see
@@ -2039,22 +2039,38 @@ DrawScrollbar:
     ld      a, COL_DGRAY
     call    DrawRectBorder
 
-    ; Thumb at computed position + size (solid black so it stands out).
-    ; Inset by 1 byte on each side so it sits inside the dark-gray frame
-    ; instead of overlapping it. ComputeThumb must be called whenever
-    ; ScrollLine or TotalLines changes; here we just read the current values.
+    ; Thumb at computed position + size. Solid black on the "settled"
+    ; draw (default); dimmer dark-gray on the "busy" draw, which
+    ; RefreshAfterScroll uses to cue the user that we're mid-paint
+    ; and unresponsive to keys for ~the next render. Toggling the
+    ; thumb tint instead of suppressing the redraw keeps the thumb
+    ; tracking ScrollLine on every key press.
     ld      a, [ThumbTop]
     ld      c, a
     ld      a, [ThumbHeight]
     ld      e, a
     ld      b, SCROLL_X0 / 4 + 1
     ld      d, (SCROLL_X1 - SCROLL_X0 + 1) / 4 - 3
+    ld      a, [ThumbBusy]
+    or      a
+    jr      z, .thumbColorBlack
+    ld      a, COL_DGRAY
+    jr      .thumbFill
+.thumbColorBlack:
     ld      a, COL_BLACK
+.thumbFill:
     call    FillRect
 
-    ; Shave 1 MSX pixel off the right side of the thumb: the byte adjacent
-    ; to the 2-byte solid block gets pattern 11_11_11_01 = 0xFD (3 pixels
-    ; black, 1 pixel LGRAY on the right).
+    ; Shave 1 MSX pixel off the right side of the thumb. Cap byte:
+    ; settled (black) thumb -> 11_11_11_01 = 0xFD (3 black + 1 lgray);
+    ; busy (dark-gray) thumb -> 00_00_00_01 = 0x01 (3 dgray + 1 lgray).
+    ld      a, [ThumbBusy]
+    or      a
+    ld      a, 0xFD                         ; default (settled)
+    jr      z, .thumbCapReady
+    ld      a, 0x01                         ; busy variant
+.thumbCapReady:
+    ld      [ThumbCapByte], a
     ld      a, [ThumbTop]
     ld      c, a
     ld      a, [ThumbHeight]
@@ -2064,7 +2080,7 @@ DrawScrollbar:
     push    de
     ld      b, SCROLL_X0 / 4 + 3
     call    SetVramWritePos
-    ld      a, 0xFD
+    ld      a, [ThumbCapByte]
     out     (VDP_DATA), a
     pop     de
     pop     bc
@@ -13750,17 +13766,19 @@ HistoryUpdateFlags:
 ; ahead of the slower content repaint and the user sees their scroll
 ; acknowledged immediately), then redraw the content area itself.
 RefreshAfterScroll:
+    ; First thumb draw: paint dark-gray to signal "busy, paging now,
+    ; ignore keys" before the long PrintFileContent run.
+    ld      a, 1
+    ld      [ThumbBusy], a
     call    ComputeThumb
     call    DrawScrollbar
     call    ClearContentArea            ; also drops InPlaceRender
     call    PrintFileContent
-    ; Re-paint the scroll thumb now that the render's
-    ; ExtrapolateHtmlLineCountIfShort has updated TotalLines (the
-    ; thumb denominator) -- without this second pass the thumb only
-    ; reflects the OLD TotalLines from the previous render and stays
-    ; pinned at the top until something else triggers a thumb redraw.
-    ; Flags don't survive through PrintFileContent's tail-jump anyway,
-    ; so no need to preserve them here.
+    ; Settled draw: black thumb. Also re-runs ComputeThumb in case
+    ; the render updated TotalLines (the thumb denominator), so the
+    ; final position+size matches the now-fresh state.
+    xor     a
+    ld      [ThumbBusy], a
     call    ComputeThumb
     call    DrawScrollbar
     ; Scroll-overshoot snap-back: when the extrapolated HtmlLineCount
@@ -17500,6 +17518,13 @@ ScrollLine:     dw 0                    ; first visible line (0 = top of file)
 TotalLines:     dw 0                    ; rendered line count for thumb math
 ThumbTop:       db THUMB_Y0             ; current thumb top y (set by ComputeThumb)
 ThumbHeight:    db THUMB_Y1 - THUMB_Y0 + 1
+; quick_screen_draw: paint the thumb dark-gray on the FIRST DrawScrollbar
+; in RefreshAfterScroll (the moment the user pressed Space) and black
+; again on the SECOND one (after PrintFileContent finishes). Visually
+; cues the user that the app is busy paging and is going to ignore
+; keys until the new viewport lands.
+ThumbBusy:      db 0
+ThumbCapByte:   db 0xFD                 ; written per draw based on ThumbBusy
 AboutOpen:      db 0                    ; 1 while the Help popup is on screen
 ShowImages:     db 1                    ; 0 = strip <img> on render and skip
                                         ; remote img fetches; 1 = render
