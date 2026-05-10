@@ -167,7 +167,7 @@ URL_MAX        equ 255         ; address-bar / fetch-target buffer cap (chars
                                ; before NUL). Bumped from 95 because real
                                ; mirror.aratab.com URLs run past the 100-char
                                ; line and got truncated on click.
-FILE_BUF_SIZE  equ 0x2400      ; 9 KB. Sized so FILEBUF_BASE (0x9E00) +
+FILE_BUF_SIZE  equ 0x2300      ; 8.75 KB. Sized so FILEBUF_BASE (0x9F00) +
                                ; FILE_BUF_SIZE + FONT_BUF_SIZE + 128 +
                                ; 512 B (FastLutHi+FastLutLo, lesson #1) +
                                ; 2 KB (TransposedFontBuf, lesson #3, see
@@ -2076,6 +2076,103 @@ DrawScrollbar:
     call    DrawUpArrow
     jp      DrawDownArrow
 
+; ExtrapolateHtmlLineCountIfShort: when PrintFileContent bailed via the
+; viewport-full short-circuit (parser cursor < FileBuf + WindowLen),
+; multiply HtmlLineCount by the smallest power of 2 K such that
+; consumed << K >= WindowLen. K is at most 8, so the new count is a
+; 1..256x scale of what's been parsed so far.
+;
+; Power-of-2 scaling intentionally over-estimates a little (typical
+; 1.3x..2x over the true total) so the user can keep PageDown'ing
+; past the viewport-full break before the parser runs the rest of
+; the doc. PageDown re-renders from the new ScrollLine; the parser
+; then walks further and refines HtmlLineCount upward each time.
+;
+; No-op when:
+; * consumed == WindowLen (parser already finished naturally)
+; * HtmlLineCountAccurate flag set (a previous render already walked
+;   to EOF and locked the count to the exact value -- re-extrapolating
+;   would create jitter as PageDown / snap-back keep undoing each
+;   other's work).
+ExtrapolateHtmlLineCountIfShort:
+    ld      a, [HtmlLineCountAccurate]
+    or      a
+    ret     nz                           ; already exact -> never extrapolate
+    ld      hl, [ParserCursor]
+    ld      de, FileBuf
+    or      a
+    sbc     hl, de                       ; HL = consumed
+    ld      a, h
+    or      l
+    ret     z                            ; nothing consumed -> bail
+    ld      de, [WindowLen]
+    or      a
+    sbc     hl, de
+    jr      c, .eaShortNeed
+    ; consumed >= WindowLen: parser walked the whole doc, count is
+    ; now exact. Latch the flag so future renders skip extrapolation.
+    ld      a, 1
+    ld      [HtmlLineCountAccurate], a
+    ret
+.eaShortNeed:
+    ; Linear extrapolation: estimated = HtmlLineCount * total / consumed.
+    ; Both total and consumed are <= FILE_BUF_SIZE (~9 KB), well under
+    ; 16 bits. We scale both by the same right-shift amount until the
+    ; denominator fits in 8 bits, then run DivU16By8 to get the ratio,
+    ; then multiply HtmlLineCount by it (saturating at 0xFFFF).
+    ; This is much more accurate than the power-of-2 approximation
+    ; we used to use, which systematically over-estimated by up to
+    ; 2x and forced PageDown to overshoot + snap-back / re-render.
+    ld      hl, [ParserCursor]
+    ld      de, FileBuf
+    or      a
+    sbc     hl, de                       ; HL = consumed
+    ld      de, [WindowLen]              ; DE = total
+.eaScaleDown:
+    ld      a, h
+    or      a
+    jr      z, .eaScaled                 ; consumed already 8-bit
+    srl     h                            ; consumed >>= 1
+    rr      l
+    srl     d                            ; total >>= 1
+    rr      e
+    jr      .eaScaleDown
+.eaScaled:
+    ; HL = scaled consumed (low byte = L), DE = scaled total.
+    ld      c, l
+    or      a
+    ret     z                            ; consumed underflowed to 0 -> bail
+    ; Compute ratio = DE / C using DivU16By8 (HL gets DE, returns
+    ; quotient in HL).
+    ld      h, d
+    ld      l, e
+    call    DivU16By8                    ; HL = ratio (typically 1..32), A = remainder
+    ; Multiply HtmlLineCount by HL (the ratio). Result must fit in
+    ; 16-bit; saturate at 0xFFFF on overflow.
+    ld      a, h
+    or      a
+    jr      nz, .eaSat                   ; ratio > 255 -> blow up; saturate
+    ld      a, l                         ; A = ratio (8-bit)
+    or      a
+    jr      z, .eaSat                    ; ratio = 0 (can't happen since total > consumed) -> safe
+    cp      1
+    ret     z                            ; ratio = 1 -> count already fits
+    ld      b, a                         ; B = ratio multiplier
+    ld      hl, [HtmlLineCount]
+    ld      d, h
+    ld      e, l                         ; DE = original count
+    ld      hl, 0
+.eaMulLoop:
+    add     hl, de
+    jr      c, .eaSat
+    djnz    .eaMulLoop
+    ld      [HtmlLineCount], hl
+    ret
+.eaSat:
+    ld      hl, 0xFFFF
+    ld      [HtmlLineCount], hl
+    ret
+
 ; CountTotalLines: walk FileBuf[0..WindowLen-1] counting LF bytes; stores into
 ; TotalLines (saturated at 255). Called after every successful load so the
 ; thumb math has a fresh denominator.
@@ -3259,6 +3356,11 @@ ResetFcbTail:
     ret
 
 LoadFile:
+    ; New file -> the previous "HtmlLineCount is exact" knowledge is
+    ; stale; clear the lock so the upcoming initial render's
+    ; ExtrapolateHtmlLineCountIfShort can fire normally.
+    xor     a
+    ld      [HtmlLineCountAccurate], a
     ; URL shape routes the load:
     ;   "view:<path>"   -> hybrid bitmap pipeline (RemoteLoadView).
     ;                      The bridge renders the page as a Screen-6
@@ -3776,6 +3878,16 @@ PrintFileContent:
     ; bump on top of the existing per-byte HtmlEnd compare.
     ld      [ParserCursor], hl
 
+    ; Spinner heartbeat: keeps the toolbar's Refresh/X glyph rotating
+    ; (X / | / - / \) during long parses so the user can see the
+    ; program is working rather than hung. BusyHeartbeat preserves
+    ; all caller registers (so no push/pop wrap needed) and throttles
+    ; itself (acts every 256 calls, no-op the rest of the time). Cost
+    ; on the hot path is ~28 T per byte parsed (call/ret + push af /
+    ; pop af + the throttle counter); negligible compared to the
+    ; tag dispatch + glyph emit downstream.
+    call    BusyHeartbeat
+
     ; Viewport-full short-circuit. Once HtmlLineSkip has drained (0) and
     ; the Y cursor has painted past the bottom of the content area,
     ; nothing we parse from here on can appear on screen. Bailing out
@@ -3784,16 +3896,14 @@ PrintFileContent:
     ; WEBSITE.HTM wrapper emitted by tools/web_to_sc6.py). Without
     ; this, every PageDown re-opens and drains all trailing images.
     ;
-    ; Only safe to fire on scrolled renders (ScrollLine != 0). The
-    ; initial-load pass needs to walk to EOF so HtmlLineCount reflects
-    ; the true document height -- the caller latches it into
-    ; TotalLines straight after this routine returns, and a short
-    ; count would clamp PageDown before the user reaches the end.
-    ld      a, [ScrollLine]
-    ld      b, a
-    ld      a, [ScrollLine + 1]
-    or      b
-    jr      z, .loopNotFull
+    ; Initial pass (ScrollLine == 0) used to be exempt because
+    ; HtmlLineCount drove the scroll-thumb math and PageDown's clamp;
+    ; a short count made the user feel like the doc ended at the
+    ; first viewport. We now ExtrapolateHtmlLineCount at .eof when
+    ; we short-circuit, so the initial pass also bails the moment
+    ; the viewport is full -- giving the user back keyboard control
+    ; immediately after first paint instead of holding it for the
+    ; many seconds it takes to walk a 30 KB doc to EOF.
     ld      a, [HtmlLineSkip]
     ld      b, a
     ld      a, [HtmlLineSkip + 1]
@@ -3843,6 +3953,12 @@ PrintFileContent:
     call    ArFlush
     call    LineFlush
     call    FormEndRender               ; flip FormSticky on
+    ; If we hit .eof via the viewport-full short-circuit (parser
+    ; didn't consume the whole window), extrapolate HtmlLineCount so
+    ; the scroll thumb sizes against the full document and PageDown
+    ; isn't clamped to one viewport. Walks past the end refine the
+    ; count on subsequent renders.
+    call    ExtrapolateHtmlLineCountIfShort
     ld      a, 5
     ld      [LoadPhase], a              ; phase 5: parser hit EOF (render done)
   IFDEF BENCH
@@ -13274,7 +13390,45 @@ RefreshAfterScroll:
     call    ComputeThumb
     call    DrawScrollbar
     call    ClearContentArea            ; also drops InPlaceRender
-    jp      PrintFileContent
+    call    PrintFileContent
+    ; Scroll-overshoot snap-back: when the extrapolated HtmlLineCount
+    ; let PageDown push ScrollLine past the actual document end,
+    ; PrintFileContent reaches natural EOF with HtmlLineSkip still
+    ; non-zero (it never drained because there weren't that many
+    ; rendered lines to skip). actual_total = ScrollLine -
+    ; HtmlLineSkip. Latch that into HtmlLineCount so future
+    ; PageDowns clamp correctly, snap ScrollLine to the last full
+    ; viewport, and re-render once.
+    ld      hl, [HtmlLineSkip]
+    ld      a, h
+    or      l
+    ret     z                            ; viewport filled normally
+    ld      de, [ScrollLine]
+    ld      a, d
+    or      e
+    ret     z                            ; ScrollLine == 0, doc shorter than viewport
+    ; actual_total = ScrollLine - HtmlLineSkip
+    ex      de, hl                       ; HL = ScrollLine, DE = HtmlLineSkip
+    or      a
+    sbc     hl, de
+    ; Underflow guard (paranoia; HtmlLineSkip <= ScrollLine by construction).
+    jr      nc, .rasNoUnderflow
+    ld      hl, 0
+.rasNoUnderflow:
+    ld      [HtmlLineCount], hl          ; refine count to true value
+    ld      a, 1
+    ld      [HtmlLineCountAccurate], a   ; lock count: ExtrapolateHtmlLineCountIfShort no-ops next time
+    ; new ScrollLine = max(0, actual_total - TEXT_MAX_LINES) -- mirrors
+    ; PageDown's clamp formula so the viewport lands on the last
+    ; full page rather than one row past it.
+    ld      de, TEXT_MAX_LINES
+    or      a
+    sbc     hl, de
+    jr      nc, .rasStore
+    ld      hl, 0
+.rasStore:
+    ld      [ScrollLine], hl
+    jp      RefreshAfterScroll          ; one-shot re-render with fixed ScrollLine
 
 ; RefreshContentInPlace: re-paint the content area WITHOUT clearing it
 ; first. Used by typing / form-state edits where the layout doesn't
@@ -15134,6 +15288,12 @@ SerialWrite:    ; send byte in A; bounded poll for TxRDY so a stuck
 ; ---------------------------------------------------------------------------
 BusyHeartbeat:
     push    af
+    ; Only animate when caller is actually loading. PrintFileContent
+    ; calls us per parsed byte even on idle re-renders (scroll); we
+    ; must NOT overpaint the toolbar's Refresh icon at those times.
+    ld      a, [Busy]
+    or      a
+    jr      z, .bhBail
     ld      a, [BusyTick]
     inc     a
     ld      [BusyTick], a
@@ -15180,6 +15340,7 @@ BusyHeartbeat:
     pop     de
     pop     bc
 .bhDone:
+.bhBail:
     pop     af
     ret
 
@@ -16978,6 +17139,16 @@ HtmlTitleSeen:  db 0                    ; 1 once <title>..</title> has resolved
 HtmlTitleLen:   db 0                    ; bytes stored in HtmlTitleBuf
 HtmlLineSkip:   dw 0                    ; rendered lines still to skip (scroll)
 HtmlLineCount:  dw 0                    ; total rendered lines (for thumb math)
+; quick_screen_draw / lesson #3 follow-up: set to 1 once a render run
+; has walked to natural EOF (consumed == WindowLen at .eof) so we
+; know HtmlLineCount holds the exact rendered line count of the
+; window. ExtrapolateHtmlLineCountIfShort + the snap-back path read
+; this to avoid re-inflating an already-exact count -- without it,
+; every viewport-full short-circuit would re-extrapolate, fighting
+; the snap-back's correction and causing PageDown/PageUp jitter.
+; Cleared on a fresh file load so a window slide / new doc starts
+; the estimate cycle over.
+HtmlLineCountAccurate: db 0
 HtmlScaleY:     db 1                    ; 1 = normal glyph height, 2 = H1/H2
 HtmlInAnchor:   db 0                    ; 1 while inside an <a>..</a>
 HtmlFocusLink:  db 0xFF                 ; index of Tab-focused link (0xFF = none)
