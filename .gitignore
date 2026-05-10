@@ -38,3 +38,18 @@
 !BITMAP_PIPELINE_DESIGN.md
 
 !samples/AUTOEXEC.BAT
+
+# quick_screen_draw branch: zero-latency Screen-6 research samples
+# (extracted, patched, assembled with sjasmplus) + the LESSONS write-up
+# that captures which design ideas are worth porting to MWBrowser.
+!research/
+!research/zero-latency screen6/
+!research/zero-latency screen6/MSX2 Assembly Fast Screen Display.md
+!research/zero-latency screen6/SHOWTXT.ASM.txt
+!research/zero-latency screen6/LESSONS.md
+!research/zero-latency screen6/build/
+!research/zero-latency screen6/build/showtxt.asm
+!research/zero-latency screen6/build/zlk.asm
+!research/zero-latency screen6/build/SOME.TXT
+!tools/shot_zlss.tcl
+!tools/shot_zlk.tcl

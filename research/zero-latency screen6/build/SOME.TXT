@@ -1,0 +1,20 @@
+ZERO-LATENCY SCREEN 6 EXPERIMENT
+================================
+
+This file is rendered by SHOWTXT.COM and ZLK.COM.
+
+The premise:
+- SHOWTXT renders text into an off-screen RAM bitmap, then
+  blits the whole bitmap to VRAM via LDIRVM (one BIOS call).
+- ZLK additionally blanks the display via VDP R1 BL=0 to free
+  the VRAM bus, transposes the font, builds bifurcated LUTs,
+  and streams pixels in tight OUT (C),A loops.
+
+Observations to compare with MWBrowser:
+1. RAM bitmap composition decouples parsing from rendering.
+2. Display blanking removes VDP wait states.
+3. Page-aligned LUTs (LUT_HI=0x8000, LUT_LO=0x8100) and a
+   transposed font collapse glyph emission to ~99 T-states
+   per character.
+
+If this manifests instantly, the lessons port directly.
