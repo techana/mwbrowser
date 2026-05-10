@@ -1897,6 +1897,14 @@ ClearContent:
     call    PackColour
     ld      [PackedColour], a
 
+    ; Blank the display so the VDP arbiter hands 100 % of VRAM
+    ; bandwidth to the Z80 for the 27 KB fill. The screen flashes
+    ; black only briefly (~200 ms total) and the saving is real --
+    ; VdpFill at 24 T/byte vs ~64 T/byte under active-raster wait
+    ; states (~2.7x). See lesson #2 in research/zero-latency
+    ; screen6/LESSONS.md.
+    call    VdpBlank
+
     ; Screen 6's visible 212 lines × 128 bytes = 27 136 bytes = 0x6A00
     ; sit at VRAM 0x00000..0x06A00. The first 16 KB (rows 0..127) live
     ; in R14=0's window (A14..A16=000 -> 0x00000..0x03FFF); the trailing
@@ -1918,7 +1926,8 @@ ClearContent:
     ld      a, [PackedColour]
     call    VdpFill
 
-    jp      VdpSetR14Zero
+    call    VdpSetR14Zero
+    jp      VdpUnblank
 
 VdpSetR14Zero:
     xor     a
@@ -1929,6 +1938,61 @@ VdpSetR14:
     out     (VDP_CMD), a
     ei
     ret
+
+; quick_screen_draw / lesson #2: VdpBlank / VdpUnblank toggle R1 BL
+; (bit 6, "display on/off"). With BL=0 the V9938 stops fetching
+; pattern + colour data from VRAM so 100 % of memory cycles are
+; handed to the Z80; OUT (VDP_DATA),a no longer pays a wait-state
+; tax during active raster. The screen flashes black for the
+; duration of the wrapped burst, so we only blank around the bulk
+; transfers (ClearContent's 27 KB fill, RenderSc6File's image
+; stream, RenderRemoteBitmap's serial->VRAM stream) -- not around
+; per-cell glyph emits where the flash would be visible to the
+; user.
+;
+; R1 layout (V9938): bit 7=0, bit 6=BL, bit 5=IE0(vblank IRQ),
+; bit 4=IE1, bits 3..2 = mode (M1/M2), bit 1=0, bit 0=SI(sprite).
+;
+; The serial path already toggles R1 via SerialMaskVblank /
+; SerialUnmaskVblank (clears IE0 around bursts to keep vblank IRQs
+; from glitching the i8251 poll). To compose cleanly with that, the
+; blank pair *snapshots* whatever R1 held on entry into VdpR1Saved,
+; clears just the BL bit, and restores the snapshot on Unblank.
+; Net result: bracketing a block with VdpBlank / VdpUnblank is
+; transparent to whatever IE0 / IE1 / SI state the caller chose.
+VdpR1Default       equ 0xE0     ; cold-start fallback when nothing
+                                ; has written R1 yet (matches
+                                ; SerialR1Value's "BIOS shadow gives
+                                ; 0x60, 0xE0 renders cleanly" note)
+VdpBlank:
+    ld      a, [VdpR1Saved]
+    or      a
+    jr      nz, .vbHave
+    ld      a, VdpR1Default
+.vbHave:
+    ld      [VdpR1Saved], a
+    and     ~0x40                ; clear BL
+    jr      VdpWriteR1
+VdpUnblank:
+    ld      a, [VdpR1Saved]
+    or      a
+    jr      nz, .vuHave
+    ld      a, VdpR1Default
+.vuHave:
+VdpWriteR1:
+    di
+    out     (VDP_CMD), a
+    ld      a, 0x80 | 1
+    out     (VDP_CMD), a
+    ei
+    ret
+
+VdpR1Saved:     db VdpR1Default  ; last R1 value the caller asked for
+                                 ; (snapshotted by VdpBlank, restored
+                                 ; by VdpUnblank). Initialised to the
+                                 ; default so VdpUnblank without a
+                                 ; matching VdpBlank still leaves a
+                                 ; sane R1.
 
 ; ============================================================================
 ; High-level GUI painting
@@ -8037,6 +8101,13 @@ RenderSc6File:
     call    ImgStreamOpenName
     jp      c, .rsfOpenFail             ; file not found -> let caller fallback
 
+    ; Lesson #2: blank the display for the duration of the bulk
+    ; pixel transfer so the V9938 arbiter doesn't steal VRAM cycles.
+    ; All exit paths below jump to .rsfDone or .rsfNoTy -- both are
+    ; routed through the .rsfFinish epilogue that re-enables the
+    ; display. (.rsfOpenFail can't reach here.)
+    call    VdpBlank
+
     ; Commit any pending text line now so both the fast-path and the
     ; streaming decoder start at a clean Y cursor. LineFlush is also
     ; what deducts the line's height from HtmlLineSkip on scrolled
@@ -8108,6 +8179,7 @@ RenderSc6File:
 .rsfFastLC:
     ld      [HtmlLineCount], hl
     call    ImgStreamClose
+    call    VdpUnblank                  ; balance VdpBlank at entry
     scf                                 ; image "handled"
     ret
 
@@ -8224,6 +8296,7 @@ RenderSc6File:
 .rsfTyOk:
     ld      [TextY], a
 .rsfNoTy:
+    call    VdpUnblank                  ; balance VdpBlank at entry
     scf                                 ; CF=1 -> image was handled
     ret
 
@@ -14625,6 +14698,12 @@ SerialMaskVblank:
 SerialUnmaskVblank:
     ld      a, SerialR1Value
 SerialWriteR1:
+    ; Mirror the value into VdpR1Saved so that any subsequent
+    ; VdpBlank / VdpUnblank pair (e.g. inside RenderRemoteBitmap)
+    ; restores THIS R1 state on Unblank, not the cold default. Without
+    ; this, blanking inside a SerialMaskVblank section would silently
+    ; flip IE0 back on and re-arm the vblank IRQ during the burst.
+    ld      [VdpR1Saved], a
     di
     out     (VDP_CMD), a
     ld      a, 0x80 | 1
@@ -15573,6 +15652,12 @@ RemoteLoadView:
 ; pixels that arrived before the timeout are visible; the rest of
 ; the viewport keeps whatever was there before).
 RenderRemoteBitmap:
+    ; Lesson #2: blank the display for the bulk serial -> VRAM
+    ; transfer. The serial wait alone dominates wall time at lower
+    ; baud rates so the saving here is smaller than for ClearContent
+    ; / RenderSc6File, but the wrap costs only 11 bytes and removes
+    ; one source of variability in the bench numbers.
+    call    VdpBlank
     ; Phase 1: rows 29..127 in R14=0. 99 rows * 128 = 12672 bytes.
     ld      b, 0
     ld      c, CONTENT_Y0                ; row 29
@@ -15610,9 +15695,11 @@ RenderRemoteBitmap:
     jr      .rrbPhase2Loop
 
 .rrbDone:
+    call    VdpUnblank                   ; balance VdpBlank at entry
     xor     a
     ret
 .rrbFail:
+    call    VdpUnblank                   ; balance even on partial paint
     or      1
     ret
 
