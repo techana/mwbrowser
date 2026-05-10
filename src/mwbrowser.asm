@@ -4124,21 +4124,23 @@ PrintFileContent:
     ld      a, [HtmlLineSkip + 1]
     or      b
     jr      nz, .loopNotFull             ; still skipping
-    ld      a, [TextY]
-    cp      CONTENT_Y1 + 1
-    jr      c, .loopNotFull              ; viewport not full yet
-    ; Viewport full.
+    ; "Viewport full" trigger: HtmlNoDraw is set by EmitNewline as
+    ; soon as it can't advance TextY past the content area
+    ; (TEXT_LINE_H of pitch wouldn't fit). That's the actual signal
+    ; we want -- TextY is capped at CONTENT_Y1 - row_partial below
+    ; CONTENT_Y1+1, so a bare `cp CONTENT_Y1 + 1` check would never
+    ; fire for the typical 22-line viewport.
+    ld      a, [HtmlNoDraw]
+    or      a
+    jr      z, .loopNotFull              ; viewport not full yet
+    ; Viewport full -- on a scrolled render bail straight to .eof,
+    ; on the initial pass keep walking so HtmlLineCount finishes
+    ; tallying via image fast-account / EmitNewline counters.
     ld      a, [ScrollLine]
     ld      b, a
     ld      a, [ScrollLine + 1]
     or      b
-    jp      nz, .eof                     ; scrolled: short-circuit
-    ; Initial pass: switch to count-only mode if not already.
-    ld      a, [HtmlNoDraw]
-    or      a
-    jr      nz, .loopNotFull             ; already counting; just keep walking
-    ld      a, 1
-    ld      [HtmlNoDraw], a
+    jp      nz, .eof
 .loopNotFull:
     ; End-of-buffer check.
     push    hl
@@ -6008,10 +6010,20 @@ EmitNewline:
 .advNoWidget:
     ld      a, [TextY]
     add     a, b                        ; A = proposed new TextY
-    jr      c, .flagsDone               ; wrapped past 255 -> page full
+    jr      c, .flagsCantFit            ; wrapped past 255 -> page full
     cp      CONTENT_Y1 + 1
-    jr      nc, .flagsDone              ; new line wouldn't fit -> stop
+    jr      nc, .flagsCantFit           ; new line wouldn't fit -> stop
     ld      [TextY], a
+    jr      .flagsDone
+
+.flagsCantFit:
+    ; quick_screen_draw / lesson #4: the proposed new TextY would
+    ; overflow the content area, so we couldn't advance. Set
+    ; HtmlNoDraw so subsequent renders (LineFlush, image fast-
+    ; account in RenderSc6File / RenderPcxFile) know to stop
+    ; emitting pixels but keep counting lines for HtmlLineCount.
+    ld      a, 1
+    ld      [HtmlNoDraw], a
 
 .flagsDone:
     ld      a, 2
@@ -13556,6 +13568,7 @@ NavigateToCurrentUrl:
     ; the X cell might re-paint mid-cycle and look stuttery.
     xor     a
     ld      [BusyTick], a
+    ld      [BusyPhase], a
     ld      a, 'X'
     ld      [BusyChar], a
     call    PaintToolbar
@@ -13627,7 +13640,21 @@ NavigateToCurrentUrl:
     call    DrawString
     call    ComputeThumb
     call    DrawScrollbar
+    ; Enable Back when there's a history entry to return to. Without
+    ; this the toolbar's Back button stays dimmed after a 404, even
+    ; though GoBack's .backFrom404 path has the logic to reload the
+    ; last real page. (The successful-load path above already calls
+    ; HistoryUpdateFlags after HistoryPush; the err path was missing
+    ; the equivalent and HasPrev stayed at 0.)
+    ld      a, [HistoryCount]
+    or      a
+    ld      a, 0
+    jr      z, .errNoBack
+    ld      a, 2
+.errNoBack:
+    ld      [HasPrev], a
     xor     a
+    ld      [HasNext], a
     ld      [Busy], a
     jp      PaintToolbar
 
@@ -15766,11 +15793,14 @@ BusyHeartbeat:
     push    bc
     push    de
     push    hl
-    ; phase = (BusyTick >> 6) & 3, indexes BusySpinner.
-    ld      a, [BusyTick]
-    rlca
-    rlca
+    ; Advance BusyPhase 0..3 cycle each time BusyTick wraps. (The
+    ; original code read phase from BusyTick post-wrap, which is
+    ; always 0 -- so the spinner sat on '|' forever instead of
+    ; rotating |/-\.)
+    ld      a, [BusyPhase]
+    inc     a
     and     0x03
+    ld      [BusyPhase], a
     ld      e, a
     ld      d, 0
     ld      hl, BusySpinner
@@ -15822,6 +15852,7 @@ IsStopDown:
     ret
 
 BusyTick:       db 0
+BusyPhase:      db 0                    ; spinner phase 0..3 (|/-\)
 BusyChar:       db 'X', 0               ; live char (single byte + NUL term)
 BusySpinner:    db '|', '/', '-', '\\'
 UserCancel:     db 0                    ; latched 1 by BusyHeartbeat when STOP
