@@ -15265,12 +15265,15 @@ DrawTitleLabel:
     ld      hl, TitleSuffix
     call    DrawString
 
-    ; Home button: "[]" placed left of "?" as a button-frame placeholder
-    ; for the upcoming bridge-root shortcut. Two glyphs = 16 px, so the
-    ; left edge sits at WIDTH-40 (the ? cell starts at WIDTH-24).
-    ld      de, WIDTH - 40
+    ; Save-page button: "[]" placeholder, 8 px gap before the "?" so
+    ; the cluster reads as three distinct glyphs ("[]", "?", "X"). The
+    ; popup + click wiring is parked until the boot-on-growth bug that
+    ; trips when this file gains ~60 BSS bytes is diagnosed (see the
+    ; session notes for details). The button paints but nothing's
+    ; clickable yet.
+    ld      de, WIDTH - 48
     ld      c, 1
-    ld      hl, CharHomeBtn
+    ld      hl, CharSaveBtn
     call    DrawString
 
     ; "?" button (About popup; shortcut F1). Placed left of the X.
@@ -17158,7 +17161,7 @@ CharGreater:    db ">", 0
 CharX:          db "X", 0
 CharLowerX:     db "x", 0
 CharHelp:       db "?", 0
-CharHomeBtn:    db "[]", 0          ; titlebar bridge-root shortcut placeholder
+CharSaveBtn:    db "[]", 0          ; titlebar save-page placeholder
 UrlInit:        db 0                    ; address bar starts empty
 
 AboutTitleMsg:  db "Help", 0
