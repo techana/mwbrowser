@@ -3643,6 +3643,21 @@ LoadFileChunk:
     jr      nz, .lfcDone                ; EOF / error -> stop reading
     ld      de, 128
     add     hl, de
+    ; Spinner heartbeat. BusyHeartbeat throttles its phase advance
+    ; to "every 256 calls" (per-byte parser cadence); on the disk
+    ; load path that's only ~40 records for a typical 5 KB file --
+    ; not enough to cross the threshold once. Pre-bump BusyTick by
+    ; 32 per record so the cumulative count crosses 256 every ~8
+    ; records, giving the user 5+ visible spinner phases during the
+    ; load.
+    push    bc
+    push    hl
+    ld      a, [BusyTick]
+    add     a, 32
+    ld      [BusyTick], a
+    call    BusyHeartbeat
+    pop     hl
+    pop     bc
     dec     bc
     ld      a, b
     or      c
@@ -8877,6 +8892,16 @@ RenderSc6File:
     ; without this branch every off-screen <img> on page 1 would
     ; drain its full file just to tally rows.
 .rsfCheckBelow:
+    ; quick_screen_draw / count-only mode: when HtmlNoDraw is set
+    ; the parser is past viewport-full and walking the doc just to
+    ; populate HtmlLineCount. Force fast-account in that mode --
+    ; otherwise each subsequent off-screen image falls into the slow
+    ; .rsfHeader path which streams ~5 KB of pixels from disk PER
+    ; IMAGE just to count its rows. On benchim with 7 images that's
+    ; 7 disk-bound seconds before PageDown becomes responsive.
+    ld      a, [HtmlNoDraw]
+    or      a
+    jr      nz, .rsfFastAccount
     ld      a, [TextY]
     cp      CONTENT_Y1 + 1
     jr      c, .rsfHeader               ; viewport not full yet -> draw normally
@@ -9151,11 +9176,20 @@ RenderPcxFile:
     jr      .pcxFastAccount
 
 .pcxCheckBelow:
-    ; Case B skipped: the below-fold fast-path occasionally reads
-    ; stale ImgBuf bytes over the serial transport and feeds a huge
-    ; image_lines into HtmlLineCount; the scroll thumb then overflows
-    ; the track and paints black into titlebar VRAM. Slow-drain
-    ; below-fold images via the normal PCX loop instead.
+    ; quick_screen_draw / count-only mode: when HtmlNoDraw is set
+    ; (parser past viewport-full on the initial pass, just walking
+    ; to populate HtmlLineCount), force fast-account. Without this
+    ; every off-screen PCX on benchim.htm streamed its full RLE
+    ; body from disk just to tally rows -- ~5 seconds per image,
+    ; so the user's first PageDowns saw a stale (low) HtmlLineCount
+    ; until the parser finally caught up. Local-disk PCX bytes are
+    ; trustworthy in count-only mode (the "stale ImgBuf over serial"
+    ; concern that originally killed Case B applies to remote
+    ; sessions only).
+    ld      a, [HtmlNoDraw]
+    or      a
+    jr      nz, .pcxFastAccount
+    ; Case B otherwise still skipped for the reasons noted above.
     jr      .pcxNoFast
 
 .pcxFastAccount:
