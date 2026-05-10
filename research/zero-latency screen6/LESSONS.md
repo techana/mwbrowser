@@ -165,6 +165,144 @@ should ship first.
   — fine for the toy but we already use FCB record-size=1 throughout
   MWBrowser; nothing new.
 
+## Lesson #1 spike — concrete plan
+
+The current inner emit lives in `src/mwbrowser.asm`:
+
+| What | Where | T-states / row |
+|------|-------|----------------|
+| `DrawCharFast` row loop | line 2712 (`.rowLoop`) | scaffold |
+| Style mux (bold/italic/strike/underline) | lines 2718–2790 | ~80 T |
+| `EmitStyledByte` (nibble→VRAM ×2) | line 2824 | ~135 T |
+| **Per row total** | | **~215 T** |
+| Per glyph (×8 rows + VRAM addr setup) | | **~2300 T** |
+
+Bifurcated-LUT inner emit (style-flags == 0 fast path):
+
+```asm
+; Pre-condition: HL = font byte address (FastFontPtr)
+;                C  = VDP_DATA port (0x98) (held in C' alternate)
+;                B  = HIGH(FastLutHi) (held in B' alternate)
+.fastEmit:
+    ld   a, (hl)           ; 7   font byte
+    inc  hl                ; 6
+    exx                    ; 4   to alt regs (B'=page, C'=port)
+    ld   l, a              ; 4   index = font byte
+    ld   h, b              ; 4   page = FastLutHi
+    ld   a, (hl)           ; 7   high VRAM byte
+    out  (c), a            ; 12  -> VDP
+    inc  h                 ; 4   page = FastLutLo (= FastLutHi+1)
+    ld   a, (hl)           ; 7   low VRAM byte
+    out  (c), a            ; 12  -> VDP
+    exx                    ; 4   restore primary
+; Total = 71 T per row vs ~135 for EmitStyledByte (-47%).
+```
+
+This saves ~64 T per row × 8 rows = **~500 T per glyph**. On a 64-char
+viewport row that's 32K T = ~9 ms. Per full viewport (24 rows) =
+~216 ms saved on a re-render that today takes ~8 s on `BENCHTX`.
+Modest as a percentage but compounds with lessons #2 and #4.
+
+**RAM-budget gotcha:** the LUT pair needs 512 bytes at a 256-byte
+page boundary. Current memory map (`src/mwbrowser.asm` line 16866)
+puts:
+- `FileBuf` at `FILEBUF_BASE` (~0x9D00)
+- `FontBuf` at FileBuf + `FILE_BUF_SIZE` (0x2F00) → ~0xCC00
+- `ImgBuf` at FontBuf + 0x800 → ~0xD400
+- `ImgBuf + 128` ASSERTed ≤ 0xD500
+
+That leaves only ~128 bytes of headroom — not enough for the 512-byte
+LUT pair. The clean fix is to **shrink `FILE_BUF_SIZE` from 0x2F00
+to 0x2D00** (~512 bytes), placing `FastLutHi` / `FastLutLo` at the
+freed page-aligned region just above `ImgBuf`. The streaming-load
+architecture already handles cache eviction for buffers smaller
+than the doc, so a 512-byte trim is benign for paging behaviour.
+
+**Patch sketch:**
+
+```asm
+; In the buffer EQUs near line 16866:
+FILE_BUF_SIZE  equ 0x2D00            ; was 0x2F00; trim 512 B for LUT pair
+FastLutHi      equ ((ImgBuf + 128 + 0xFF) & 0xFF00)
+FastLutLo      equ FastLutHi + 0x100
+ASSERT (FastLutHi & 0xFF) == 0       ; page-aligned
+ASSERT FastLutLo + 0x100 <= 0xD500
+
+; New BuildFastLut routine called once at startup, after ExtractFont:
+BuildFastLut:
+    ld   hl, FastLutHi
+    ld   bc, 0x0100                  ; 256 entries
+.bflLoop:
+    ld   a, c                        ; index = font byte (0..255)
+    ; high nibble -> hi LUT[idx]
+    push af
+    and  0xF0
+    rrca \ rrca \ rrca \ rrca
+    ld   de, FontLUT                 ; existing 16-entry nibble LUT
+    add  a, e \ ld e, a
+    ld   a, (de)
+    ld   (hl), a
+    ; low nibble -> lo LUT[idx]
+    pop  af
+    and  0x0F
+    ld   de, FontLUT
+    add  a, e \ ld e, a
+    ld   a, (de)
+    inc  h                           ; FastLutLo
+    ld   (hl), a
+    dec  h                           ; back to FastLutHi
+    inc  hl                          ; next index (l wraps after 256)
+    djnz .bflLoop                    ; B counts 256→0 once
+    ret
+```
+
+(Repeat for the 4 colour variants, or generate per-color on demand
+when `<font color>` flips `CurrentFontLUT`.)
+
+Wire-in to `DrawCharFast`:
+
+```asm
+.rowLoop:
+    ld   a, [HtmlStyleFlags]
+    or   a
+    jp   nz, .slowRow                ; bold/italic/strike/UL → existing path
+    ; Fast path: index FastLutHi/FastLutLo by font byte directly.
+    ld   hl, [FastFontPtr]
+    ld   a, (hl)
+    inc  hl
+    ld   [FastFontPtr], hl
+    push bc
+    call SetVramWritePos
+    pop  bc
+    exx
+    ld   l, a
+    ld   h, HIGH(FastLutHi)
+    ld   a, (hl)
+    out  (VDP_DATA), a
+    inc  h
+    ld   a, (hl)
+    out  (VDP_DATA), a
+    exx
+    ; row scale + row counter as today
+    jr   .rowDone
+.slowRow:
+    ; existing code (lines 2718..2818)
+```
+
+Test plan:
+1. `tools/build.sh` clean.
+2. `tools/inject.sh` + `tools/run.sh` with the existing
+   `tools/shot_benchtx.tcl` driver. Compare wall-clock between the
+   `loaded` and `after-pagedown` shots on `BENCHTX.HTM`.
+3. Visual diff: any glyph regression (e.g. wrong fg colour after
+   a `<font color>` flip) shows up immediately on `samples/test.html`
+   which exercises the four colour variants. Run `shot_loaded` on
+   that page against the pre-spike screenshot.
+
+If the measured saving on `BENCHTX` is < 5%, the integration cost
+isn't worth it and we should jump straight to lesson #3 (transposed
+font + row-major repaint), where the structural win is much bigger.
+
 ## Files in this branch
 
 ```
