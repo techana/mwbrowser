@@ -167,11 +167,13 @@ URL_MAX        equ 255         ; address-bar / fetch-target buffer cap (chars
                                ; before NUL). Bumped from 95 because real
                                ; mirror.aratab.com URLs run past the 100-char
                                ; line and got truncated on click.
-FILE_BUF_SIZE  equ 0x2D00      ; 11.25 KB. Sized so FILEBUF_BASE (0x9D00) +
-                               ; FILE_BUF_SIZE + FONT_BUF_SIZE + 128 + 512 B
-                               ; (FastLutHi+FastLutLo, see lesson #1 in
+FILE_BUF_SIZE  equ 0x2400      ; 9 KB. Sized so FILEBUF_BASE (0x9E00) +
+                               ; FILE_BUF_SIZE + FONT_BUF_SIZE + 128 +
+                               ; 512 B (FastLutHi+FastLutLo, lesson #1) +
+                               ; 2 KB (TransposedFontBuf, lesson #3, see
                                ; research/zero-latency screen6/LESSONS.md)
-                               ; lands at 0xD480 -- below both MSX-DOS 1.03's
+                               ; lands at exactly 0xD500 -- below both
+                               ; MSX-DOS 1.03's
                                ; *runtime* HIMEM (~0xDF94 on Sony HB-F1XD,
                                ; queried via BIOS HIMSAV @ 0xFC4A) AND
                                ; the .COM's initial SP (~0xDDC8 -- MSX-DOS
@@ -252,6 +254,7 @@ Main:
 
     call    ExtractFont                 ; pull BIOS font into FontBuf (once)
     call    BuildFastLut                ; populate FastLutHi/Lo from FontLUT
+    call    BuildTransposedFont         ; row-major mirror of FontBuf
     call    SetPalette
     call    SetBorder
     call    ClearContent                ; VRAM all white (colour 0)
@@ -2803,6 +2806,37 @@ BuildFastLut:
     djnz    .bflLoop                     ; B counts 256 iterations
     ret
 
+; BuildTransposedFont: convert FontBuf (256 chars × 8 rows, char-major)
+; into TransposedFontBuf (8 rows × 256 chars, row-major). Indexed at
+; runtime by `H = HIGH(TransposedFontBuf) + row, L = char_code`,
+; which collapses the per-row glyph fetch to `ld a,(hl)` -- 7 T, no
+; multiplication. Called once at startup right after ExtractFont +
+; BuildFastLut.
+BuildTransposedFont:
+    ld      a, 0                         ; outer loop: char_code 0..255
+.btfChar:
+    ld      h, 0
+    ld      l, a
+    add     hl, hl
+    add     hl, hl
+    add     hl, hl                       ; HL = char_code * 8
+    ld      de, FontBuf
+    add     hl, de                       ; HL = &FontBuf[char_code][0]
+    ; DE = &TransposedFontBuf[row 0][char_code] = base + 0*256 + char
+    ld      e, a                         ; E = char_code
+    ld      d, HIGH(TransposedFontBuf)   ; row 0 page
+    ld      b, 8                         ; 8 rows per char
+.btfRow:
+    ld      a, [hl]                      ; font byte for (char, row)
+    ld      [de], a
+    inc     hl                           ; next row in linear buf
+    inc     d                            ; next row's page in transposed buf
+    djnz    .btfRow
+    ld      a, e                         ; A still = char_code (E preserved)
+    inc     a
+    jp      nz, .btfChar                 ; loop until char_code wraps 255->0
+    ret
+
 ; DrawCharFastPlain: bifurcated-LUT fast lane used when no styling /
 ; scaling / colour swap is active. Pre-condition: FastFontPtr points
 ; at the 8 font bytes for the current glyph; B = byte column;
@@ -4938,6 +4972,20 @@ LineDrawCells:
     or      a
     call    nz, FixRtlLinkRectsOnLine
 
+    ; quick_screen_draw / lesson #3: row-major fast lane.
+    ; Pre-scan the line: when every cell is plain text (default fg,
+    ; no style, no widget) and HtmlScaleY != 2, dispatch to
+    ; DrawPlainLineRowMajor which does 1 SetVramWritePos per row
+    ; (8 total) instead of 1 per cell (8 * LineLen). The slow
+    ; per-cell path below handles styled cells, widgets, scaled
+    ; glyphs, <font color> overrides, and any line that fails the
+    ; pre-scan.
+    call    IsLinePlain
+    jr      nz, .dcSlowSetup
+    call    DrawPlainLineRowMajor
+    jp      .ldcEpilogue
+
+.dcSlowSetup:
     xor     a
     ld      [LineDrawI], a
 .dLoop:
@@ -4946,12 +4994,14 @@ LineDrawCells:
     ld      a, [LineLen]
     cp      b
     jr      nz, .dDraw
-    ; Loop finished. Run the box-connector post-pass before restoring
-    ; state so any glyphs sitting between WG_BOX_L .. WG_BOX_R cells
-    ; (e.g. a submit button's label "Search") get a continuous black
-    ; top + bottom border painted on top of them. Per-cell drawing
-    ; can't do this because the label glyphs would overpaint the
-    ; M-cells' own border rows with the font's blank top/bottom.
+    ; Loop finished. Fall through to the shared epilogue.
+.ldcEpilogue:
+    ; Run the box-connector post-pass before restoring state so any
+    ; glyphs sitting between WG_BOX_L .. WG_BOX_R cells (e.g. a
+    ; submit button's label "Search") get a continuous black top +
+    ; bottom border painted on top of them. Per-cell drawing can't
+    ; do this because the label glyphs would overpaint the M-cells'
+    ; own border rows with the font's blank top/bottom.
     call    PaintBoxConnectors
     ld      a, [SavedStyleFlags]
     ld      [HtmlStyleFlags], a
@@ -5047,6 +5097,135 @@ SavedStyleFlags: db 0
 LineRightPx:    dw 0                ; pixel past the right edge of current line
 PbcI:           db 0                ; PaintBoxConnectors loop cursor
 PbcL:           db 0                ; PaintBoxConnectors L-cell index
+
+; quick_screen_draw / lesson #3.
+; IsLinePlain: returns Z (and A=0) when the current line is
+; eligible for the row-major fast lane, NZ otherwise.
+;
+; "Plain" means every cell satisfies all of:
+;   * glyph code >= WG_LAST + 1   (not a widget)
+;   * attr & ~CELL_RTL == 0       (no fg-other-than-default,
+;                                  no bold/italic/UL/focused)
+;   * the line's overall context is non-styled:
+;     - HtmlStyleFlags == 0
+;     - HtmlScaleY != 2
+;
+; The CELL_RTL bit is allowed because BiDi already reordered the
+; cells before LineDrawCells runs -- the visual byte stream is the
+; same regardless of the source dir flag, so the row-major lane
+; renders RTL lines correctly.
+;
+; Side-effect-free: preserves BC/DE/HL.
+IsLinePlain:
+    ; HtmlStyleFlags must be zero.
+    ld      a, [HtmlStyleFlags]
+    or      a
+    ret     nz
+    ; HtmlScaleY must be 1.
+    ld      a, [HtmlScaleY]
+    cp      2
+    jr      nz, .ilpScaleOk
+    or      a                            ; force NZ
+    ret
+.ilpScaleOk:
+    ; Walk LineGlyph + LineAttr in lock-step.
+    push    bc
+    push    de
+    push    hl
+    ld      a, [LineLen]
+    ld      b, a                         ; B = remaining cells
+    ld      hl, LineGlyph
+    ld      de, LineAttr
+.ilpLoop:
+    ld      a, b
+    or      a
+    jr      z, .ilpYes
+    ld      a, [hl]                      ; glyph
+    cp      WG_LAST + 1
+    jr      c, .ilpNo                    ; widget cell -> not plain
+    ld      a, [de]                      ; attr
+    and     ~CELL_RTL & 0xFF             ; mask off CELL_RTL (allowed)
+    jr      nz, .ilpNo                   ; any other bit set -> styled
+    inc     hl
+    inc     de
+    dec     b
+    jr      .ilpLoop
+.ilpYes:
+    pop     hl
+    pop     de
+    pop     bc
+    xor     a                            ; Z=1, plain line
+    ret
+.ilpNo:
+    pop     hl
+    pop     de
+    pop     bc
+    or      1                            ; Z=0, not plain
+    ret
+
+; DrawPlainLineRowMajor: emit the visible glyphs for the current
+; line using the row-major + transposed-font + bifurcated-LUT path.
+; Pre-condition: IsLinePlain returned plain. LineStartCol holds the
+; first byte-col; TextY holds the top scanline; LineLen > 0.
+;
+; Inner loop per row: 1 SetVramWritePos call, then for each cell
+; emit 2 VRAM bytes (high + low half via FastLutHi/Lo). 8 outer
+; iterations -> total VRAM addr setups = 8 vs ~8 * LineLen for the
+; per-cell path. On a 64-cell line that's 8 vs 512 SetVramWritePos
+; calls, a 64x reduction.
+DrawPlainLineRowMajor:
+    xor     a
+    ld      [DplrmRow], a
+.dplrmRowLoop:
+    ld      a, [DplrmRow]
+    cp      8
+    ret     z
+    ; Position VDP at (LineStartCol, TextY + row).
+    ld      a, [LineStartCol]
+    ld      b, a
+    ld      a, [TextY]
+    ld      c, a
+    ld      a, [DplrmRow]
+    add     a, c
+    ld      c, a
+    push    bc
+    call    SetVramWritePos
+    pop     bc
+    ; D = TransposedFontBuf row page = HIGH(TransposedFontBuf) + row.
+    ld      a, HIGH(TransposedFontBuf)
+    ld      b, a
+    ld      a, [DplrmRow]
+    add     a, b
+    ld      d, a                         ; D = row's font page
+    ; HL = LineGlyph; B = cells remaining.
+    ld      hl, LineGlyph
+    ld      a, [LineLen]
+    ld      b, a
+.dplrmCellLoop:
+    ld      a, [hl]                      ; A = glyph code
+    inc     hl
+    ld      e, a                         ; E = char_code (low byte of font ptr)
+    ld      a, [de]                      ; A = font byte for (row, char)
+    ; Bifurcated LUT lookup: H' = page, L' = font byte.
+    ; HL is the cell pointer; stash it through the alternate bank
+    ; so the LUT lookup can reuse HL with no save/restore overhead
+    ; on each iteration.
+    exx
+    ld      l, a
+    ld      h, HIGH(FastLutHi)
+    ld      a, [hl]
+    out     (VDP_DATA), a
+    inc     h                            ; H = HIGH(FastLutLo)
+    ld      a, [hl]
+    out     (VDP_DATA), a
+    exx
+    djnz    .dplrmCellLoop
+    ld      a, [DplrmRow]
+    inc     a
+    ld      [DplrmRow], a
+    jr      .dplrmRowLoop
+
+DplrmRow:       db 0                     ; row counter for the fast lane
 
 ; PaintBoxConnectors: scan the just-drawn line for WG_BOX_L .. WG_BOX_R
 ; pairs and paint a continuous black 1-px row at TextY (top) and TextY+7
@@ -17088,7 +17267,17 @@ FastLutHi          equ FAST_LUT_PAGE_BASE
 FastLutLo          equ FAST_LUT_PAGE_BASE + 0x100
 FastLutEnd         equ FastLutLo + 0x100
     ASSERT (FastLutHi & 0xFF) == 0
-    ASSERT FastLutEnd <= 0xD500
+
+; quick_screen_draw / lesson #3: row-first transposed font. Layout
+; is `byte r of all 256 chars contiguous in row r's page`, so
+; reading char C's byte for row R is `H = base_page + R, L = C,
+; ld a,(hl)` (7 T, no multiplication). Eight pages = 2 KB at a
+; page-aligned base. Indexed alongside FastLutHi/Lo by the
+; row-major fast lane in LineDrawCells.
+TransposedFontBuf  equ FastLutEnd
+TransposedFontEnd  equ TransposedFontBuf + 8 * 0x100
+    ASSERT (TransposedFontBuf & 0xFF) == 0
+    ASSERT TransposedFontEnd <= 0xD500
 
 ; Build-time guards.
 ;   * FileEnd <= FILEBUF_BASE: catches the FileBuf-vs-globals overlap
