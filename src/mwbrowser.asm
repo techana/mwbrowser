@@ -2117,14 +2117,85 @@ ExtrapolateHtmlLineCountIfShort:
     sbc     hl, de
     jr      c, .eaShort
     ; consumed >= WindowLen: parser walked the whole doc, count is
-    ; now exact. Latch the flag so future renders skip extrapolation.
+    ; now exact. Latch the flag so future renders skip extrapolation,
+    ; and lock TotalLines to the same exact value so the scroll
+    ; thumb sizes correctly.
     ld      a, 1
     ld      [HtmlLineCountAccurate], a
+    ld      hl, [HtmlLineCount]
+    ld      [TotalLines], hl
     ret
 .eaShort:
-    ; Saturated default: PageDown advances freely; snap-back will
-    ; latch the true count once the user overshoots.
+    ; Pre-condition: HtmlLineCount holds the partial render count for
+    ; THIS pass. Compute a TotalLines estimate for the scroll-thumb
+    ; math (estimated = current_count * total / consumed) BEFORE
+    ; saturating HtmlLineCount, then saturate.
+    ld      hl, [ParserCursor]
+    ld      de, FileBuf
+    or      a
+    sbc     hl, de                       ; HL = consumed
+    ld      de, [WindowLen]              ; DE = total
+.eaTscale:
+    ld      a, h
+    or      a
+    jr      z, .eaTscaled
+    srl     h
+    rr      l
+    srl     d
+    rr      e
+    jr      .eaTscale
+.eaTscaled:
+    ld      c, l                         ; C = scaled consumed (8-bit)
+    or      a
+    jr      z, .eaSatBoth                ; consumed underflowed -> bail w/ saturated
+    ld      h, d
+    ld      l, e                         ; HL = scaled total
+    call    DivU16By8                    ; HL = ratio (typically 1..32)
+    ld      a, h
+    or      a
+    jr      nz, .eaTSat                  ; ratio >> 256 -> saturate
+    ld      a, l
+    or      a
+    jr      z, .eaTSat
+    cp      1
+    jr      z, .eaTKeepCount             ; ratio == 1: estimate = count
+    ld      b, a                         ; B = ratio
+    ld      hl, [HtmlLineCount]          ; current parser count (still un-saturated)
+    ld      d, h
+    ld      e, l
+    ld      hl, 0
+.eaTMul:
+    add     hl, de
+    jr      c, .eaTSat
+    djnz    .eaTMul
+    jr      .eaTStore
+.eaTKeepCount:
+    ld      hl, [HtmlLineCount]
+.eaTStore:
+    ; Monotonic high-water mark: never DECREASE TotalLines so the
+    ; scroll thumb doesn't jitter backward when a later render's
+    ; ratio gives a smaller estimate than an earlier render's.
+    ld      de, [TotalLines]
+    or      a
+    push    hl
+    sbc     hl, de
+    pop     hl
+    jr      c, .eaSatCount               ; existing TotalLines >= estimate; just saturate count
+    ld      [TotalLines], hl
+.eaSatCount:
+    ; PageDown clamp: HtmlLineCount = 0xFFFF so PageDown advances
+    ; freely. The snap-back path latches the exact count when the
+    ; user overshoots.
     ld      hl, 0xFFFF
+    ld      [HtmlLineCount], hl
+    ret
+.eaTSat:
+    ld      hl, 0xFFFF
+    ld      [TotalLines], hl
+    jr      .eaSatCount
+.eaSatBoth:
+    ld      hl, 0xFFFF
+    ld      [TotalLines], hl
     ld      [HtmlLineCount], hl
     ret
 
@@ -3313,9 +3384,13 @@ ResetFcbTail:
 LoadFile:
     ; New file -> the previous "HtmlLineCount is exact" knowledge is
     ; stale; clear the lock so the upcoming initial render's
-    ; ExtrapolateHtmlLineCountIfShort can fire normally.
+    ; ExtrapolateHtmlLineCountIfShort can fire normally. Also reset
+    ; TotalLines (the high-water-mark for the thumb denominator)
+    ; so the new doc starts from a clean estimate.
     xor     a
     ld      [HtmlLineCountAccurate], a
+    ld      [TotalLines], a
+    ld      [TotalLines + 1], a
     ; URL shape routes the load:
     ;   "view:<path>"   -> hybrid bitmap pipeline (RemoteLoadView).
     ;                      The bridge renders the page as a Screen-6
@@ -3842,6 +3917,7 @@ PrintFileContent:
     ; pop af + the throttle counter); negligible compared to the
     ; tag dispatch + glyph emit downstream.
     call    BusyHeartbeat
+
 
     ; Viewport-full short-circuit. Once HtmlLineSkip has drained (0) and
     ; the Y cursor has painted past the bottom of the content area,
@@ -13346,6 +13422,15 @@ RefreshAfterScroll:
     call    DrawScrollbar
     call    ClearContentArea            ; also drops InPlaceRender
     call    PrintFileContent
+    ; Re-paint the scroll thumb now that the render's
+    ; ExtrapolateHtmlLineCountIfShort has updated TotalLines (the
+    ; thumb denominator) -- without this second pass the thumb only
+    ; reflects the OLD TotalLines from the previous render and stays
+    ; pinned at the top until something else triggers a thumb redraw.
+    ; Flags don't survive through PrintFileContent's tail-jump anyway,
+    ; so no need to preserve them here.
+    call    ComputeThumb
+    call    DrawScrollbar
     ; Scroll-overshoot snap-back: when the extrapolated HtmlLineCount
     ; let PageDown push ScrollLine past the actual document end,
     ; PrintFileContent reaches natural EOF with HtmlLineSkip still
@@ -13371,6 +13456,7 @@ RefreshAfterScroll:
     ld      hl, 0
 .rasNoUnderflow:
     ld      [HtmlLineCount], hl          ; refine count to true value
+    ld      [TotalLines], hl             ; lock thumb math to exact count
     ld      a, 1
     ld      [HtmlLineCountAccurate], a   ; lock count: ExtrapolateHtmlLineCountIfShort no-ops next time
     ; new ScrollLine = max(0, actual_total - TEXT_MAX_LINES) -- mirrors
