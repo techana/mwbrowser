@@ -4024,7 +4024,11 @@ PrintFileContent:
     call    DetectArabicInBuf
     or      a
     jr      z, .noAutoRtl
-    ld      a, 2
+    ld      a, 1                        ; HtmlDir RTL = 1 (CELL_RTL bit);
+                                         ; LineBidiReorder/Resolve mask
+                                         ; bit 0 to detect RTL, so 2
+                                         ; would silently fall through
+                                         ; to the LTR path.
     ld      [HtmlDir], a
     ld      [HtmlDefaultDir], a
     ld      [HtmlAlign], a
@@ -7031,7 +7035,10 @@ ScanBlockAttrs:
     xor     a                           ; anything else -> LTR
     jr      .sba_dStore
 .sba_dR:
-    ld      a, 2
+    ld      a, 1                        ; HtmlDir RTL = 1 (CELL_RTL bit);
+                                         ; see comment in PrintFileContent
+                                         ; auto-RTL setter for the same
+                                         ; "1 not 2" rule.
 .sba_dStore:
     ld      [HtmlNextDir], a
     pop     af
