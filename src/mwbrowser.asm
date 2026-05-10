@@ -15265,6 +15265,14 @@ DrawTitleLabel:
     ld      hl, TitleSuffix
     call    DrawString
 
+    ; Home button: "[]" placed left of "?" as a button-frame placeholder
+    ; for the upcoming bridge-root shortcut. Two glyphs = 16 px, so the
+    ; left edge sits at WIDTH-40 (the ? cell starts at WIDTH-24).
+    ld      de, WIDTH - 40
+    ld      c, 1
+    ld      hl, CharHomeBtn
+    call    DrawString
+
     ; "?" button (About popup; shortcut F1). Placed left of the X.
     ld      de, WIDTH - 24
     ld      c, 1
@@ -17162,6 +17170,7 @@ CharGreater:    db ">", 0
 CharX:          db "X", 0
 CharLowerX:     db "x", 0
 CharHelp:       db "?", 0
+CharHomeBtn:    db "[]", 0          ; titlebar bridge-root shortcut placeholder
 UrlInit:        db 0                    ; address bar starts empty
 
 AboutTitleMsg:  db "Help", 0

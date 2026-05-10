@@ -5067,15 +5067,33 @@ class MsxSession:
         # Drop optional :port from host_part for the comparison.
         host = host_part.split(":", 1)[0].lower()
         self_hosts = {"127.0.0.1", "localhost", SERVER_IP.lower()}
-        # A bare leading-slash path ("HELLO.TXT" after the lstrip above
-        # means host_part="" and path_part already set) is treated as
-        # self-host: relative-link clicks from a page served out of
-        # CFG['root'] arrive as "GET /HELLO.TXT" with no host. Without
-        # this branch the request would fall through to _fetch_page,
-        # which would prepend http:// and fail to resolve.
-        if not host_part and path_part:
-            pass  # accept as self-host
-        elif host not in self_hosts:
+        # Two self-host pathways:
+        #   1. Explicit host (127.0.0.1, localhost, SERVER_IP): always
+        #      treated as self-host, path may be empty -> dir listing.
+        #   2. Scheme-less, no host part: treat the whole url as a
+        #      relative path INTO root and try it. If it doesn't
+        #      resolve to a real file we return None so the caller
+        #      falls through to web fetch -- this lets bare names like
+        #      "INDEX.TXT" (a relative link click from a self-host
+        #      page) reach root, while real URLs like "wikipedia.org"
+        #      that don't exist as files in root still go to the web.
+        # is_guess = True when the request didn't specify a self-host
+        # explicitly. Used below to decide whether a missing file
+        # falls back to web fetch (guess: yes) or returns 404
+        # (explicit: yes).
+        is_guess = False
+        if host in self_hosts:
+            pass  # explicit self-host
+        elif not host_part:
+            pass  # bare leading-slash path -> self-host
+        elif "/" not in target and ":" not in target:
+            # Scheme-less, non-slashed target like "INDEX.TXT" or
+            # "msn.com". Treat the WHOLE thing as a relative path
+            # within root; if no such file/dir exists we fall through
+            # so the URL still gets fetched from the web.
+            host_part, path_part = "", url
+            is_guess = True
+        else:
             return None
         # Hit: serve from CFG['root'].
         root = CFG.get("root")
@@ -5120,6 +5138,11 @@ class MsxSession:
             self.img_counter = 0
             return ("HTM", body)
         if not os.path.isfile(full):
+            # Bare-filename guess that didn't resolve in root: fall
+            # through to web fetch (caller may successfully resolve
+            # "msn.com" etc as an HTTP URL).
+            if is_guess:
+                return None
             return ("404", None)
         try:
             with open(full, "rb") as fh:
