@@ -3514,6 +3514,46 @@ LoadFileChunk:
     jr      c, .lfcSizeOk
     ld      hl, FILE_BUF_SIZE
 .lfcSizeOk:
+    ; Clamp again to (DocSize - DocOffset) so WindowLen reflects the
+    ; ACTUAL bytes available in the file rather than the requested
+    ; window size. Without this clamp, a fresh LoadFile of a small
+    ; file (test4 ~1 KB) into a previously-used FileBuf left
+    ; WindowLen at FILE_BUF_SIZE, so the parser walked past the new
+    ; doc's last byte into stale content from the previous larger
+    ; doc (BENCHTX, BIGBENCH, ...).
+    ;
+    ; HL holds the requested-and-buffer-clamped window. Compute
+    ; remaining = DocSize - DocOffset as a 24-bit value; if it fits
+    ; in 16 bits AND is smaller than HL, use it.
+    push    hl                            ; save requested
+    ld      hl, [DocSize]
+    ld      de, [DocOffset]
+    or      a
+    sbc     hl, de                        ; HL = (DocSize - DocOffset) low 16
+    ld      a, [DocSize + 2]
+    ld      e, a
+    ld      a, [DocOffset + 2]
+    sbc     a, e
+    cpl
+    inc     a                             ; A = high byte of (DocSize-DocOffset)
+                                          ; (negated; now correct signed/unsigned)
+    or      a
+    jr      nz, .lfcRemainingBig          ; > 0xFFFF: requested wins
+    ; remaining (HL) fits in 16 bits; pop requested into DE and pick min.
+    pop     de                            ; DE = requested
+    or      a
+    push    hl                            ; preserve remaining
+    sbc     hl, de
+    pop     hl                            ; HL = remaining (untouched)
+    jr      nc, .lfcUseReqDE              ; remaining >= requested -> use requested
+    ; remaining < requested: HL is the smaller value, use it.
+    jr      .lfcStore
+.lfcUseReqDE:
+    ex      de, hl                        ; HL = requested
+    jr      .lfcStore
+.lfcRemainingBig:
+    pop     hl                            ; HL = requested (remaining > 64 KB ignored)
+.lfcStore:
     ld      [WindowLen], hl
     ld      a, h
     or      l
