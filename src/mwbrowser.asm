@@ -4777,13 +4777,13 @@ ShapePick:
     xor     a                           ; Isolated
     ret
 .formEnd:
-    ld      a, 2
+    ld      a, 1
     ret
 .formIni:
     ld      a, 2
     ret
 .formMid:
-    ld      a, 2
+    ld      a, 3
     ret
 
 ; LamAlefLigature: if A is an alef-variant that can fuse with a preceding
