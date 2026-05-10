@@ -2145,9 +2145,10 @@ ExtrapolateHtmlLineCountIfShort:
     rr      e
     jr      .eaTscale
 .eaTscaled:
-    ld      c, l                         ; C = scaled consumed (8-bit)
+    ld      a, l                         ; A = scaled consumed low byte
     or      a
-    jr      z, .eaSatBoth                ; consumed underflowed -> bail w/ saturated
+    jr      z, .eaSatBoth                ; consumed underflowed -> saturate
+    ld      c, a                         ; C = scaled consumed (DivU16By8 input)
     ld      h, d
     ld      l, e                         ; HL = scaled total
     call    DivU16By8                    ; HL = ratio (typically 1..32)
@@ -2172,15 +2173,20 @@ ExtrapolateHtmlLineCountIfShort:
 .eaTKeepCount:
     ld      hl, [HtmlLineCount]
 .eaTStore:
-    ; Monotonic high-water mark: never DECREASE TotalLines so the
-    ; scroll thumb doesn't jitter backward when a later render's
-    ; ratio gives a smaller estimate than an earlier render's.
-    ld      de, [TotalLines]
+    ; HL = computed estimate (ratio * count). Bump up if it would
+    ; round down to less than ScrollLine + TEXT_MAX_LINES so the
+    ; thumb math stays well-formed (ScrollLine fraction <= 1).
+    ld      [TotalLines], hl             ; tentative store
+    ld      de, [ScrollLine]
+    ld      hl, TEXT_MAX_LINES
+    add     hl, de                       ; HL = ScrollLine + 22 = floor
+    ex      de, hl                       ; DE = floor
+    ld      hl, [TotalLines]             ; HL = estimate
     or      a
-    push    hl
-    sbc     hl, de
-    pop     hl
-    jr      c, .eaSatCount               ; existing TotalLines >= estimate; just saturate count
+    sbc     hl, de                       ; HL = estimate - floor; CF=1 if estimate < floor
+    jr      nc, .eaSatCount              ; estimate >= floor, leave it
+    ; estimate < floor: replace with floor
+    ex      de, hl                       ; HL = floor
     ld      [TotalLines], hl
 .eaSatCount:
     ; PageDown clamp: HtmlLineCount = 0xFFFF so PageDown advances
@@ -15923,6 +15929,14 @@ RemoteLoadFile:
 StoreTotalLinesWithPages:
     push    bc
     push    de
+    ; Local-file path: PrintFileContent's ExtrapolateHtmlLineCountIfShort
+    ; already wrote a thumb-friendly TotalLines estimate (high-water
+    ; mark across renders, locked to the exact count after natural
+    ; EOF or snap-back). Don't stomp it with HtmlLineCount, which
+    ; we deliberately saturate at 0xFFFF for PageDown's clamp.
+    ld      a, [IsRemoteSession]
+    or      a
+    jr      z, .stlDone
     ; remaining = SerialPageTotal - SerialPage  (0 when no more chunks)
     ld      a, [SerialPageTotal]
     ld      c, a
@@ -15945,6 +15959,7 @@ StoreTotalLinesWithPages:
     ld      de, [HtmlLineCount]
     add     hl, de                      ; HL = HtmlLineCount + remaining*22
     ld      [TotalLines], hl
+.stlDone:
     pop     de
     pop     bc
     ret
