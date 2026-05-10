@@ -1973,6 +1973,77 @@ VdpSetDisplayPage:
     ei
     ret
 
+; CopyChromeToBack: replicate the titlebar + toolbar bands (rows
+; 0..CONTENT_Y0-1, full width) from the currently displayed page to the
+; back page so a subsequent VdpSetDisplayPage flip lands on a screen
+; with identical chrome.
+;
+; Used by RefreshAfterScroll's page-flip flow: the user keeps seeing
+; the OLD displayed page (with current titlebar/toolbar/spinner state)
+; while the renderer composes the NEW content area on the back page.
+; At flip time, both pages need matching chrome above CONTENT_Y0 or
+; the user sees the toolbar "rewind" to whatever stale state the back
+; page was last left in.
+;
+; Implementation: 128-byte RAM stage row, 29 round-trips through the
+; VDP read/write ports (~50 ms on a 3.58 MHz Z80; the page-flip itself
+; is what hides ClearContentArea's white flash, which costs ~190 ms of
+; visible blank so the trade is firmly net-positive).
+;
+; Clobbers AF, BC, HL. Restores WritesToPage to its prior value.
+CopyChromeToBack:
+    ld      a, [WritesToPage]
+    push    af                           ; save caller's WritesToPage
+    xor     a
+    ld      [ChromeRow], a
+.crLoop:
+    ld      a, [ChromeRow]
+    cp      CONTENT_Y0
+    jr      nc, .crDone
+
+    ; Read row from the displayed page (R14 follows WritesToPage).
+    ld      a, [DisplayedPage]
+    ld      [WritesToPage], a
+    ld      a, [ChromeRow]
+    ld      c, a
+    ld      b, 0
+    call    SetVramReadPos
+    ld      hl, ImgBuf                   ; reuse the 128-byte image-stream
+    ld      b, 128                       ; scratch -- no image active here
+.crRead:
+    in      a, (VDP_DATA)
+    ld      [hl], a
+    inc     hl
+    djnz    .crRead
+
+    ; Stream the staged row into the back page.
+    ld      a, [DisplayedPage]
+    xor     1
+    ld      [WritesToPage], a
+    ld      a, [ChromeRow]
+    ld      c, a
+    ld      b, 0
+    call    SetVramWritePos
+    ld      hl, ImgBuf
+    ld      b, 128
+.crWrite:
+    ld      a, [hl]
+    out     (VDP_DATA), a
+    inc     hl
+    djnz    .crWrite
+
+    ld      a, [ChromeRow]
+    inc     a
+    ld      [ChromeRow], a
+    jr      .crLoop
+
+.crDone:
+    pop     af
+    ld      [WritesToPage], a
+    ret
+
+ChromeRow:    db 0
+
 ; quick_screen_draw / lesson #2: VdpBlank / VdpUnblank toggle R1 BL
 ; (bit 6, "display on/off"). With BL=0 the V9938 stops fetching
 ; pattern + colour data from VRAM so 100 % of memory cycles are
@@ -13887,12 +13958,36 @@ HistoryUpdateFlags:
 ; ahead of the slower content repaint and the user sees their scroll
 ; acknowledged immediately), then redraw the content area itself.
 RefreshAfterScroll:
-    ; First thumb draw: paint dark-gray to signal "busy, paging now,
-    ; ignore keys" before the long PrintFileContent run.
+    ; Phase 1: paint the busy-tinted scrollbar thumb on the currently
+    ; displayed page so the user sees IMMEDIATE feedback ("page acked,
+    ; rendering...") before the multi-100ms content render. With the
+    ; page-flip flow below this is the LAST thing we paint to the
+    ; old displayed page -- everything from here on goes to the back.
+    ld      a, [DisplayedPage]
+    ld      [WritesToPage], a            ; force writes onto displayed
     ld      a, 1
     ld      [ThumbBusy], a
     call    ComputeThumb
     call    DrawScrollbar
+
+    ; Phase 2: lesson #4 page-flip prep. Mirror the titlebar + toolbar
+    ; bands from the displayed page to the back page so the upcoming
+    ; flip lands on a back page that has the SAME chrome the user is
+    ; already looking at. The content area is wiped and rewritten by
+    ; ClearContentArea+PrintFileContent below so it doesn't need
+    ; copying.
+    call    CopyChromeToBack
+
+    ; Phase 3: redirect VRAM writes to the back page. From here until
+    ; the flip every SetVramWritePos call goes through R14=back via
+    ; VdpSetR14's WritesToPage offset, so the user keeps seeing the
+    ; old page (no white flash from ClearContentArea, no half-rendered
+    ; intermediate state).
+    ld      a, [DisplayedPage]
+    xor     1
+    ld      [WritesToPage], a
+
+    ; Phase 4: render content + scrollbar on the back page (off-screen).
     call    ClearContentArea            ; also drops InPlaceRender
     call    PrintFileContent
     ; Settled draw: black thumb. Also re-runs ComputeThumb in case
@@ -13902,6 +13997,17 @@ RefreshAfterScroll:
     ld      [ThumbBusy], a
     call    ComputeThumb
     call    DrawScrollbar
+
+    ; Phase 5: flip. R2 swap is a single VDP register write so the
+    ; transition is atomic at the next vblank -- no tearing.
+    ld      a, [WritesToPage]
+    call    VdpSetDisplayPage            ; updates DisplayedPage = A
+
+    ; Phase 6: idle. Future chrome state changes (toolbar buttons,
+    ; busy spinner, dialog overlays) should land on the now-displayed
+    ; page so the user sees them right away. WritesToPage tracks
+    ; DisplayedPage between renders.
+    ld      [WritesToPage], a
     ; Scroll-overshoot snap-back: when the extrapolated HtmlLineCount
     ; let PageDown push ScrollLine past the actual document end,
     ; PrintFileContent reaches natural EOF with HtmlLineSkip still
