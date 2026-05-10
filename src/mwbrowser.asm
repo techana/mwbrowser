@@ -2180,6 +2180,7 @@ ExtrapolateHtmlLineCountIfShort:
     ld      [HtmlLineCountAccurate], a
     ld      hl, [HtmlLineCount]
     ld      [TotalLines], hl
+    ld      [HtmlLineCountSaved], hl
     ret
 .eaShort:
     ; Pre-condition: HtmlLineCount holds the partial render count for
@@ -3453,6 +3454,8 @@ LoadFile:
     ld      [HtmlLineCountAccurate], a
     ld      [TotalLines], a
     ld      [TotalLines + 1], a
+    ld      [HtmlLineCountSaved], a
+    ld      [HtmlLineCountSaved + 1], a
     ; URL shape routes the load:
     ;   "view:<path>"   -> hybrid bitmap pipeline (RemoteLoadView).
     ;                      The bridge renders the page as a Screen-6
@@ -4188,6 +4191,23 @@ PrintFileContent:
     ; isn't clamped to one viewport. Walks past the end refine the
     ; count on subsequent renders.
     call    ExtrapolateHtmlLineCountIfShort
+    ; quick_screen_draw: scrolled renders bail at .eof as soon as the
+    ; viewport fills (HtmlNoDraw=1 + ScrollLine != 0), leaving
+    ; HtmlLineCount at just the partial count for the visible page
+    ; (e.g. ~45 on a 484-line BENCHIM after PD1 lands). PageDown's
+    ; clamp then jams the user at "stuck at page 2". When the
+    ; document-wide accurate count is already known, restore
+    ; HtmlLineCount from the saved snapshot so PageDown sees the real
+    ; ceiling.
+    ld      a, [HtmlLineCountAccurate]
+    or      a
+    jr      z, .eofNoRestore
+    ld      hl, [HtmlLineCountSaved]
+    ld      a, h
+    or      l
+    jr      z, .eofNoRestore             ; nothing saved yet
+    ld      [HtmlLineCount], hl
+.eofNoRestore:
     ld      a, 5
     ld      [LoadPhase], a              ; phase 5: parser hit EOF (render done)
   IFDEF BENCH
@@ -13904,6 +13924,7 @@ RefreshAfterScroll:
 .rasNoUnderflow:
     ld      [HtmlLineCount], hl
     ld      [TotalLines], hl
+    ld      [HtmlLineCountSaved], hl
     ld      a, 1
     ld      [HtmlLineCountAccurate], a
     ld      de, TEXT_MAX_LINES
@@ -17671,6 +17692,13 @@ HtmlLineCount:  dw 0                    ; total rendered lines (for thumb math)
 ; Cleared on a fresh file load so a window slide / new doc starts
 ; the estimate cycle over.
 HtmlLineCountAccurate: db 0
+; Accurate HtmlLineCount value, snapshotted whenever HtmlLineCountAccurate
+; latches to 1 (initial-pass natural EOF or RefreshAfterScroll snap-back).
+; Scrolled renders bail at .eof as soon as the viewport fills, so the
+; live HtmlLineCount they leave behind is just the partial visible-page
+; count. PrintFileContent.eof restores from this snapshot when accurate
+; is set so PageDown's clamp keeps seeing the doc-wide line total.
+HtmlLineCountSaved: dw 0
 ; quick_screen_draw: when the parser fills the visible viewport on
 ; an initial-load pass, we DON'T short-circuit out of the loop; we
 ; set HtmlNoDraw=1 instead so the parser keeps walking to natural
