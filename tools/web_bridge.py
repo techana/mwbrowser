@@ -22,6 +22,7 @@ Requires:
 """
 
 import io
+import os
 import re
 import sys
 import time
@@ -32,6 +33,7 @@ import threading
 import http.server
 import socketserver
 import urllib.parse
+from html import escape as _html_escape
 from urllib.parse import urljoin, urlparse, quote, unquote
 from collections import OrderedDict
 
@@ -4128,6 +4130,49 @@ def _generate_logo():
         print("  Logo   : PCX bake failed ({})".format(exc))
 
 
+def _root_listing_html():
+    """HTML directory listing of CFG['root'], rendered as classic HTML
+    that the on-MSX parser can chew. One <a href="<name>"> per file or
+    subdir, sorted with directories first then files, both alphabetic.
+    Sizes shown for files; directories get a trailing '/' to disambiguate.
+    Empty folders render a single '(empty)' line so the user knows the
+    page loaded."""
+    root = CFG.get("root", ".")
+    try:
+        entries = sorted(os.listdir(root))
+    except OSError as exc:
+        return ("<html><head><title>Root</title></head><body>"
+                "<h1>Bridge root unreadable</h1>"
+                "<p>{}</p></body></html>").format(_html_escape(str(exc)))
+    dirs, files = [], []
+    for name in entries:
+        if name.startswith("."):
+            continue
+        full = os.path.join(root, name)
+        if os.path.isdir(full):
+            dirs.append(name)
+        elif os.path.isfile(full):
+            try:
+                size = os.path.getsize(full)
+            except OSError:
+                size = -1
+            files.append((name, size))
+    rows = []
+    for name in dirs:
+        rows.append('<li><a href="/{0}/">{0}/</a></li>'.format(
+            _html_escape(name)))
+    for name, size in files:
+        size_str = "" if size < 0 else " &nbsp; ({} B)".format(size)
+        rows.append('<li><a href="/{0}">{0}</a>{1}</li>'.format(
+            _html_escape(name), size_str))
+    if not rows:
+        rows = ["<li><i>(empty)</i></li>"]
+    return ("<!DOCTYPE HTML PUBLIC \"-//IETF//DTD HTML 2.0//EN\">\n"
+            "<html><head><title>Bridge root</title></head>\n"
+            "<body><h1>{}</h1>\n<ul>\n{}\n</ul></body></html>\n").format(
+        _html_escape(root), "\n".join(rows))
+
+
 def _landing_html(ip, user_agent=""):
     """Minimal HTML-2 landing page for the MSX browser.
 
@@ -5322,9 +5367,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "Host", "{}:{}".format(SERVER_IP, PORT))
 
         if path == "/":
-            landing = _landing_html(self.client_address[0])
+            # Directory listing of CFG['root'] for the bridge owner. The
+            # MSX serial path goes through GET /get?url=..., not "/", so
+            # this only fires for HTTP browser visits to the bridge's own
+            # IP. Replaces the older _landing_html (which is kept around
+            # in case a caller wants the search/history widget).
+            listing = _root_listing_html()
             self._send(200, "text/html; charset=utf-8",
-                       landing.encode("utf-8"))
+                       listing.encode("utf-8"))
 
         elif path == "/wb-logo.pcx":
             # Landing-page logo as 2-bpp PCX (492 px wide max, four-colour
@@ -5463,7 +5513,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._serve_image(url)
 
         else:
-            if path.startswith("/http"):
+            # /<filename> served from CFG['root']: every request whose
+            # decoded path is a single safe segment is checked against
+            # the root folder before we fall through to /p/ proxy
+            # heuristics. Path traversal (../) is rejected by the
+            # _safe_root_path helper. Sub-directory listings (e.g. /sub/)
+            # are served as nested directory pages.
+            served = self._maybe_serve_root(path)
+            if served:
+                pass
+            elif path.startswith("/http"):
                 self._send(302, location="/p/" + path.lstrip("/"))
             else:
                 # Unknown path — likely a form submission to a relative URL
@@ -5479,6 +5538,67 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                            "The requested path was not found."))
 
     do_POST = do_GET
+
+    def _maybe_serve_root(self, path):
+        """Try to serve ``path`` from CFG['root']. Returns True if a
+        response was sent (file content, sub-directory listing, or 404
+        for an obviously-rooted-but-missing target). Returns False for
+        paths that don't look like root references at all, so the
+        caller can fall through to its other routes."""
+        root = CFG.get("root")
+        if not root:
+            return False
+        # Strip leading '/' and decode percent-escapes once.
+        rel = urllib.parse.unquote(path.lstrip("/"))
+        if not rel:
+            return False
+        # Reject traversal / absolute / drive-letter forms before joining.
+        if ".." in rel.split("/") or rel.startswith("/") or ":" in rel:
+            return False
+        full = os.path.normpath(os.path.join(root, rel))
+        # Final containment check (defence-in-depth against odd Unicode
+        # forms that survive the string filter above).
+        try:
+            common = os.path.commonpath([os.path.abspath(full),
+                                         os.path.abspath(root)])
+        except ValueError:
+            return False
+        if common != os.path.abspath(root):
+            return False
+        if os.path.isdir(full):
+            # Render a sub-directory listing using the same template,
+            # rooted at this sub-path. CFG['root'] override is local to
+            # this call; reset before returning so the global stays at
+            # the user-configured top.
+            saved = CFG["root"]
+            CFG["root"] = full
+            try:
+                listing = _root_listing_html()
+            finally:
+                CFG["root"] = saved
+            self._send(200, "text/html; charset=utf-8",
+                       listing.encode("utf-8"))
+            return True
+        if os.path.isfile(full):
+            try:
+                with open(full, "rb") as fh:
+                    data = fh.read()
+            except OSError as exc:
+                self._send(500, "text/plain; charset=utf-8",
+                           "read error: {}".format(exc).encode("utf-8"))
+                return True
+            ext = os.path.splitext(full)[1].lower()
+            ctype = {
+                ".htm":  "text/html; charset=utf-8",
+                ".html": "text/html; charset=utf-8",
+                ".txt":  "text/plain; charset=utf-8",
+                ".pcx":  "image/x-pcx",
+                ".sc6":  "application/octet-stream",
+                ".bmp":  "image/bmp",
+            }.get(ext, "application/octet-stream")
+            self._send(200, ctype, data)
+            return True
+        return False
 
     # ── internal helpers ───────────────────────────────────────────────────
 
@@ -5937,11 +6057,44 @@ def main():
                          "instance.")
     ap.add_argument("--verbose", action="store_true",
                     help="Log every GET on the serial wire.")
+    ap.add_argument("--root", default=None, metavar="DIR",
+                    help="Local folder served as the bridge root. Browsing "
+                         "to http://127.0.0.1:<port>/ produces a directory "
+                         "listing of this folder; files inside it are "
+                         "downloadable via http://127.0.0.1:<port>/<name>. "
+                         "Defaults to a 'root/' folder adjacent to this "
+                         "script. Created on first launch (with prompt).")
     args = ap.parse_args()
     CFG["no_images"] = bool(args.no_images)
     CFG["paginate"]  = not bool(args.no_pagination)
     CFG["passthrough_hosts"] = {h.lower().strip() for h in args.passthrough_hosts
                                 if h.strip()}
+    # Resolve the root folder: --root override, else 'root/' next to the script.
+    root_arg = args.root
+    if root_arg:
+        root = os.path.abspath(os.path.expanduser(root_arg))
+    else:
+        root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "root")
+    if not os.path.isdir(root):
+        sys.stdout.write(
+            "  Bridge root '{}' does not exist. Create it? [y/N] ".format(root))
+        sys.stdout.flush()
+        try:
+            answer = sys.stdin.readline().strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            answer = ""
+        if answer in ("y", "yes"):
+            try:
+                os.makedirs(root, exist_ok=True)
+                sys.stdout.write("  Created {}\n".format(root))
+            except OSError as exc:
+                sys.stderr.write("  Failed to create {}: {}\n".format(root, exc))
+                sys.exit(1)
+        else:
+            sys.stderr.write(
+                "  Aborted: bridge needs a readable root folder.\n")
+            sys.exit(1)
+    CFG["root"] = root
     return args
 
 
@@ -5969,6 +6122,7 @@ if __name__ == "__main__":
         print("  HTTP     : http://{}:{}".format(_args.host, _args.port))
         if _args.host in ("0.0.0.0", ""):
             print("             http://{}:{}".format(SERVER_IP, _args.port))
+        print("  Root     : {}".format(CFG.get("root", "(unset)")))
         # MSX serial listener runs in a daemon thread so Ctrl-C on the
         # main HTTP loop tears the whole process down cleanly.
         if not _args.no_serial:

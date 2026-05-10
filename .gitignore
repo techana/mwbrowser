@@ -55,3 +55,11 @@
 !tools/shot_zlk.tcl
 !tools/shot_qsd.tcl
 !tools/shot_qsd2.tcl
+
+# new_html_simplifier branch: the bridge's local-file root.  Empty by
+# default in the repo; the bridge mints it on first launch (with a
+# user prompt) and the contents are user-supplied so we don't track
+# any files inside it -- only the placeholder so the directory exists
+# on fresh clones.
+!tools/root/
+!tools/root/.gitkeep
