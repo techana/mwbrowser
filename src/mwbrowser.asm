@@ -167,9 +167,11 @@ URL_MAX        equ 255         ; address-bar / fetch-target buffer cap (chars
                                ; before NUL). Bumped from 95 because real
                                ; mirror.aratab.com URLs run past the 100-char
                                ; line and got truncated on click.
-FILE_BUF_SIZE  equ 0x2F00      ; 11.75 KB. Sized so FILEBUF_BASE (0x9D00) +
-                               ; FILE_BUF_SIZE + FONT_BUF_SIZE + 128 lands
-                               ; at 0xD480 -- below both MSX-DOS 1.03's
+FILE_BUF_SIZE  equ 0x2D00      ; 11.25 KB. Sized so FILEBUF_BASE (0x9D00) +
+                               ; FILE_BUF_SIZE + FONT_BUF_SIZE + 128 + 512 B
+                               ; (FastLutHi+FastLutLo, see lesson #1 in
+                               ; research/zero-latency screen6/LESSONS.md)
+                               ; lands at 0xD480 -- below both MSX-DOS 1.03's
                                ; *runtime* HIMEM (~0xDF94 on Sony HB-F1XD,
                                ; queried via BIOS HIMSAV @ 0xFC4A) AND
                                ; the .COM's initial SP (~0xDDC8 -- MSX-DOS
@@ -249,6 +251,7 @@ Main:
     CALLBIOS BIOS_CHGMOD                    ; Screen 6
 
     call    ExtractFont                 ; pull BIOS font into FontBuf (once)
+    call    BuildFastLut                ; populate FastLutHi/Lo from FontLUT
     call    SetPalette
     call    SetBorder
     call    ClearContent                ; VRAM all white (colour 0)
@@ -2691,6 +2694,96 @@ ExtractFont:
     jr      nz, .loop
     ret
 
+; BuildFastLut: populate the page-aligned bifurcated glyph LUT from
+; the existing 16-entry nibble->byte FontLUT (BLACK fg variant).
+; FastLutHi[byte] = expansion of high nibble (left 4 px, 1 VRAM byte).
+; FastLutLo[byte] = expansion of low  nibble (right 4 px, 1 VRAM byte).
+; Inner emit can then collapse to: ld l,fontByte / ld h,page /
+; ld a,(hl) / out (c),a / inc h / ld a,(hl) / out (c),a -- 71 T per
+; row vs ~135 T for EmitStyledByte (-47%).
+;
+; Called once at startup. Output lives in RAM; rebuilding on every
+; <font color> change is overkill (the slow EmitStyledByte path stays
+; the source of truth for non-default colours; bifurcated LUT only
+; serves the BLACK fg + style==0 fast lane).
+BuildFastLut:
+    ld      hl, FastLutHi
+    ld      b, 0                         ; 256-entry counter (B=0 -> djnz × 256)
+.bflLoop:
+    ld      a, l                         ; A = font byte (0..255 mod 256)
+    ; --- High nibble -> FastLutHi[A] ---
+    push    af
+    and     0xF0
+    rrca
+    rrca
+    rrca
+    rrca
+    ld      de, FontLUT
+    add     a, e
+    ld      e, a                         ; FontLUT base is byte-aligned;
+                                         ; high byte unchanged for our
+                                         ; nibble add (0..15 added)
+    ld      a, [de]
+    ld      [hl], a
+    ; --- Low nibble -> FastLutLo[A] ---
+    pop     af
+    and     0x0F
+    ld      de, FontLUT
+    add     a, e
+    ld      e, a
+    ld      a, [de]
+    inc     h                            ; FastLutLo = FastLutHi + 0x100
+    ld      [hl], a
+    dec     h                            ; back to FastLutHi
+    inc     l                            ; next index (wraps 255->0)
+    djnz    .bflLoop                     ; B counts 256 iterations
+    ret
+
+; DrawCharFastPlain: bifurcated-LUT fast lane used when no styling /
+; scaling / colour swap is active. Pre-condition: FastFontPtr points
+; at the 8 font bytes for the current glyph; B = byte column;
+; C = y pixel.
+;
+; Per row: SetVramWritePos (~52 T overhead unchanged) + 71 T inner
+; emit vs ~135 T for EmitStyledByte. ~64 T saved per row, 8 rows per
+; glyph = ~500 T saved per text glyph rendered through this path.
+DrawCharFastPlain:
+    ld      a, 8
+    ld      [DcfpRowsLeft], a
+    ld      hl, [FastFontPtr]
+.dcfpRow:
+    push    bc
+    push    hl
+    call    SetVramWritePos             ; clobbers HL/DE; preserves BC via push
+    pop     hl
+    pop     bc
+    ld      a, [hl]                     ; font byte
+    inc     hl
+    ; Bifurcated LUT lookup: H = page (FastLutHi), L = font byte.
+    ; Stash row pointer in DE so we can reuse HL for the LUT walk.
+    ld      d, h
+    ld      e, l
+    ld      l, a
+    ld      h, HIGH(FastLutHi)
+    ld      a, [hl]
+    out     (VDP_DATA), a
+    inc     h                           ; H = HIGH(FastLutLo)
+    ld      a, [hl]
+    out     (VDP_DATA), a
+    ld      h, d
+    ld      l, e
+    inc     c                           ; advance VRAM Y
+    ; Loop 8 times. Use a small inline counter so we don't have to
+    ; touch FastRowsLeft (the slow path's state byte) -- keeps the
+    ; two paths fully independent.
+    ld      a, [DcfpRowsLeft]
+    dec     a
+    ld      [DcfpRowsLeft], a
+    jp      nz, .dcfpRow
+    ret
+
+DcfpRowsLeft:   db 0                    ; ephemeral counter for the fast lane
+
 ; DrawCharFast: blit an 8x8 glyph to Screen-6 VRAM.
 ;   A = character code (0..255)
 ;   B = byte column (x / 4)   -- pixel x must be a multiple of 4
@@ -2706,6 +2799,29 @@ DrawCharFast:
     add     hl, de
     ld      [FastFontPtr], hl
 
+    ; quick_screen_draw fast lane: when no styling flags are active,
+    ; no Y-scaling, and the active fg LUT is the default FontLUT, the
+    ; bifurcated 256-byte FastLutHi/FastLutLo lets the inner emit
+    ; collapse to two `out (c),a` per row -- no nibble math, no
+    ; per-row style branches. Falls through to the slow EmitStyledByte
+    ; path on any of:  bold/italic/strike/underline/focused, scale=2,
+    ; or an inline <font color> swap pointing CurrentFontLUT
+    ; somewhere other than FontLUT.
+    ld      a, [HtmlStyleFlags]
+    or      a
+    jr      nz, .slowSetup
+    ld      a, [HtmlScaleY]
+    cp      2
+    jr      z, .slowSetup
+    ld      a, [CurrentFontLUT]
+    cp      LOW(FontLUT)
+    jr      nz, .slowSetup
+    ld      a, [CurrentFontLUT + 1]
+    cp      HIGH(FontLUT)
+    jr      nz, .slowSetup
+    jp      DrawCharFastPlain
+
+.slowSetup:
     ld      a, 8
     ld      [FastRowsLeft], a
 
@@ -16872,6 +16988,20 @@ FILEBUF_BASE   equ (RuntimeRamEnd + 0xFF) & 0xFF00
 FileBuf        equ FILEBUF_BASE
 FontBuf        equ FileBuf + FILE_BUF_SIZE
 ImgBuf         equ FontBuf + FONT_BUF_SIZE
+
+; quick_screen_draw / lesson #1: bifurcated page-aligned glyph LUT.
+; FastLutHi[font_byte] = high VRAM byte (left 4 px); FastLutLo[font_byte]
+; = low VRAM byte (right 4 px). Indexed by H = page, L = font_byte so
+; the inner emit collapses to `ld a,(hl); out (c),a; inc h; ld a,(hl);
+; out (c),a` -- no multiplication, no add. Built once at startup by
+; BuildFastLut from the 16-entry FontLUT (BLACK fg variant only).
+; <font color> swaps still go through the slow EmitStyledByte path.
+FAST_LUT_PAGE_BASE equ ((ImgBuf + 128 + 0xFF) & 0xFF00)
+FastLutHi          equ FAST_LUT_PAGE_BASE
+FastLutLo          equ FAST_LUT_PAGE_BASE + 0x100
+FastLutEnd         equ FastLutLo + 0x100
+    ASSERT (FastLutHi & 0xFF) == 0
+    ASSERT FastLutEnd <= 0xD500
 
 ; Build-time guards.
 ;   * FileEnd <= FILEBUF_BASE: catches the FileBuf-vs-globals overlap
