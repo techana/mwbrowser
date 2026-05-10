@@ -2078,22 +2078,29 @@ DrawScrollbar:
 
 ; ExtrapolateHtmlLineCountIfShort: when PrintFileContent bailed via the
 ; viewport-full short-circuit (parser cursor < FileBuf + WindowLen),
-; multiply HtmlLineCount by the smallest power of 2 K such that
-; consumed << K >= WindowLen. K is at most 8, so the new count is a
-; 1..256x scale of what's been parsed so far.
+; we still owe the caller a HtmlLineCount big enough that PageDown's
+; clamp doesn't pin them to the current viewport. We tried various
+; estimators (power-of-2 scaling, then linear ratio); both had the
+; same failure mode: the per-render estimate is computed from
+; partial data and DECREASES as the parser walks deeper into the
+; doc, which then SHRINKS PageDown's clamp below the user's current
+; ScrollLine and silently jams them at "stuck at page 2".
 ;
-; Power-of-2 scaling intentionally over-estimates a little (typical
-; 1.3x..2x over the true total) so the user can keep PageDown'ing
-; past the viewport-full break before the parser runs the rest of
-; the doc. PageDown re-renders from the new ScrollLine; the parser
-; then walks further and refines HtmlLineCount upward each time.
+; Simpler approach: cap HtmlLineCount at 0xFFFF (saturated) on every
+; short-circuit. PageDown then advances freely until the user
+; actually overshoots; the snap-back path in RefreshAfterScroll
+; catches the overshoot, latches the exact count into HtmlLineCount,
+; sets HtmlLineCountAccurate, and lands the viewport on the last
+; full page. From that point on PageDown clamps correctly against
+; the true count. Trade-off: until the snap-back fires once, the
+; scroll-thumb sits tiny at 22/0xFFFF -- cosmetic only.
 ;
 ; No-op when:
-; * consumed == WindowLen (parser already finished naturally)
-; * HtmlLineCountAccurate flag set (a previous render already walked
-;   to EOF and locked the count to the exact value -- re-extrapolating
-;   would create jitter as PageDown / snap-back keep undoing each
-;   other's work).
+; * consumed == WindowLen (parser walked to natural EOF; HtmlLineCount
+;   is already exact -- latch the accuracy flag).
+; * HtmlLineCountAccurate flag set (a previous render already
+;   discovered the exact count via natural EOF or snap-back -- never
+;   stomp it with the saturated default).
 ExtrapolateHtmlLineCountIfShort:
     ld      a, [HtmlLineCountAccurate]
     or      a
@@ -2108,67 +2115,15 @@ ExtrapolateHtmlLineCountIfShort:
     ld      de, [WindowLen]
     or      a
     sbc     hl, de
-    jr      c, .eaShortNeed
+    jr      c, .eaShort
     ; consumed >= WindowLen: parser walked the whole doc, count is
     ; now exact. Latch the flag so future renders skip extrapolation.
     ld      a, 1
     ld      [HtmlLineCountAccurate], a
     ret
-.eaShortNeed:
-    ; Linear extrapolation: estimated = HtmlLineCount * total / consumed.
-    ; Both total and consumed are <= FILE_BUF_SIZE (~9 KB), well under
-    ; 16 bits. We scale both by the same right-shift amount until the
-    ; denominator fits in 8 bits, then run DivU16By8 to get the ratio,
-    ; then multiply HtmlLineCount by it (saturating at 0xFFFF).
-    ; This is much more accurate than the power-of-2 approximation
-    ; we used to use, which systematically over-estimated by up to
-    ; 2x and forced PageDown to overshoot + snap-back / re-render.
-    ld      hl, [ParserCursor]
-    ld      de, FileBuf
-    or      a
-    sbc     hl, de                       ; HL = consumed
-    ld      de, [WindowLen]              ; DE = total
-.eaScaleDown:
-    ld      a, h
-    or      a
-    jr      z, .eaScaled                 ; consumed already 8-bit
-    srl     h                            ; consumed >>= 1
-    rr      l
-    srl     d                            ; total >>= 1
-    rr      e
-    jr      .eaScaleDown
-.eaScaled:
-    ; HL = scaled consumed (low byte = L), DE = scaled total.
-    ld      c, l
-    or      a
-    ret     z                            ; consumed underflowed to 0 -> bail
-    ; Compute ratio = DE / C using DivU16By8 (HL gets DE, returns
-    ; quotient in HL).
-    ld      h, d
-    ld      l, e
-    call    DivU16By8                    ; HL = ratio (typically 1..32), A = remainder
-    ; Multiply HtmlLineCount by HL (the ratio). Result must fit in
-    ; 16-bit; saturate at 0xFFFF on overflow.
-    ld      a, h
-    or      a
-    jr      nz, .eaSat                   ; ratio > 255 -> blow up; saturate
-    ld      a, l                         ; A = ratio (8-bit)
-    or      a
-    jr      z, .eaSat                    ; ratio = 0 (can't happen since total > consumed) -> safe
-    cp      1
-    ret     z                            ; ratio = 1 -> count already fits
-    ld      b, a                         ; B = ratio multiplier
-    ld      hl, [HtmlLineCount]
-    ld      d, h
-    ld      e, l                         ; DE = original count
-    ld      hl, 0
-.eaMulLoop:
-    add     hl, de
-    jr      c, .eaSat
-    djnz    .eaMulLoop
-    ld      [HtmlLineCount], hl
-    ret
-.eaSat:
+.eaShort:
+    ; Saturated default: PageDown advances freely; snap-back will
+    ; latch the true count once the user overshoots.
     ld      hl, 0xFFFF
     ld      [HtmlLineCount], hl
     ret
