@@ -167,7 +167,7 @@ URL_MAX        equ 255         ; address-bar / fetch-target buffer cap (chars
                                ; before NUL). Bumped from 95 because real
                                ; mirror.aratab.com URLs run past the 100-char
                                ; line and got truncated on click.
-FILE_BUF_SIZE  equ 0x2300      ; 8.75 KB. Sized so FILEBUF_BASE (0x9F00) +
+FILE_BUF_SIZE  equ 0x2200      ; 8.5 KB. Sized so FILEBUF_BASE (0xA000) +
                                ; FILE_BUF_SIZE + FONT_BUF_SIZE + 128 +
                                ; 512 B (FastLutHi+FastLutLo, lesson #1) +
                                ; 2 KB (TransposedFontBuf, lesson #3, see
@@ -3946,6 +3946,74 @@ PrintFileContent:
     ld      [PendingRestoreSlot], a
 .pfcNoRestore:
 
+    ; quick_screen_draw: fast-forward via LineCache. On a scrolled
+    ; render (ScrollLine != 0), look up the cached entry whose
+    ; line_no is the largest <= ScrollLine. If found, restore
+    ; parser state from that snapshot, advance HL into FileBuf to
+    ; the cached doc_offset, charge the cached lines against
+    ; HtmlLineSkip + HtmlLineCount, and let the parser pick up from
+    ; there. Without this, every PageDown re-walks from byte 0 of
+    ; FileBuf so each subsequent page takes longer than the
+    ; previous (the "intermediate empty white view area gets
+    ; longer and longer" bug).
+    ld      a, [ScrollLine]
+    ld      b, a
+    ld      a, [ScrollLine + 1]
+    or      b
+    jr      z, .pfcNoFastFwd             ; ScrollLine == 0: nothing to skip
+    push    hl                           ; save HL = FileBuf
+    ld      hl, [ScrollLine]
+    call    LineCacheLookupLine          ; A = slot or 0xFF
+    pop     hl
+    cp      0xFF
+    jr      z, .pfcNoFastFwd
+    ; Restore parser state from the cached slot.
+    push    hl
+    call    LineCacheRestore             ; clobbers A/HL/DE
+    pop     hl
+    ; HL = FileBuf + (cached_doc_offset - DocOffset). The slot's
+    ; line_no + matching doc_offset live at LineCacheLineNo[slot] +
+    ; LineCacheDocOff[slot]; LcllBestLine + LcllBestIdx still hold
+    ; the chosen entry from LineCacheLookupLine.
+    ld      a, [LcllBestIdx]
+    ld      c, a
+    ; Read LineCacheDocOff[slot] (3 bytes) -> use only the low 16
+    ; bits relative to DocOffset's low 16 (FileBuf is < 0x10000 and
+    ; the chunk fits in WindowLen <= 0x2300, so a 16-bit subtract
+    ; covers the cache). The slide path's 24-bit case handled the
+    ; cross-chunk problem already.
+    add     a, c
+    add     a, c                         ; A = slot * 3
+    ld      e, a
+    ld      d, 0
+    ld      hl, LineCacheDocOff
+    add     hl, de
+    ld      e, [hl]                      ; E = doc_off low
+    inc     hl
+    ld      d, [hl]                      ; D = doc_off mid
+    ; HL = FileBuf + (doc_off - DocOffset)
+    ld      hl, [DocOffset]
+    push    hl
+    ex      de, hl                       ; HL = doc_off (low word)
+    pop     de                           ; DE = DocOffset (low word)
+    or      a
+    sbc     hl, de                       ; HL = doc_off - DocOffset
+    ld      de, FileBuf
+    add     hl, de                       ; HL = FileBuf + (doc_off - DocOffset)
+    ; Adjust HtmlLineSkip = ScrollLine - cached_line_no.
+    ; HtmlLineCount = cached_line_no (so the cache append on this
+    ; render's later EmitNewlines stays consistent).
+    push    hl
+    ld      hl, [LcllBestLine]
+    ld      [HtmlLineCount], hl
+    ld      de, [ScrollLine]
+    ex      de, hl                       ; HL = ScrollLine, DE = cached line
+    or      a
+    sbc     hl, de                       ; HL = ScrollLine - cached
+    ld      [HtmlLineSkip], hl
+    pop     hl
+.pfcNoFastFwd:
+
 .loop:
     ; Mirror the parser cursor into ParserCursor so any handler that
     ; needs to know "where am I in the document?" -- LineCache append,
@@ -6125,6 +6193,74 @@ Cmp24:
     sbc     a, b                         ; HL_hi - DE_hi - borrow
     pop     de
     pop     hl
+    ret
+
+; LineCacheLookupLine: find the cached slot whose stored line_no is
+; the largest one not exceeding the target line. Mirror of
+; LineCacheLookupOffset but indexed on LineCacheLineNo (2 bytes per
+; slot) instead of LineCacheDocOff (3 bytes per slot).
+;
+; Input:  HL = target line number (caller's ScrollLine).
+; Output: A = slot index (0..LineCacheCount-1) of the qualifying
+;             entry, or 0xFF if no slot has line_no <= target.
+;             LcllBestIdx + LcllBestLine left at the chosen values.
+;
+; Phase-3 LineCache populates one entry per rendered line on the
+; initial pass (until the ring fills, then evicts oldest), so on
+; a typical PageDown into a freshly-walked doc we land on either
+; an exact match or one line shy of the target. Either way the
+; subsequent parser walks at most ~1 cell rather than re-walking
+; the full prefix from byte 0.
+LineCacheLookupLine:
+    push    de
+    push    bc
+    push    hl                            ; preserve target
+    ld      [LcllTarget], hl              ; stash target for inner compares
+    ld      a, 0xFF
+    ld      [LcllBestIdx], a
+    ld      hl, 0
+    ld      [LcllBestLine], hl
+    ld      a, [LineCacheCount]
+    or      a
+    jr      z, .lcllDone
+    ld      b, a                          ; B = remaining slots
+    ld      c, 0                          ; C = current slot index
+.lcllIter:
+    ; HL = LineCacheLineNo + slot * 2
+    ld      a, c
+    add     a, c                          ; slot * 2 (LineCacheMax = 32, fits in A)
+    ld      e, a
+    ld      d, 0
+    ld      hl, LineCacheLineNo
+    add     hl, de
+    ; DE = slot.line_no
+    ld      a, [hl]
+    ld      e, a
+    inc     hl
+    ld      a, [hl]
+    ld      d, a
+    ; slot.line_no <= target ?
+    ld      hl, [LcllTarget]
+    or      a
+    sbc     hl, de                        ; HL = target - slot.line_no
+    jr      c, .lcllNext                  ; slot > target -> skip
+    ; slot <= target. Update best iff slot > best.
+    ld      hl, [LcllBestLine]
+    or      a
+    sbc     hl, de                        ; HL = best - slot
+    jr      nc, .lcllNext                 ; best >= slot -> skip
+    ; slot > best: record.
+    ld      a, c
+    ld      [LcllBestIdx], a
+    ld      [LcllBestLine], de
+.lcllNext:
+    inc     c
+    djnz    .lcllIter
+.lcllDone:
+    ld      a, [LcllBestIdx]
+    pop     hl
+    pop     bc
+    pop     de
     ret
 
 ; LineCacheLookupOffset: find the cached slot whose stored doc_offset
@@ -17198,6 +17334,12 @@ LcloBestOff:    db 0, 0, 0              ; best entry doc_offset so far (24-bit)
 ; that fall in the slide path.
 SlideTarget:    db 0, 0, 0
 LcloBestIdx:    db 0xFF                 ; best entry slot, or 0xFF = none
+
+; LineCacheLookupLine scratch (mirrors Lclo* but indexed by line_no).
+; Only touched while the routine runs.
+LcllTarget:     dw 0
+LcllBestLine:   dw 0
+LcllBestIdx:    db 0xFF
 
 ; Slide -> render parser-state hand-off (Phase 7 fix). When a slide
 ; aligns its target to a cached safe boundary, we save the slot
