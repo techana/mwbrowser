@@ -5067,7 +5067,15 @@ class MsxSession:
         # Drop optional :port from host_part for the comparison.
         host = host_part.split(":", 1)[0].lower()
         self_hosts = {"127.0.0.1", "localhost", SERVER_IP.lower()}
-        if host not in self_hosts:
+        # A bare leading-slash path ("HELLO.TXT" after the lstrip above
+        # means host_part="" and path_part already set) is treated as
+        # self-host: relative-link clicks from a page served out of
+        # CFG['root'] arrive as "GET /HELLO.TXT" with no host. Without
+        # this branch the request would fall through to _fetch_page,
+        # which would prepend http:// and fail to resolve.
+        if not host_part and path_part:
+            pass  # accept as self-host
+        elif host not in self_hosts:
             return None
         # Hit: serve from CFG['root'].
         root = CFG.get("root")
