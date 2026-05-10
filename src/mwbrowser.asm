@@ -5946,6 +5946,18 @@ LineCacheMaybeAppend:
     ld      a, [HtmlLineSkip + 1]
     or      b
     ret     nz                          ; scrolled render -> skip
+    ; Even when HtmlLineSkip drained to 0 mid-render (e.g. after a
+    ; fast-forward cache hit on a PageDown), don't append more
+    ; entries -- the cache snapshot from the initial pass is what
+    ; subsequent PageUp/PageDown queries against, and ring-evicting
+    ; old entries here would slowly delete the entries needed to
+    ; PageUp back into earlier parts of the doc. ScrollLine != 0 at
+    ; render entry is the test for "this is a scrolled render".
+    ld      a, [ScrollLine]
+    ld      b, a
+    ld      a, [ScrollLine + 1]
+    or      b
+    ret     nz                          ; scrolled render -> don't pollute cache
     call    IsLineCacheStateSafe
     ret     nz                          ; unsafe scope open -> skip
     push    hl
