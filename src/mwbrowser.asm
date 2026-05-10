@@ -3812,6 +3812,7 @@ PrintFileContent:
     ld      a, 2
     ld      [HtmlLineEmpty], a          ; trim leading whitespace
     xor     a
+    ld      [HtmlNoDraw], a             ; reset count-only mode
     ld      [HtmlTitleLen], a
     ld      [HtmlTitleSeen], a
     ld      [HtmlLineCount], a          ; 16-bit -- low byte
@@ -3925,30 +3926,40 @@ PrintFileContent:
     call    BusyHeartbeat
 
 
-    ; Viewport-full short-circuit. Once HtmlLineSkip has drained (0) and
-    ; the Y cursor has painted past the bottom of the content area,
-    ; nothing we parse from here on can appear on screen. Bailing out
-    ; skips every subsequent <img src=...> file-open, which is the
-    ; dominant cost when an HTM file stacks many screenshots (the
-    ; WEBSITE.HTM wrapper emitted by tools/web_to_sc6.py). Without
-    ; this, every PageDown re-opens and drains all trailing images.
+    ; Viewport-full handling. Two cases:
     ;
-    ; Initial pass (ScrollLine == 0) used to be exempt because
-    ; HtmlLineCount drove the scroll-thumb math and PageDown's clamp;
-    ; a short count made the user feel like the doc ended at the
-    ; first viewport. We now ExtrapolateHtmlLineCount at .eof when
-    ; we short-circuit, so the initial pass also bails the moment
-    ; the viewport is full -- giving the user back keyboard control
-    ; immediately after first paint instead of holding it for the
-    ; many seconds it takes to walk a 30 KB doc to EOF.
+    ; * Initial pass (ScrollLine == 0): once the viewport is full we
+    ;   want HtmlLineCount to keep growing so the scroll thumb and
+    ;   PageDown clamp reflect the WHOLE rendered-line count of the
+    ;   window. Set HtmlNoDraw=1 so LineFlush stops emitting cells
+    ;   to VRAM (no off-screen TextY overdraws into the chrome) but
+    ;   the parser keeps walking + EmitNewline keeps incrementing
+    ;   the count. Drops natural-EOF cleanly.
+    ;
+    ; * Scrolled pass (ScrollLine != 0): jump to .eof immediately --
+    ;   skipping every trailing <img src=...> file-open which is
+    ;   the dominant cost on HTM pages that stack screenshots
+    ;   (WEBSITE.HTM emitted by tools/web_to_sc6.py).
     ld      a, [HtmlLineSkip]
     ld      b, a
     ld      a, [HtmlLineSkip + 1]
     or      b
-    jr      nz, .loopNotFull
+    jr      nz, .loopNotFull             ; still skipping
     ld      a, [TextY]
     cp      CONTENT_Y1 + 1
-    jr      nc, .eof
+    jr      c, .loopNotFull              ; viewport not full yet
+    ; Viewport full.
+    ld      a, [ScrollLine]
+    ld      b, a
+    ld      a, [ScrollLine + 1]
+    or      b
+    jp      nz, .eof                     ; scrolled: short-circuit
+    ; Initial pass: switch to count-only mode if not already.
+    ld      a, [HtmlNoDraw]
+    or      a
+    jr      nz, .loopNotFull             ; already counting; just keep walking
+    ld      a, 1
+    ld      [HtmlNoDraw], a
 .loopNotFull:
     ; End-of-buffer check.
     push    hl
@@ -4037,7 +4048,7 @@ PrintFileContent:
     call    EmitText
 .entityDone:
     pop     hl
-    jr      .loop
+    jp      .loop
 
 ; ----------------------------------------------------------------------------
 ; EmitText: consume one source character (or entity result) into the output
@@ -4673,15 +4684,21 @@ LineFlush:
     or      a
     ret     z
 
-    ; Suppress the actual VRAM paint while HtmlLineSkip > 0 (the
-    ; first N rendered lines of a scrolled pass are cells we need
-    ; to have *laid out* for wrap consistency with the non-scrolled
-    ; render, but we don't want them on screen). Resolve/BiDi still
-    ; run so any internal state stays consistent.
+    ; Suppress the actual VRAM paint when:
+    ; * HtmlLineSkip > 0 (scrolled pass: skip the first N rendered
+    ;   lines so they DON'T appear on screen but their wrap math
+    ;   still happens for cache consistency).
+    ; * HtmlNoDraw != 0 (initial pass past viewport-full: keep
+    ;   walking to count remaining lines, but stop drawing so we
+    ;   don't overdraw the last visible row or wrap into the
+    ;   chrome).
     ld      a, [HtmlLineSkip]
     ld      b, a
     ld      a, [HtmlLineSkip + 1]
     or      b
+    jr      nz, .lfSkipDraw
+    ld      a, [HtmlNoDraw]
+    or      a
     jr      nz, .lfSkipDraw
 
     call    LineResolveNeutrals
@@ -17205,6 +17222,15 @@ HtmlLineCount:  dw 0                    ; total rendered lines (for thumb math)
 ; Cleared on a fresh file load so a window slide / new doc starts
 ; the estimate cycle over.
 HtmlLineCountAccurate: db 0
+; quick_screen_draw: when the parser fills the visible viewport on
+; an initial-load pass, we DON'T short-circuit out of the loop; we
+; set HtmlNoDraw=1 instead so the parser keeps walking to natural
+; EOF (giving an exact HtmlLineCount + TotalLines) but LineFlush
+; stops emitting cells to VRAM. Without this byte, off-screen
+; rendered lines either overdraw the last visible row or wrap
+; their TextY into the chrome. Reset to 0 at PrintFileContent
+; entry.
+HtmlNoDraw:        db 0
 HtmlScaleY:     db 1                    ; 1 = normal glyph height, 2 = H1/H2
 HtmlInAnchor:   db 0                    ; 1 while inside an <a>..</a>
 HtmlFocusLink:  db 0xFF                 ; index of Tab-focused link (0xFF = none)
