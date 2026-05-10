@@ -5990,30 +5990,41 @@ LineCacheMaybeAppend:
     ret     nz                          ; scrolled render -> don't pollute cache
     call    IsLineCacheStateSafe
     ret     nz                          ; unsafe scope open -> skip
+    ; Stride sampling. We don't want to cache EVERY safe line --
+    ; for a 100-line doc that would ring-evict the early entries
+    ; before the user PageDowns to them, leaving the cache full of
+    ; only the latest lines. Instead, only append when HtmlLineCount
+    ; has advanced by AT LEAST LineCacheStride lines since the last
+    ; append. When the cache fills, double the stride and decimate
+    ; (drop every other entry, compacting). Net effect: cache stays
+    ; evenly spread across the full doc with ~LineCacheMax entries,
+    ; regardless of doc length.
+    ld      hl, [HtmlLineCount]
+    ld      de, [LineCacheLastLine]
+    or      a
+    sbc     hl, de                       ; HL = HtmlLineCount - LastLine
+    ld      a, [LineCacheStride]
+    ld      e, a
+    ld      d, 0                         ; DE = stride
+    or      a
+    sbc     hl, de                       ; HL = (HtmlLineCount - LastLine) - stride
+    ret     c                            ; gap < stride -> skip
     push    hl
     push    de
     push    bc
-    ; Pick the slot index. Two cases:
-    ;   count < LineCacheMax  -> append at slot[count], bump count.
-    ;   count == LineCacheMax -> ring-buffer eviction: write to
-    ;       slot[head], advance head modulo Max. Count stays at Max.
-    ; Either way C ends up holding the chosen slot index, which then
-    ; gets multiplied for the line_no / doc_offset / state strides.
     ld      a, [LineCacheCount]
     cp      LineCacheMax
     jr      c, .lcmaPartial
-    ; Full: ring eviction. Slot = head; advance head.
-    ld      a, [LineCacheHead]
-    ld      c, a                        ; C = slot index
-    inc     a
-    cp      LineCacheMax
-    jr      c, .lcmaHeadOk
-    xor     a                           ; wrap to 0
-.lcmaHeadOk:
-    ld      [LineCacheHead], a
-    jr      .lcmaWrite
+    ; Cache full: double stride, decimate (compact every other slot
+    ; into the lower half), then proceed to append at the freed
+    ; slot.
+    ld      a, [LineCacheStride]
+    add     a, a
+    ld      [LineCacheStride], a
+    call    LineCacheDecimate
 .lcmaPartial:
-    ld      c, a                        ; C = slot index = current count
+    ld      a, [LineCacheCount]
+    ld      c, a                         ; C = slot index = current count
     inc     a
     ld      [LineCacheCount], a
 .lcmaWrite:
@@ -6060,11 +6071,87 @@ LineCacheMaybeAppend:
     inc     hl
     pop     af
     ld      [hl], a                      ; hi
+    ; Record the line_no of this append so the next stride check
+    ; knows where to start counting from.
+    ld      hl, [HtmlLineCount]
+    ld      [LineCacheLastLine], hl
     ; ── Slot 3: parser state snapshot ──
     pop     bc
     pop     de
     pop     hl
     jp      LineCacheSnapshot            ; tail-call
+
+; LineCacheDecimate: keep slots at even indices (0, 2, 4, ..., 30),
+; compacting them into slots 0..15. Halves LineCacheCount. Called by
+; LineCacheMaybeAppend just after stride doubles, so the cache stays
+; evenly spread across the doc as more lines arrive.
+LineCacheDecimate:
+    push    af
+    push    bc
+    push    de
+    push    hl
+    ; ── LineCacheLineNo: 2 bytes/slot. Compact slots 1..15 from
+    ;     even-indexed source slots (slot 2, 4, ..., 30). Slot 0
+    ;     stays put.
+    ld      hl, LineCacheLineNo + 4      ; src = slot 2 byte 0
+    ld      de, LineCacheLineNo + 2      ; dst = slot 1 byte 0
+    ld      b, LineCacheMax / 2 - 1      ; 15 dst slots
+.lcdLine:
+    ld      a, [hl]
+    ld      [de], a
+    inc     hl
+    inc     de
+    ld      a, [hl]
+    ld      [de], a
+    inc     hl
+    inc     de
+    ; HL now points to the odd slot's byte 0. Skip 2 bytes to land
+    ; on the next even slot. DE is correct (next dst slot byte 0).
+    inc     hl
+    inc     hl
+    djnz    .lcdLine
+    ; ── LineCacheDocOff: 3 bytes/slot.
+    ld      hl, LineCacheDocOff + 6      ; src = slot 2 byte 0
+    ld      de, LineCacheDocOff + 3      ; dst = slot 1 byte 0
+    ld      b, LineCacheMax / 2 - 1
+.lcdOff:
+    ld      a, [hl]
+    ld      [de], a
+    inc     hl
+    inc     de
+    ld      a, [hl]
+    ld      [de], a
+    inc     hl
+    inc     de
+    ld      a, [hl]
+    ld      [de], a
+    inc     hl
+    inc     de
+    ; Skip the odd slot's 3 bytes.
+    inc     hl
+    inc     hl
+    inc     hl
+    djnz    .lcdOff
+    ; ── LineCacheState: LineCacheStateSz bytes/slot.
+    ld      hl, LineCacheState + 2 * LineCacheStateSz
+    ld      de, LineCacheState + LineCacheStateSz
+    ld      b, LineCacheMax / 2 - 1
+.lcdState:
+    push    bc
+    ld      bc, LineCacheStateSz
+    ldir                                  ; copy stateSz bytes; HL+=sz, DE+=sz
+    ld      bc, LineCacheStateSz
+    add     hl, bc                        ; skip the odd slot
+    pop     bc
+    djnz    .lcdState
+    ; New count = LineCacheMax / 2 = 16.
+    ld      a, LineCacheMax / 2
+    ld      [LineCacheCount], a
+    pop     hl
+    pop     de
+    pop     bc
+    pop     af
+    ret
 
 ; IsLineCacheStateSafe: returns Z (with A=0) when the parser's "open
 ; scopes" are all at default values, NZ otherwise. Safe scope means
@@ -6208,6 +6295,10 @@ LineCacheReset:
     xor     a
     ld      [LineCacheCount], a
     ld      [LineCacheHead], a
+    ld      [LineCacheLastLine], a
+    ld      [LineCacheLastLine + 1], a
+    ld      a, 1
+    ld      [LineCacheStride], a
     ret
 
 ; Cmp24: 24-bit unsigned compare of two values stored at [HL] and [DE]
@@ -17359,6 +17450,17 @@ LineCacheCount: db 0
 ; (count < max) doesn't use head -- new entries land at slot[count]
 ; and head stays at 0.
 LineCacheHead:  db 0
+; Stride sampling state. LineCacheStride starts at 1 (cache every
+; safe line); LineCacheMaybeAppend doubles it whenever the cache
+; fills (calling LineCacheDecimate to keep every 2nd entry). After
+; the initial pass on a long doc the cache ends up with
+; LineCacheMax/2 .. LineCacheMax entries spread evenly across the
+; doc, so PageDown to ANY line (early or late) finds a cached
+; entry within stride-1 lines. Without this, ring-eviction left
+; the cache full of late lines and PageDown 1/2 missed the cache
+; entirely, falling back to the slow byte-0 walk.
+LineCacheStride:    db 1
+LineCacheLastLine:  dw 0
 ; LineCacheLineNo / LineCacheDocOff / LineCacheState moved past FileEnd:.
 
 ; LineCacheLookupOffset scratch (Phase 7 fix). Lives in RAM so the
