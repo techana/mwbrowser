@@ -5030,11 +5030,107 @@ class MsxSession:
             url, dw, dh = entry
             return self._fetch_image_to_pcx(url, dw, dh)
 
+        # Self-host short-circuit: when the requested URL is the bridge
+        # itself (127.0.0.1, localhost, or the LAN IP we're listening on),
+        # serve from CFG['root'] directly instead of round-tripping
+        # through HTTP. Catches: "127.0.0.1", "127.0.0.1/HELLO.TXT",
+        # "http://localhost/", etc. -- all flow into the same root
+        # listing / file-serve path the HTTP handler uses.
+        served = self._maybe_serve_self_host(target)
+        if served is not None:
+            return served
         if target.lower().startswith(("http://", "https://")):
             return self._fetch_page(target)
         if "." in target or target.startswith("/"):
             return self._fetch_page("http://" + target.lstrip("/"))
         return ("404", None)
+
+    def _maybe_serve_self_host(self, target):
+        """If ``target`` resolves to the bridge's own host (loopback or
+        LAN IP), serve from CFG['root']. Returns ("HTM", body) or
+        ("404", None) on hit; None when the target isn't self-host so
+        the caller falls through to its normal dispatch."""
+        # Strip optional scheme + leading slash; isolate host[:port] and path.
+        url = target.strip()
+        low = url.lower()
+        for prefix in ("http://", "https://"):
+            if low.startswith(prefix):
+                url = url[len(prefix):]
+                low = low[len(prefix):]
+                break
+        # Split host vs path.
+        slash = url.find("/")
+        if slash < 0:
+            host_part, path_part = url, ""
+        else:
+            host_part, path_part = url[:slash], url[slash + 1:]
+        # Drop optional :port from host_part for the comparison.
+        host = host_part.split(":", 1)[0].lower()
+        self_hosts = {"127.0.0.1", "localhost", SERVER_IP.lower()}
+        if host not in self_hosts:
+            return None
+        # Hit: serve from CFG['root'].
+        root = CFG.get("root")
+        if not root:
+            return ("404", None)
+        # Empty path -> directory listing.
+        if not path_part:
+            html = _root_listing_html()
+            body = html.encode(WIRE_CHARSET, "replace")
+            self.pending_chunks = []
+            self.body = body
+            self.page_total = 0
+            self.page_served = 0
+            self.img_cache = {}
+            self.img_counter = 0
+            return ("HTM", body)
+        # Reject traversal.
+        rel = urllib.parse.unquote(path_part)
+        if ".." in rel.split("/") or rel.startswith("/") or ":" in rel:
+            return ("404", None)
+        full = os.path.normpath(os.path.join(root, rel))
+        try:
+            common = os.path.commonpath([os.path.abspath(full),
+                                         os.path.abspath(root)])
+        except ValueError:
+            return ("404", None)
+        if common != os.path.abspath(root):
+            return ("404", None)
+        if os.path.isdir(full):
+            saved = CFG["root"]
+            CFG["root"] = full
+            try:
+                html = _root_listing_html()
+            finally:
+                CFG["root"] = saved
+            body = html.encode(WIRE_CHARSET, "replace")
+            self.pending_chunks = []
+            self.body = body
+            self.page_total = 0
+            self.page_served = 0
+            self.img_cache = {}
+            self.img_counter = 0
+            return ("HTM", body)
+        if not os.path.isfile(full):
+            return ("404", None)
+        try:
+            with open(full, "rb") as fh:
+                data = fh.read()
+        except OSError:
+            return ("404", None)
+        ext = os.path.splitext(full)[1].lower()
+        # HTM/TXT flow back as the HTM frame the on-MSX renderer
+        # already knows; binary types stream as the same frame -- the
+        # MSX writer (Phase 3) will decide what to do with them.
+        self.pending_chunks = []
+        self.body = data
+        self.page_total = 0
+        self.page_served = 0
+        self.img_cache = {}
+        self.img_counter = 0
+        if ext in (".htm", ".html", ".txt"):
+            return ("HTM", data)
+        return ("HTM", data)  # Phase 3 will distinguish via MIME if needed.
 
     # -- HTML fetch + simplify -----------------------------------------
 
