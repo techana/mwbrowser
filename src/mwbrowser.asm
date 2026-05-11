@@ -15766,15 +15766,20 @@ OpenSaveFromTitlebar:
     ld      a, [DocOffset + 2]
     ld      [SaveResumeOffset + 2], a
 
-    ; Size estimate = SerialPageTotal * SERIAL_CHUNK_RANGE_BYTES
-    ; (0x1800 = 6 KB). 16-bit product; saturates at 0xFFFF for very
-    ; large docs -- the live progress counter is exact, the headline
-    ; "Size:" is only ever an estimate.
+    ; Size for the popup's "Size:" row. If the bridge served the
+    ; whole doc in one chunk (SerialPageTotal <= 1), WindowLen is
+    ; the exact file size -- use it. Otherwise estimate via
+    ; SerialPageTotal * SERIAL_CHUNK_RANGE_BYTES (0x1800 = 6 KB).
+    ; The estimate overshoots by < 6 KB on the last chunk; the
+    ; live progress counter is always exact, and SaveByteCount is
+    ; overwritten with the true byte total at .dsCloseAndDone so
+    ; the final "Saved" frame reads correctly either way.
     ld      a, [SerialPageTotal]
-    or      a
-    jr      nz, .ostHaveTotal
-    inc     a                               ; 0 -> 1 (defensive)
-.ostHaveTotal:
+    cp      2
+    jr      nc, .ostMultiChunk
+    ld      hl, [WindowLen]
+    jr      .ostHaveSize
+.ostMultiChunk:
     ld      h, a
     ld      l, 0                            ; HL = total * 256
     add     hl, hl                          ; * 512
@@ -15784,6 +15789,7 @@ OpenSaveFromTitlebar:
     ld      e, l                            ; DE = total * 2048
     add     hl, hl                          ; HL = total * 4096
     add     hl, de                          ; HL = total * 6144 (mod 16-bit)
+.ostHaveSize:
     ld      [SaveByteCount], hl
     jr      OpenSave
 
