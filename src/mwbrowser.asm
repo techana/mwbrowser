@@ -16186,7 +16186,19 @@ CloseSave:
     xor     a
     ld      [SaveOpen], a
     call    PopupRestoreFocusAndPaintChrome
-    jp      RestorePopupBg              ; HMMM-blit the bg back
+    call    RestorePopupBg              ; HMMM-blit the bg back
+    ; Drain any keys the user mashed while the chunk-loop / refetch
+    ; were busy. Without this a second Esc queued during the multi-
+    ; second cancel-cleanup reaches MainLoop with SaveOpen=0 and
+    ; hits the .noPopup branch -> Shutdown, killing the program.
+.csDrainKbd:
+    ld      c, DOS_CONST
+    call    BDOS_ENTRY
+    or      a
+    ret     z
+    ld      c, DOS_DIRIN
+    call    BDOS_ENTRY
+    jr      .csDrainKbd
 
 ; DoSave: stream the remote source from offset 0 to the dest FCB
 ; via the web bridge, 6 KB chunks at a time.
@@ -16225,6 +16237,12 @@ DoSave:
     ld      a, [SaveStatus]
     cp      SaveStatus_Done
     jp      z, CloseSave
+
+    ; Re-stamp the cursor (PollMouse erased it before HandleClick
+    ; fired; without this it stays gone for the duration of the
+    ; multi-second download, so the user can't visually track where
+    ; Cancel sits to click it).
+    call    DrawCursor
 
     ld      a, SaveStatus_Saving
     ld      [SaveStatus], a
