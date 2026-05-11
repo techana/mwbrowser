@@ -6571,7 +6571,8 @@ IsLineCacheStateSafe:
 ;
 ; Slot bytes (must match LineCacheRestore):
 ;   +0 HtmlScaleY  +1 HtmlListKind   +2 HtmlOlCounter +3 HtmlIndent
-;   +4 HtmlAlign   +5 HtmlDir        +6 HtmlFg        +7 (reserved)
+;   +4 HtmlAlign   +5 HtmlDir        +6 HtmlFg
+;   +7 packed: bits 0..1 = HtmlDefaultAlign, bit 2 = HtmlDefaultDir
 ;
 ; Clobbers A, HL, DE.
 LineCacheSnapshot:
@@ -6606,8 +6607,21 @@ LineCacheSnapshot:
     ld      a, [HtmlFg]
     ld      [hl], a
     inc     hl
-    xor     a
-    ld      [hl], a                     ; reserved byte
+    ; Byte 7: pack HtmlDefaultAlign (low 2 bits) + HtmlDefaultDir
+    ; (bit 2) so ResetBlockAttrs after a LineCacheRestore-driven
+    ; fast-forward gets back to the right document-level alignment
+    ; instead of falling back to 0 (LTR/left). Without this, every
+    ; PageDown into a doc whose <html dir="rtl"> sits before the
+    ; cached entry loses RTL alignment as soon as the parser hits
+    ; the next block close.
+    ld      a, [HtmlDefaultDir]
+    add     a, a
+    add     a, a                        ; bit 2 = DefaultDir
+    ld      c, a
+    ld      a, [HtmlDefaultAlign]
+    and     0x03
+    or      c
+    ld      [hl], a
     pop     bc
     ret
 
@@ -6648,6 +6662,18 @@ LineCacheRestore:
     inc     hl
     ld      a, [hl]
     ld      [HtmlFg], a
+    inc     hl
+    ; Byte 7: unpack HtmlDefaultAlign (low 2 bits) + HtmlDefaultDir
+    ; (bit 2). Pair with the packing logic in LineCacheSnapshot.
+    ld      a, [hl]
+    ld      b, a
+    and     0x03
+    ld      [HtmlDefaultAlign], a
+    ld      a, b
+    rrca
+    rrca                                ; bit 2 -> bit 0
+    and     0x01
+    ld      [HtmlDefaultDir], a
     pop     bc
     ret
 
