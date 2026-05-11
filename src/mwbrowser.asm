@@ -18112,6 +18112,14 @@ FileBuf        equ FILEBUF_BASE
 FontBuf        equ 0xC200
 ImgBuf         equ FontBuf + FONT_BUF_SIZE
 
+; Build-time guard: FileBuf must end at or before FontBuf -- otherwise
+; ExtractFont's 2 KB write into FontBuf would clobber the FileBuf
+; tail. The auto-computed FILEBUF_BASE shifts up as BSS grows; if it
+; grows past FontBuf-FILE_BUF_SIZE this assert catches it. The fix is
+; to shrink FILE_BUF_SIZE; do NOT raise FontBuf (the address is
+; pinned for hardware reasons, see the comment block above).
+    ASSERT FILEBUF_BASE + FILE_BUF_SIZE <= FontBuf
+
 ; quick_screen_draw / lesson #1: bifurcated page-aligned glyph LUT.
 ; FastLutHi[font_byte] = high VRAM byte (left 4 px); FastLutLo[font_byte]
 ; = low VRAM byte (right 4 px). Indexed by H = page, L = font_byte so
