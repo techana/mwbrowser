@@ -15449,6 +15449,7 @@ ImgOffCmd:      db "IMG OFF", 0
 ; unwinds back through PollMouse correctly. Keyboard-path callers wrap each
 ; in `call OpenAbout / jp MainLoop`.
 OpenAbout:
+    call    PopupSaveFocusAndUnfocusChrome
     ld      a, 2
     ld      [AboutOpen], a
     jp      DrawAboutPopup              ; DrawAboutPopup ends with `ret`
@@ -15456,8 +15457,27 @@ OpenAbout:
 CloseAbout:
     xor     a
     ld      [AboutOpen], a
+    call    PopupRestoreFocusAndPaintChrome
     call    ClearContentArea
     jp      PrintFileContent            ; PrintFileContent ends with `ret`
+
+; Snapshot the toolbar Focus and force it to a sentinel that doesn't
+; match any focusable element (ComputeFocusState compares against
+; FOC_* enums 0..4), then repaint the toolbar. Address bar / buttons
+; lose their black focus frame; address bar in particular falls back
+; to the DGRAY unfocused border in PaintAddressBar. The matching
+; PopupRestoreFocusAndPaintChrome on popup close undoes both.
+PopupSaveFocusAndUnfocusChrome:
+    ld      a, [Focus]
+    ld      [PopupFocusBefore], a
+    ld      a, 0xFF                     ; sentinel: matches no FOC_*
+    ld      [Focus], a
+    jp      PaintToolbar                ; tail-call (ends with ret)
+
+PopupRestoreFocusAndPaintChrome:
+    ld      a, [PopupFocusBefore]
+    ld      [Focus], a
+    jp      PaintToolbar
 
 ; ============================================================================
 ; Save-file popup (titlebar [] button, and later: link click to
@@ -15468,10 +15488,15 @@ CloseAbout:
 ; readout updating live and Cancel deleting the partial file.
 ; ============================================================================
 
+; Popup X/W shared with About (visual consistency); H is per-popup so
+; each dialog snaps to its own content height with no empty tail.
 SAVE_X  equ ABOUT_X
 SAVE_Y  equ ABOUT_Y
 SAVE_W  equ ABOUT_W
-SAVE_H  equ ABOUT_H
+SAVE_H  equ 80                                                    ; fits title + 2 body lines + gap + button row
+
+; Title bar height shared by the popup-frame helper (DrawPopupFrame).
+POPUP_TITLE_H   equ 16
 
 ; Button geometry (text rendered inside a black-bordered rect).
 SAVE_BTN_W      equ 60
@@ -15508,6 +15533,7 @@ OpenSaveFromLink:
     ; fall through
 
 OpenSave:
+    call    PopupSaveFocusAndUnfocusChrome
     ld      a, 1
     ld      [SaveOpen], a
     jp      DrawSavePopup
@@ -15517,6 +15543,7 @@ CloseSave:
     ; partial file here. Phase 1 has nothing in flight to clean up.
     xor     a
     ld      [SaveOpen], a
+    call    PopupRestoreFocusAndPaintChrome
     call    ClearContentArea
     jp      PrintFileContent
 
@@ -15579,38 +15606,104 @@ ClickInSavePopup:
     ret     nc
     jp      CloseSave
 
-; ----- DrawSavePopup: paint the dialog -----
-DrawSavePopup:
-    ; Body fill + black border.
+; ----------------------------------------------------------------------------
+; DrawPopupFrame: shared LGRAY body + BLACK border + title row + X
+; close glyph. Used by both DrawAboutPopup and DrawSavePopup so the
+; popup chrome is authored once.
+;
+; Inputs:
+;   A  = body / popup height in pixels (each popup picks its own H
+;        to snap to its content; X / Y / W stay shared for visual
+;        consistency)
+;   B  = title-bar background colour (COL_LGRAY blends with body,
+;        COL_WHITE gives the Save dialog its distinct title strip)
+;   HL = title string ptr (NUL terminated)
+;
+; Leaves the SetTextColours pair on BLACK-on-LGRAY so the caller can
+; immediately DrawString body lines without re-setting colours.
+; ----------------------------------------------------------------------------
+DrawPopupFrame:
+    push    hl                          ; save title ptr
+    push    bc                          ; save title-bar bg colour (B)
+    push    af                          ; save body height (A)
+
+    ; Body fill (LGRAY) + black border, full popup.
     ld      b, SAVE_X / 4
     ld      c, SAVE_Y
     ld      d, SAVE_W / 4
-    ld      e, SAVE_H
+    ld      e, a                        ; height (still in A from caller)
+    push    de                          ; need E (height) later
     ld      a, COL_LGRAY
     call    FillRect
-
+    pop     de
     ld      b, SAVE_X / 4
     ld      c, SAVE_Y
     ld      d, SAVE_W / 4
-    ld      e, SAVE_H
     ld      a, COL_BLACK
     call    DrawRectBorder
 
+    ; Title bar overlay. SAVE_X is 4-px aligned (108 = 27*4) so the
+    ; strip fill lands cleanly. We re-draw the top + side border
+    ; bytes afterwards so the title strip looks framed even when the
+    ; overlay colour matches the body (COL_LGRAY case).
+    pop     af                          ; A = saved body height (unused below)
+    pop     bc                          ; B = title-bar bg colour
+    push    bc
+    ld      a, b
+    cp      COL_LGRAY
+    jr      z, .pfNoTitleFill           ; matches body -- no overlay needed
+    ld      b, SAVE_X / 4
+    ld      c, SAVE_Y
+    ld      d, SAVE_W / 4
+    ld      e, POPUP_TITLE_H
+    ; A still holds the title-bar bg colour from the cp above.
+    call    FillRect
+    ; Re-paint the top + side border pixels eaten by the fill above.
+    ld      b, SAVE_X / 4
+    ld      c, SAVE_Y
+    ld      d, SAVE_W / 4
+    ld      e, POPUP_TITLE_H
     ld      a, COL_BLACK
-    ld      l, COL_LGRAY
+    call    DrawRectBorder
+.pfNoTitleFill:
+
+    ; Title text colour: pair with whichever title-bar background we
+    ; just painted (caller's B).
+    pop     bc
+    ld      a, COL_BLACK
+    ld      l, b                        ; bg for SetTextColours
+    push    bc
     call    SetTextColours
 
-    ; Title "Save file?" top-left.
+    pop     bc                          ; bg (unused past here)
+    pop     hl                          ; HL = title string
+
+    ; Title text top-left (1 px inside left border + small margin).
+    push    hl
     ld      de, SAVE_X + 8
     ld      c, SAVE_Y + 4
-    ld      hl, SaveTitleMsg
     call    DrawString
 
-    ; "X" close glyph top-right (matches About popup).
+    ; "X" close glyph top-right.
     ld      de, SAVE_X + SAVE_W - 13
     ld      c, SAVE_Y + 4
     ld      hl, CharX
     call    DrawString
+    pop     hl
+
+    ; Body text is BLACK on LGRAY for both popups; leave colour pair
+    ; armed for the caller's body lines.
+    ld      a, COL_BLACK
+    ld      l, COL_LGRAY
+    jp      SetTextColours              ; tail-call returns to caller
+
+; ----- DrawSavePopup: shared frame + 2 body lines + buttons -----
+DrawSavePopup:
+    ld      a, SAVE_H
+    ld      b, COL_WHITE                ; title strip is white per spec
+    ld      hl, SaveTitleMsg
+    call    DrawPopupFrame
+    ; Title is painted; colour pair now back at BLACK-on-LGRAY.
 
     ; Body line 1: path + filename. Phase 1: drive prefix hardcoded
     ; to "A:" (the bridge / MWBRO disk we're booting from). Phase 2
@@ -15670,35 +15763,13 @@ SaveBtnCancelMsg:    db "Cancel", 0
 SaveStubName:        db "PAGE    .HTM", 0    ; 12 chars + NUL = 13
 
 DrawAboutPopup:
-    ; Popup body: 256 x 120 centred in the content area, at (128, 50).
-    ld      b, ABOUT_X / 4
-    ld      c, ABOUT_Y
-    ld      d, ABOUT_W / 4
-    ld      e, ABOUT_H
-    ld      a, COL_LGRAY
-    call    FillRect
-
-    ld      b, ABOUT_X / 4
-    ld      c, ABOUT_Y
-    ld      d, ABOUT_W / 4
-    ld      e, ABOUT_H
-    ld      a, COL_BLACK
-    call    DrawRectBorder
-
-    ; Black-on-lgray body text so it blends with the popup fill.
-    ld      a, COL_BLACK
-    ld      l, COL_LGRAY
-    call    SetTextColours
-
-    ld      de, ABOUT_X + 8
-    ld      c, ABOUT_Y + 4
+    ; Shared frame: LGRAY body + black border + title row + X close.
+    ; About keeps its title strip blending with the body (COL_LGRAY).
+    ld      a, ABOUT_H
+    ld      b, COL_LGRAY
     ld      hl, AboutTitleMsg
-    call    DrawString
-
-    ld      de, ABOUT_X + ABOUT_W - 13  ; X glyph in the popup's top-right (1 px left of the border)
-    ld      c, ABOUT_Y + 4
-    ld      hl, CharX
-    call    DrawString
+    call    DrawPopupFrame
+    ; Colour pair now back at BLACK-on-LGRAY (see DrawPopupFrame tail).
 
     ; Centre "MSX WBrowser" (12 glyphs * 8 px = 96 px) and render it
     ; bold via DrawCharFast. SetTextColours(BLACK, LGRAY) above already
@@ -18400,6 +18471,12 @@ SaveSource:     db 0                    ; 0 = titlebar [] (save current view),
                                         ; 1 = link click to unrecognised file
 SaveFilename:   ds 13                   ; 8.3 DOS filename + NUL terminator
 SaveByteCount:  dw 0                    ; size in bytes if known, 0 = unknown
+; Popup-modal focus save: any popup-open zeroes the visible focus
+; (FOC_* sentinel 0xFF doesn't match any button), so chrome paints
+; with no focused frame (address bar reverts to its DGRAY unfocused
+; border, etc.). CloseAbout / CloseSave restore the prior focus.
+; Only one popup is open at a time, so a single byte suffices.
+PopupFocusBefore: db 0
 ShowImages:     db 1                    ; 0 = strip <img> on render and skip
                                         ; remote img fetches; 1 = render
                                         ; local images + ask the bridge for
