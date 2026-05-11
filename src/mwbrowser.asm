@@ -3077,7 +3077,24 @@ BAKCLR          equ 0xF3EA
 ; Renders left-to-right via DrawCharFast. Each glyph is 8 px wide
 ; (2 byte cols). Caller is expected to have called SetTextColours
 ; first so CurrentFontLUT points at the right colour pair.
+;
+; Force HtmlStyleFlags = 0 and HtmlScaleY = 1 for the duration of
+; the loop, then restore. Chrome / popup / spinner text must not
+; inherit bold / italic / underline / 2x-scale state from in-flight
+; HTML body rendering -- BusyHeartbeat re-enters DrawString from
+; inside PrintFileContent, and if the parser was mid-<h1> the
+; spinner would stretch 16 px tall and bleed onto the chrome/
+; content separator.
 DrawString:
+    ld      a, [HtmlStyleFlags]
+    push    af
+    xor     a
+    ld      [HtmlStyleFlags], a
+    ld      a, [HtmlScaleY]
+    push    af
+    ld      a, 1
+    ld      [HtmlScaleY], a
+
     ; byte_col = pixel_X / 4. Pixel X is 16-bit (chrome+content goes
     ; up to 511), so handle high byte.
     push    hl
@@ -3092,7 +3109,7 @@ DrawString:
 .loop:
     ld      a, [hl]
     or      a
-    ret     z
+    jr      z, .done
     push    hl
     push    bc
     call    DrawCharFast                ; A=char, B=byte_col, C=row_y; clobbers C
@@ -3102,6 +3119,12 @@ DrawString:
     inc     b                           ; advance 8 px = 2 byte cols
     inc     hl
     jr      .loop
+.done:
+    pop     af
+    ld      [HtmlScaleY], a
+    pop     af
+    ld      [HtmlStyleFlags], a
+    ret
 
 ; SetTextColours(A=fg palette index 0..3, L=bg palette index 0..3).
 ; Updates FORCLR/BAKCLR (legacy) AND picks the matching CurrentFontLUT
@@ -13937,7 +13960,12 @@ NavigateToCurrentUrl:
     ld      [Busy], a
     ld      a, 6
     ld      [LoadPhase], a                  ; phase 6: navigate done
-    jp      PaintToolbar
+    call    PaintToolbar
+    ; Warm the back page so the FIRST PageDown after a URL load also
+    ; benefits from the Phase-1 fast-flip. NavigateToCurrentUrl is the
+    ; only render path that doesn't reach PrerenderNext via
+    ; RefreshAfterScroll's tail, so we have to call it explicitly here.
+    jp      PrerenderNext
 
 .err:
     ; Load failed. If the address bar is empty (Enter pressed with no
@@ -14375,31 +14403,65 @@ PrerenderNext:
     or      a
     ret     nz
 
+    ; Compute candidate using the SAME clamp logic as PageDown so
+    ; PrerenderScrollLine matches the ScrollLine value the next
+    ; PageDown will actually pick. Without this, an estimated /
+    ; pre-extrapolation HtmlLineCount clamps PageDown's target
+    ; below SL + PAGE_SCROLL_STEP, the fast-path's
+    ; PrerenderScrollLine != ScrollLine check fails, and PageDown
+    ; pays a full foreground render even though the next page is
+    ; ready on the back.
+    ld      hl, [HtmlLineCount]
+    ld      a, h
+    or      l
+    ret     z                            ; zero-line doc, nothing to prerender
+    ld      de, TEXT_MAX_LINES + 1
+    and     a
+    sbc     hl, de
+    ret     c                            ; doc fits in viewport, no next page
+    inc     hl
+    ex      de, hl                       ; DE = max ScrollLine
+    ld      hl, [ScrollLine]
+    and     a
+    sbc     hl, de
+    ret     nc                           ; SL already at or past max, no next page
     ld      hl, [ScrollLine]
     ld      bc, PAGE_SCROLL_STEP
     add     hl, bc
-    ld      [PrerenderCandidate], hl
-    ld      de, [HtmlLineCount]
-    or      a
+    and     a
+    push    hl
     sbc     hl, de
-    ret     nc                           ; candidate past doc tail
+    pop     hl
+    jr      c, .pnHaveCandidate          ; SL+step < max -> use it
+    ex      de, hl                       ; clamp HL = max ScrollLine
+.pnHaveCandidate:
+    ld      [PrerenderCandidate], hl
+    ; Skip prerender when candidate == current ScrollLine (would
+    ; render the same page that's already on display).
+    ld      de, [ScrollLine]
+    and     a
+    sbc     hl, de
+    ret     z
 
     ; --- Snapshot the foreground state PrintFileContent clobbers ---
-    ld      hl, ScrollLine
-    ld      de, PrerenderSaved
-    ld      bc, 2
-    ldir
-    ld      hl, HtmlLineCount
-    ld      bc, 2
-    ldir
-    ld      hl, TotalLines
-    ld      bc, 2
-    ldir
-    ld      hl, HtmlLineCountSaved
-    ld      bc, 2
-    ldir
+    ld      hl, [ScrollLine]
+    ld      [PrerenderSaved], hl
+    ld      hl, [HtmlLineCount]
+    ld      [PrerenderSaved + 2], hl
+    ld      hl, [TotalLines]
+    ld      [PrerenderSaved + 4], hl
+    ld      hl, [HtmlLineCountSaved]
+    ld      [PrerenderSaved + 6], hl
     ld      a, [HtmlLineCountAccurate]
     ld      [PrerenderSaved + 8], a
+
+    ; --- Mirror chrome (rows 0..28) from the currently displayed
+    ;     page to the back so a future fast-flip lands on a page
+    ;     whose titlebar/toolbar matches what the user is seeing
+    ;     right now. Without this, the back page's chrome stays
+    ;     stale (whatever was there from a previous render cycle or
+    ;     boot-time fill), and the fast-flip reveals it briefly.
+    call    CopyChromeToBack
 
     ; --- Apply candidate; redirect writes to the back page ---
     ld      hl, [PrerenderCandidate]
@@ -14411,6 +14473,17 @@ PrerenderNext:
     ; --- Render the next page on the back ---
     call    ClearContentArea
     call    PrintFileContent
+
+    ; --- Settled scrollbar thumb at the candidate ScrollLine on the
+    ;     back so a future fast-flip doesn't reveal a stale busy
+    ;     (dark-gray) thumb left behind by a previous cycle's phase-1
+    ;     paint. ComputeThumb reads the current ScrollLine (which is
+    ;     set to candidate above), so the thumb lands at the right
+    ;     position for the next page. ---
+    xor     a
+    ld      [ThumbBusy], a
+    call    ComputeThumb
+    call    DrawScrollbar
 
     ; --- Mark prerender valid only if PrintFileContent filled the
     ;     viewport. If HtmlLineSkip is still non-zero, we hit EOF
@@ -14429,19 +14502,14 @@ PrerenderNext:
 .pnSkipMark:
 
     ; --- Restore foreground state ---
-    ld      hl, PrerenderSaved
-    ld      de, ScrollLine
-    ld      bc, 2
-    ldir
-    ld      de, HtmlLineCount
-    ld      bc, 2
-    ldir
-    ld      de, TotalLines
-    ld      bc, 2
-    ldir
-    ld      de, HtmlLineCountSaved
-    ld      bc, 2
-    ldir
+    ld      hl, [PrerenderSaved]
+    ld      [ScrollLine], hl
+    ld      hl, [PrerenderSaved + 2]
+    ld      [HtmlLineCount], hl
+    ld      hl, [PrerenderSaved + 4]
+    ld      [TotalLines], hl
+    ld      hl, [PrerenderSaved + 6]
+    ld      [HtmlLineCountSaved], hl
     ld      a, [PrerenderSaved + 8]
     ld      [HtmlLineCountAccurate], a
 
