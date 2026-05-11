@@ -4245,49 +4245,98 @@ FindUrlBasename:
     ex      de, hl
     ret
 
-; UrlHasComExt: Z if UrlBuf ends in ".com" (case-insensitive). Used
-; by NavigateToCurrentUrl to route non-displayable binaries (.com,
-; later .exe / .zip / etc.) to the Save popup instead of the parser.
-UrlHasComExt:
+; UrlIsBinary: Z when UrlBuf's extension is NOT in the displayable
+; whitelist {htm, html, txt, pcx, bmp, sc6} -- caller pops the Save
+; dialog instead of rendering. URLs with no '.' at all are treated
+; as displayable (e.g. bare directory links like "INDEX" served as
+; HTML by the bridge).
+;
+; Table format: <length:1> <chars:length>, terminated by length=0.
+; All entries are uppercase; the URL tail is uppercased per-char
+; during compare via UpperCaseA.
+DisplayableExts:
+    db  3, "HTM"
+    db  4, "HTML"
+    db  3, "TXT"
+    db  3, "PCX"
+    db  3, "BMP"
+    db  3, "SC6"
+    db  0
+
+UrlIsBinary:
+    ; Forward-scan UrlBuf: HL ends pointing at the NUL terminator,
+    ; DE captures the pointer to the last '.' (or stays 0 if none).
     ld      hl, UrlBuf
-    ld      e, 0
-.uceLen:
+    ld      de, 0
+.uibScan:
     ld      a, [hl]
     or      a
-    jr      z, .uceHave
-    inc     hl
-    inc     e
-    jr      .uceLen
-.uceHave:
-    ld      a, e
-    cp      4
-    jr      c, .uceNo
-    sub     4
-    ld      e, a
-    ld      d, 0
-    ld      hl, UrlBuf
-    add     hl, de
-    ld      a, [hl]
+    jr      z, .uibScanDone
     cp      '.'
-    jr      nz, .uceNo
+    jr      nz, .uibNextChar
+    ld      d, h
+    ld      e, l
+.uibNextChar:
     inc     hl
+    jr      .uibScan
+.uibScanDone:
+    ld      a, d
+    or      e
+    jr      z, .uibNoDot                    ; no '.' anywhere -> displayable
+    ; ext_len = L - E - 1  (both pointers in same 256-byte page so
+    ; high bytes match; subtraction stays 8-bit).
+    ld      a, l
+    sub     e
+    dec     a                               ; subtract the '.' itself
+    jr      z, .uibBinary                   ; trailing dot ("foo.") -> binary
+    ld      [UibExtLen], a
+    inc     de                              ; DE -> first ext char
+    ld      hl, DisplayableExts
+.uibEntry:
     ld      a, [hl]
+    or      a
+    jr      z, .uibBinary                   ; end of table
+    push    hl
+    ld      hl, UibExtLen
+    cp      [hl]
+    pop     hl
+    jr      nz, .uibAdv                     ; length mismatch
+    ; Lengths match -- byte-by-byte compare with case fold on URL side.
+    push    de
+    push    hl
+    inc     hl                              ; HL -> entry chars
+    ld      a, [UibExtLen]
+    ld      b, a
+.uibCmp:
+    ld      a, [de]
     call    UpperCaseA
-    cp      'C'
-    jr      nz, .uceNo
+    cp      [hl]
+    jr      nz, .uibCmpFail
     inc     hl
-    ld      a, [hl]
-    call    UpperCaseA
-    cp      'O'
-    jr      nz, .uceNo
-    inc     hl
-    ld      a, [hl]
-    call    UpperCaseA
-    cp      'M'
-    ret     z
-.uceNo:
-    or      1
+    inc     de
+    djnz    .uibCmp
+    pop     hl
+    pop     de
+    or      1                               ; match -> displayable, NZ
     ret
+.uibCmpFail:
+    pop     hl
+    pop     de
+.uibAdv:
+    ; Advance HL past this entry: 1 (length byte) + entry_len.
+    ld      a, [hl]
+    inc     a
+    ld      c, a
+    ld      b, 0
+    add     hl, bc
+    jr      .uibEntry
+.uibNoDot:
+    or      1                               ; no '.' -> NZ (displayable)
+    ret
+.uibBinary:
+    xor     a                               ; Z = binary, fire save popup
+    ret
+UibExtLen: db 0
 
 ; LoadFileChunk: fill FileBuf starting at the given document offset
 ; with up to byte_count bytes from the FCB-open file. Sets DocOffset
@@ -14424,13 +14473,15 @@ NavigateToCurrentUrl:
     or      a
     jr      nz, .navViewDone
 
-    ; .COM (and any future opaque-binary) URLs skip rendering and pop
-    ; the Save dialog directly. The user's already typed/clicked the
-    ; URL -- the bridge cached the body in self.body -- and asking
-    ; "Save?" is more useful than scrolling through a wall of garbage
-    ; bytes. PrintFileContent's normal text path still runs for HTM /
-    ; TXT and unknown extensions (treated as text by default).
-    call    UrlHasComExt
+    ; Binary URLs (any extension not on the displayable whitelist:
+    ; htm, html, txt, pcx, bmp, sc6) skip rendering and pop the Save
+    ; dialog directly. The user's already typed/clicked the URL --
+    ; the bridge cached the body in self.body -- and asking "Save?"
+    ; is more useful than scrolling through a wall of garbage bytes.
+    ; HTM/TXT/no-extension URLs still flow into PrintFileContent;
+    ; PCX/BMP/SC6 already rendered as images via the LoadFile image-
+    ; synthesis path so the displayable check passes them through.
+    call    UrlIsBinary
     jp      z, .navAutoSave
 
     ld      hl, 0
@@ -18092,7 +18143,7 @@ RemoteGetParseReply:
     jp      nz, .rgFail
     call    SerialRead                  ; ' '
     jp      c, .rgFail
-    call    SerialRead                  ; 'H', 'P', or 'B'
+    call    SerialRead                  ; 'H', 'P', 'B', or 'S'
     jp      c, .rgFail
     ld      b, 1                         ; SerialKind=1 -> HTM/HTMP
     cp      'H'
@@ -18102,6 +18153,9 @@ RemoteGetParseReply:
     jr      z, .rgKind
     ld      b, 3                         ; SerialKind=3 -> BMP (hybrid bitmap)
     cp      'B'
+    jr      z, .rgKind
+    ld      b, 4                         ; SerialKind=4 -> SC6 (raw image)
+    cp      'S'
     jp      nz, .rgFail
 .rgKind:
     ld      a, b
@@ -18881,16 +18935,22 @@ Format6Hex:
     inc     de
     ret
 
-; RemoteImgOpen: filename is in ImgNameBuf. Expects OK PCX; saves body
-; length into ImgBytesLeft so ImgStreamByte can pull from the UART.
+; RemoteImgOpen: filename is in ImgNameBuf. Expects OK PCX or OK SC6;
+; saves body length into ImgBytesLeft so ImgStreamByte can pull from
+; the UART. Both kinds stream raw file bytes through ImgBuf; the
+; image-decoder dispatch (RenderPcxFile / RenderSc6File) happens at
+; the TagImg level based on the URL's extension, not the wire kind.
 RemoteImgOpen:
     call    SerialMaskVblank
     ld      hl, ImgNameBuf
     call    RemoteGet
     jr      c, .rioFail
     ld      a, [SerialKind]
-    cp      2
+    cp      2                            ; PCX
+    jr      z, .rioOk
+    cp      4                            ; SC6
     jr      nz, .rioFail
+.rioOk:
     ld      hl, [SerialLen]
     ld      [ImgBytesLeft], hl
     ld      hl, 0

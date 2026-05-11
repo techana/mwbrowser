@@ -5180,6 +5180,9 @@ class MsxSession:
         if ext == ".bmp":
             self._log("self-host BMP {} ({} B)".format(rel, len(data)))
             return ("BMP", data)
+        if ext == ".sc6":
+            self._log("self-host SC6 {} ({} B)".format(rel, len(data)))
+            return ("SC6", data)
         return ("HTM", data)
 
     # -- HTML fetch + simplify -----------------------------------------
@@ -5418,7 +5421,7 @@ def _serial_send_response(conn, kind, body):
         # length field with no body bytes following.
         conn.sendall("OK HTM {}\r\n".format(body).encode("ascii"))
         return
-    if kind in ("HTM", "PCX", "BMP"):
+    if kind in ("HTM", "PCX", "BMP", "SC6"):
         header = "OK {} {}\r\n".format(kind, len(body)).encode("ascii")
         conn.sendall(header)
         _serial_slow_send(conn, body)
