@@ -167,7 +167,7 @@ URL_MAX        equ 255         ; address-bar / fetch-target buffer cap (chars
                                ; before NUL). Bumped from 95 because real
                                ; mirror.aratab.com URLs run past the 100-char
                                ; line and got truncated on click.
-FILE_BUF_SIZE  equ 0x2000      ; 8 KB. Sized so FILEBUF_BASE +
+FILE_BUF_SIZE  equ 0x1E00      ; 7.5 KB. Sized so FILEBUF_BASE +
                                ; FILE_BUF_SIZE + FONT_BUF_SIZE + 128 +
                                ; 512 B (FastLutHi+FastLutLo, lesson #1) +
                                ; 2 KB (TransposedFontBuf, lesson #3, see
@@ -321,12 +321,25 @@ MainLoop:
     ; When the About popup is open everything except Esc is swallowed.
     ld      a, [AboutOpen]
     or      a
-    jr      z, .noPopup
+    jr      z, .checkSavePopup
     ld      a, b
     cp      KEY_ESC
     jr      nz, .popupSwallow
     call    CloseAbout
 .popupSwallow:
+    jp      MainLoop
+
+.checkSavePopup:
+    ; Same swallow + Esc-closes contract for the Save-file popup. Esc
+    ; matches clicking Cancel / X (per the design spec: any cancel
+    ; mid-download drops the partial file -- handled by CloseSave).
+    ld      a, [SaveOpen]
+    or      a
+    jr      z, .noPopup
+    ld      a, b
+    cp      KEY_ESC
+    jr      nz, .popupSwallow
+    call    CloseSave
     jp      MainLoop
 
 .noPopup:
@@ -15169,10 +15182,13 @@ PollMouse:
 ; under (MouseX, MouseY). Either returns (no-op) or jumps into an existing
 ; keyboard-handler routine; MainLoop is the shared return point.
 HandleClick:
-    ; Popup mode: only the popup's X-glyph closes the dialog.
+    ; Popup mode: only the popup's own click targets are live.
     ld      a, [AboutOpen]
     or      a
     jp      nz, ClickInPopup
+    ld      a, [SaveOpen]
+    or      a
+    jp      nz, ClickInSavePopup
 
     ; Out-of-screen clicks (shouldn't happen with our clamp) are ignored.
     ld      a, [MouseY + 1]
@@ -15201,22 +15217,38 @@ CpHL:
     cp      e
     ret
 
-; ---- titlebar: "?" glyph opens About, "X" glyph exits ----
+; ---- titlebar: "[]" save, "?" About, "X" exit ----
+; Glyph rects in pixel-X:
+;   [] at WIDTH-48 .. WIDTH-32 (16 px = 2 glyphs)
+;   ?  at WIDTH-24 .. WIDTH-16 (1 glyph; 8-px gap before it)
+;   X  at WIDTH-12 .. WIDTH     (1 glyph; 4-px gap before it)
 ClickTitle:
     ld      hl, [MouseX]
+
+    ; "[]" save button
+    ld      de, WIDTH - 48
+    call    CpHL
+    ret     c                           ; left of "[]" -- just text
+    ld      de, WIDTH - 32
+    call    CpHL
+    jp      c, OpenSaveFromTitlebar
+
+    ; "?" Help / About
     ld      de, WIDTH - 24
     call    CpHL
-    ret     c                           ; left of "?" -- just text
+    ret     c                           ; gap between "[]" and "?"
     ld      de, WIDTH - 16
     call    CpHL
-    jp      c, OpenAbout                ; "?" glyph
+    jp      c, OpenAbout
+
+    ; "X" close
     ld      de, WIDTH - 12
     call    CpHL
-    ret     c                           ; between glyphs
+    ret     c                           ; gap between "?" and "X"
     ld      de, WIDTH
     call    CpHL
     ret     nc
-    jp      Shutdown                    ; "X" glyph
+    jp      Shutdown
 
 ; ---- toolbar: Back / Forward / Address-bar + clear-X / Refresh(Go) ----
 ; Regions are tested left-to-right; the `ret c` guards mean any click that
@@ -15426,6 +15458,216 @@ CloseAbout:
     ld      [AboutOpen], a
     call    ClearContentArea
     jp      PrintFileContent            ; PrintFileContent ends with `ret`
+
+; ============================================================================
+; Save-file popup (titlebar [] button, and later: link click to
+; unrecognised file). Phase 1: paints the dialog, wires Save / Cancel
+; / X / Esc. Save is currently a stub -- closes the popup without
+; touching disk. Phase 2 will add the BDOS sequential-write streaming
+; from the bridge / FileBuf into a:<filename>, with the progress
+; readout updating live and Cancel deleting the partial file.
+; ============================================================================
+
+SAVE_X  equ ABOUT_X
+SAVE_Y  equ ABOUT_Y
+SAVE_W  equ ABOUT_W
+SAVE_H  equ ABOUT_H
+
+; Button geometry (text rendered inside a black-bordered rect).
+SAVE_BTN_W      equ 60
+SAVE_BTN_H      equ 14
+SAVE_BTN_Y      equ SAVE_Y + SAVE_H - 24
+SAVE_BTN1_X     equ SAVE_X + 32                                   ; "Save"
+SAVE_BTN2_X     equ SAVE_X + SAVE_W - SAVE_BTN_W - 32             ; "Cancel"
+
+; Entry point used by HandleClick / ClickTitle when the user clicks
+; the "[]" titlebar glyph. Source tag = 0 (saving the currently
+; displayed page/image).
+OpenSaveFromTitlebar:
+    xor     a
+    ld      [SaveSource], a
+    ; Derive an 8.3 DOS filename from UrlBuf. Phase 1 stub: just
+    ; use a generic placeholder; Phase 2 will parse UrlBuf (drop the
+    ; "a:" / "http://host/" prefix, walk to the last slash, sanitise
+    ; into 8.3).
+    ld      hl, SaveStubName
+    ld      de, SaveFilename
+    ld      bc, 13
+    ldir
+    xor     a
+    ld      [SaveByteCount], a
+    ld      [SaveByteCount + 1], a
+    jr      OpenSave
+
+; Entry point for the future link-click-on-unrecognised-file path.
+; Source tag = 1.  Caller is expected to have populated SaveFilename
+; and (optionally) SaveByteCount first.
+OpenSaveFromLink:
+    ld      a, 1
+    ld      [SaveSource], a
+    ; fall through
+
+OpenSave:
+    ld      a, 1
+    ld      [SaveOpen], a
+    jp      DrawSavePopup
+
+CloseSave:
+    ; Phase 2 will: if a transfer is mid-flight, abort + delete the
+    ; partial file here. Phase 1 has nothing in flight to clean up.
+    xor     a
+    ld      [SaveOpen], a
+    call    ClearContentArea
+    jp      PrintFileContent
+
+; Stub for the Save button. Phase 1 just dismisses; Phase 2 will
+; kick off the BDOS write streaming loop.
+DoSave:
+    ; TODO Phase 2: open SaveFilename via BDOS create+truncate, stream
+    ; bytes (from FileBuf for view-mode saves, or from the bridge GET
+    ; response for link-click saves) until EOF, update SaveByteCount /
+    ; progress readout, and close the file. Cancel deletes the partial
+    ; file.
+    jp      CloseSave
+
+; ClickInSavePopup: dispatch a click while the Save popup is open.
+; Targets (X-band tests guarded by Y-band so out-of-rect clicks
+; silently no-op):
+;   - X glyph top-right -> CloseSave (= Cancel)
+;   - Save button rect  -> DoSave
+;   - Cancel button rect -> CloseSave
+ClickInSavePopup:
+    ld      a, [MouseY]
+    cp      SAVE_Y
+    ret     c                               ; above popup
+    ld      hl, [MouseX]
+
+    ; Top title strip: hand off to the close-X test.
+    cp      SAVE_Y + 16
+    jr      c, .csTitle
+
+    ; Buttons row.
+    cp      SAVE_BTN_Y
+    ret     c
+    cp      SAVE_BTN_Y + SAVE_BTN_H
+    ret     nc
+
+    ; Save button hotspot.
+    ld      de, SAVE_BTN1_X
+    call    CpHL
+    jr      c, .csTrySaveDone
+    ld      de, SAVE_BTN1_X + SAVE_BTN_W
+    call    CpHL
+    jp      c, DoSave
+.csTrySaveDone:
+
+    ; Cancel button hotspot.
+    ld      de, SAVE_BTN2_X
+    call    CpHL
+    ret     c
+    ld      de, SAVE_BTN2_X + SAVE_BTN_W
+    call    CpHL
+    ret     nc
+    jp      CloseSave
+
+.csTitle:
+    ld      de, SAVE_X + SAVE_W - 16
+    call    CpHL
+    ret     c
+    ld      de, SAVE_X + SAVE_W
+    call    CpHL
+    ret     nc
+    jp      CloseSave
+
+; ----- DrawSavePopup: paint the dialog -----
+DrawSavePopup:
+    ; Body fill + black border.
+    ld      b, SAVE_X / 4
+    ld      c, SAVE_Y
+    ld      d, SAVE_W / 4
+    ld      e, SAVE_H
+    ld      a, COL_LGRAY
+    call    FillRect
+
+    ld      b, SAVE_X / 4
+    ld      c, SAVE_Y
+    ld      d, SAVE_W / 4
+    ld      e, SAVE_H
+    ld      a, COL_BLACK
+    call    DrawRectBorder
+
+    ld      a, COL_BLACK
+    ld      l, COL_LGRAY
+    call    SetTextColours
+
+    ; Title "Save file?" top-left.
+    ld      de, SAVE_X + 8
+    ld      c, SAVE_Y + 4
+    ld      hl, SaveTitleMsg
+    call    DrawString
+
+    ; "X" close glyph top-right (matches About popup).
+    ld      de, SAVE_X + SAVE_W - 13
+    ld      c, SAVE_Y + 4
+    ld      hl, CharX
+    call    DrawString
+
+    ; Body line 1: path + filename. Phase 1: drive prefix hardcoded
+    ; to "A:" (the bridge / MWBRO disk we're booting from). Phase 2
+    ; will query the current drive via BDOS function 0x19.
+    ld      de, SAVE_X + 8
+    ld      c, SAVE_Y + 24
+    ld      hl, SavePathPrefix
+    call    DrawString
+    ld      de, SAVE_X + 8 + 16             ; 2 chars * 8 px past "A:"
+    ld      c, SAVE_Y + 24
+    ld      hl, SaveFilename
+    call    DrawString
+
+    ; Body line 2: size on left, progress placeholder on right.
+    ld      de, SAVE_X + 8
+    ld      c, SAVE_Y + 40
+    ld      hl, SaveSizeLabel
+    call    DrawString
+    ld      de, SAVE_X + SAVE_W - 8 - 96    ; right-aligned (12 chars)
+    ld      c, SAVE_Y + 40
+    ld      hl, SaveProgressLabel
+    call    DrawString
+
+    ; --- Save button: black border + "Save" label ---
+    ld      b, SAVE_BTN1_X / 4
+    ld      c, SAVE_BTN_Y
+    ld      d, SAVE_BTN_W / 4
+    ld      e, SAVE_BTN_H
+    ld      a, COL_BLACK
+    call    DrawRectBorder
+    ld      de, SAVE_BTN1_X + (SAVE_BTN_W - 4 * 8) / 2  ; "Save" = 4 chars
+    ld      c, SAVE_BTN_Y + 3
+    ld      hl, SaveBtnSaveMsg
+    call    DrawString
+
+    ; --- Cancel button ---
+    ld      b, SAVE_BTN2_X / 4
+    ld      c, SAVE_BTN_Y
+    ld      d, SAVE_BTN_W / 4
+    ld      e, SAVE_BTN_H
+    ld      a, COL_BLACK
+    call    DrawRectBorder
+    ld      de, SAVE_BTN2_X + (SAVE_BTN_W - 6 * 8) / 2  ; "Cancel" = 6 chars
+    ld      c, SAVE_BTN_Y + 3
+    ld      hl, SaveBtnCancelMsg
+    jp      DrawString                          ; tail-call; returns to caller
+
+; Strings used by the Save popup.
+SaveTitleMsg:        db "Save file?", 0
+SavePathPrefix:      db "A:", 0
+SaveSizeLabel:       db "Size: -- B", 0
+SaveProgressLabel:   db "Progress: --", 0
+SaveBtnSaveMsg:      db "Save", 0
+SaveBtnCancelMsg:    db "Cancel", 0
+; Phase 1 placeholder filename used by OpenSaveFromTitlebar until
+; Phase 2 parses UrlBuf into a real 8.3 name.
+SaveStubName:        db "PAGE    .HTM", 0    ; 12 chars + NUL = 13
 
 DrawAboutPopup:
     ; Popup body: 256 x 120 centred in the content area, at (128, 50).
@@ -18153,6 +18395,11 @@ ThumbHeight:    db THUMB_Y1 - THUMB_Y0 + 1
 ThumbBusy:      db 0
 ThumbCapByte:   db 0xFD                 ; written per draw based on ThumbBusy
 AboutOpen:      db 0                    ; 1 while the Help popup is on screen
+SaveOpen:       db 0                    ; 1 while the Save-file popup is on screen
+SaveSource:     db 0                    ; 0 = titlebar [] (save current view),
+                                        ; 1 = link click to unrecognised file
+SaveFilename:   ds 13                   ; 8.3 DOS filename + NUL terminator
+SaveByteCount:  dw 0                    ; size in bytes if known, 0 = unknown
 ShowImages:     db 1                    ; 0 = strip <img> on render and skip
                                         ; remote img fetches; 1 = render
                                         ; local images + ask the bridge for
