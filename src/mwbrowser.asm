@@ -15795,12 +15795,18 @@ CloseSave:
 ;   * File size rounded up to the next 128-byte record boundary
 ;     (MSX-DOS 1 has no byte-granular write).
 DoSave:
+    ; If the previous save already completed, Save button is showing
+    ; "OK" -- treat a click on it the same as Cancel / X / Esc.
+    ld      a, [SaveStatus]
+    cp      SaveStatus_Done
+    jp      z, CloseSave
+
     ld      a, SaveStatus_Saving
     ld      [SaveStatus], a
     xor     a
     ld      [SaveBytesWritten], a
     ld      [SaveBytesWritten + 1], a
-    call    PaintSaveStatusLine
+    call    PaintSaveSizeProgress
 
     ; --- Zero-fill the trailing partial record so we don't write
     ;     FileBuf garbage past EOF.
@@ -15889,7 +15895,7 @@ DoSave:
     ld      a, h
     and     0x07
     or      l
-    call    z, PaintSaveStatusLine
+    call    z, PaintSaveSizeProgress
     pop     hl
     pop     bc
     djnz    .dsLoop
@@ -15900,9 +15906,15 @@ DoSave:
     call    BDOS_ENTRY
     or      a
     jp      nz, .dsFailed
+    ; Force Progress == Size for the final paint (the per-record bump
+    ; rounds up to 128, so the count could overshoot the real source
+    ; size on the last record).
+    ld      hl, [SaveByteCount]
+    ld      [SaveBytesWritten], hl
     ld      a, SaveStatus_Done
     ld      [SaveStatus], a
-    jp      PaintSaveStatusLine
+    call    PaintSaveSizeProgress
+    jp      PaintSaveButton
 
 .dsCancelEnter:
     pop     hl
@@ -15923,7 +15935,7 @@ DoSave:
 .dsFailed:
     ld      a, SaveStatus_Failed
     ld      [SaveStatus], a
-    jp      PaintSaveStatusLine
+    jp      PaintSaveSizeProgress
 
 ; FindAvailableDestName: probe SaveDestFcb's filename via DOS_OPEN.
 ; If file exists (open succeeds), bump the extension to "2  ", then
@@ -15996,49 +16008,6 @@ DestFcbToSaveFilename:
     ld      [de], a
     ret
 
-; FormatDec16: render HL (unsigned 16-bit) as decimal at DE, no
-; leading zeros, single "0" for zero. Returns DE = past the last
-; digit so the caller can keep appending.
-FormatDec16:
-    push    bc
-    push    hl
-    xor     a
-    ld      [FdSuppress], a               ; not-yet-printed
-    ld      bc, -10000
-    call    .fdDigit
-    ld      bc, -1000
-    call    .fdDigit
-    ld      bc, -100
-    call    .fdDigit
-    ld      bc, -10
-    call    .fdDigit
-    ld      a, 1                          ; last digit always prints
-    ld      [FdSuppress], a
-    ld      bc, -1
-    call    .fdDigit
-    pop     hl
-    pop     bc
-    ret
-.fdDigit:
-    ld      a, '0' - 1
-.fdL:
-    inc     a
-    add     hl, bc
-    jr      c, .fdL
-    sbc     hl, bc                        ; undo the overshoot
-    cp      '0'
-    jr      nz, .fdPrint
-    ld      a, [FdSuppress]
-    or      a
-    ret     z                             ; suppress leading zero
-    ld      a, '0'
-.fdPrint:
-    ld      [de], a
-    inc     de
-    ld      a, 1
-    ld      [FdSuppress], a
-    ret
-
 ; FcbNameToDisplay: copy the FCB filename (8 chars at Fcb+1) + "." +
 ; extension (3 chars at Fcb+9) into SaveFilename (13 bytes incl NUL).
 ; The FCB stores name/ext space-padded; we preserve those spaces so
@@ -16060,11 +16029,13 @@ FcbNameToDisplay:
 
 ; PaintSaveStatusLine: replaces the body's "Size:" / "Progress:" row
 ; with a centred status string based on SaveStatus.
-PaintSaveStatusLine:
-    ld      a, [SaveStatus]
-    or      a
-    ret     z                             ; idle -- nothing to repaint
-
+; PaintSaveSizeProgress: paint the body's "Size: X.X KB  Progress:
+; Y.Y KB" row. On Save_Failed it shows a single "Save failed."
+; centred message instead. Called once when the popup opens
+; (renders "Size: N KB  Progress: 0.0 KB"), then per-update as
+; DoSave streams bytes (live-tracks Progress), then on completion
+; (Progress == Size).
+PaintSaveSizeProgress:
     ; LGRAY-fill the row.
     ld      b, (SAVE_X + 4) / 4
     ld      c, SAVE_Y + 40
@@ -16076,40 +16047,74 @@ PaintSaveStatusLine:
     ld      l, COL_LGRAY
     call    SetTextColours
 
-    ; Build status string into SaveStatusBuf so we can mix prefix +
-    ; live byte count + suffix in one DrawString call.
-    ld      de, SaveStatusBuf
     ld      a, [SaveStatus]
-    cp      SaveStatus_Done
-    jr      z, .pslDoneBuild
     cp      SaveStatus_Failed
-    jr      z, .pslFailedBuild
-    ; default = saving
-.pslSavingBuild:
-    ld      hl, SaveStatusSavingMsg
+    jr      z, .pspFailed
+
+    ; --- Size field on the left: "Size: X.X KB" ---
+    ld      de, SaveStatusBuf
+    ld      hl, SizeLabel
     call    StrCopy
-    ld      hl, [SaveBytesWritten]
-    call    FormatDec16
-    ld      hl, BytesSuffix
-    call    StrCopy
-    jr      .pslDraw
-.pslDoneBuild:
-    ld      hl, SaveStatusDoneMsg
-    call    StrCopy
-    ld      hl, [SaveBytesWritten]
-    call    FormatDec16
-    ld      hl, BytesPeriodSuffix
-    call    StrCopy
-    jr      .pslDraw
-.pslFailedBuild:
-    ld      hl, SaveStatusFailedMsg
-    call    StrCopy
-.pslDraw:
+    ld      hl, [SaveByteCount]
+    call    FormatKB
     xor     a
-    ld      [de], a                       ; NUL-terminate
+    ld      [de], a
     ld      hl, SaveStatusBuf
+    ld      de, SAVE_X + 8
+    ld      c, SAVE_Y + 40
+    call    DrawString
+
+    ; --- Progress field on the right: "Progress: Y.Y KB" ---
+    ld      de, SaveStatusBuf
+    ld      hl, ProgressLabel
+    call    StrCopy
+    ld      hl, [SaveBytesWritten]
+    call    FormatKB
+    xor     a
+    ld      [de], a
+    ld      hl, SaveStatusBuf
+    ld      de, SAVE_X + 8 + 120
+    ld      c, SAVE_Y + 40
+    jp      DrawString
+
+.pspFailed:
+    ld      hl, SaveStatusFailedMsg
     ld      de, SAVE_X + 16
     ld      c, SAVE_Y + 40
+    jp      DrawString
+
+; PaintSaveButton: redraw the Save button. Label is "Save" while
+; the save is idle / in flight / failed, and "OK" once it's done so
+; the user has a clear "dismiss" action paired with the right
+; ClickInSavePopup behaviour (both Save and Cancel close the popup
+; in the Done state).
+PaintSaveButton:
+    ld      b, SAVE_BTN1_X / 4
+    ld      c, SAVE_BTN_Y
+    ld      d, SAVE_BTN_W / 4
+    ld      e, SAVE_BTN_H
+    ld      a, COL_LGRAY
+    call    FillRect
+    ld      b, SAVE_BTN1_X / 4
+    ld      c, SAVE_BTN_Y
+    ld      d, SAVE_BTN_W / 4
+    ld      e, SAVE_BTN_H
+    ld      a, COL_BLACK
+    call    DrawRectBorder
+    ld      a, COL_BLACK
+    ld      l, COL_LGRAY
+    call    SetTextColours
+    ld      a, [SaveStatus]
+    cp      SaveStatus_Done
+    jr      z, .psbOk
+    ld      hl, SaveBtnSaveMsg
+    ld      de, SAVE_BTN1_X + (SAVE_BTN_W - 4 * 8) / 2  ; "Save" = 4 chars
+    jr      .psbDraw
+.psbOk:
+    ld      hl, SaveBtnOkMsg
+    ld      de, SAVE_BTN1_X + (SAVE_BTN_W - 2 * 8) / 2  ; "OK" = 2 chars
+.psbDraw:
+    ld      c, SAVE_BTN_Y + 3
     jp      DrawString
 
 ; StrCopy: copy NUL-terminated string from HL to DE. Stops at the
@@ -16124,16 +16129,91 @@ StrCopy:
     inc     de
     jr      StrCopy
 
+; FormatKB: render HL (unsigned 16-bit byte count) as "X.Y KB" at DE.
+; Integer part is HL/1024 (floor), decimal digit is the next 1/10
+; (floor). Max value 0xFFFF -> "63.9 KB". Returns DE past the last
+; char. Doesn't NUL-terminate -- caller does, so this composes with
+; StrCopy.
+FormatKB:
+    push    bc
+
+    ; Integer part = HL >> 10. For 16-bit values the integer fits
+    ; in the high byte's top 6 bits.
+    ld      a, h
+    srl     a
+    srl     a
+    ld      b, a                          ; B = integer KB (0..63)
+
+    ; Print integer: 0..9 single digit, 10..63 two digits.
+    cp      10
+    jr      c, .fkbOnes
+    ; Tens: peel off in a loop (max 6 iterations for B<=63).
+    ld      c, 0
+.fkbTens:
+    cp      10
+    jr      c, .fkbTensDone
+    sub     10
+    inc     c
+    jr      .fkbTens
+.fkbTensDone:
+    push    af                            ; A = ones digit
+    ld      a, c
+    add     a, '0'
+    ld      [de], a
+    inc     de
+    pop     af
+.fkbOnes:
+    add     a, '0'
+    ld      [de], a
+    inc     de
+
+    ; Decimal point.
+    ld      a, '.'
+    ld      [de], a
+    inc     de
+
+    ; Decimal digit = (HL & 0x3FF) * 10 / 1024. Clear high 6 bits of
+    ; H, multiply HL by 10, take the high 6 bits of H.
+    ld      a, h
+    and     0x03
+    ld      h, a
+    ; HL * 10 = HL*8 + HL*2. Use a temp in BC.
+    ld      b, h
+    ld      c, l
+    add     hl, hl                        ; HL*2
+    add     hl, hl                        ; HL*4
+    add     hl, bc                        ; HL*4 + HL*1 = HL*5
+    add     hl, hl                        ; HL*10
+    ld      a, h
+    srl     a
+    srl     a                             ; A = (HL*10) >> 10
+    add     a, '0'
+    ld      [de], a
+    inc     de
+
+    ; " KB" suffix.
+    ld      a, ' '
+    ld      [de], a
+    inc     de
+    ld      a, 'K'
+    ld      [de], a
+    inc     de
+    ld      a, 'B'
+    ld      [de], a
+    inc     de
+
+    pop     bc
+    ret
+
 SaveStatus_Idle    equ 0
 SaveStatus_Saving  equ 1
 SaveStatus_Done    equ 2
 SaveStatus_Failed  equ 3
 
-SaveStatusSavingMsg: db "Saving: ", 0
-SaveStatusDoneMsg:   db "Saved ", 0
 SaveStatusFailedMsg: db "Save failed.", 0
-BytesSuffix:         db " B", 0
-BytesPeriodSuffix:   db " B.", 0
+SizeLabel:           db "Size: ", 0
+ProgressLabel:       db "Progress: ", 0
+SaveBtnOkMsg:        db "OK", 0
 ; FCB-format placeholder when UrlBuf is empty (Open [] on a blank
 ; page): 8-char name + 3-char ext, space-padded, no dot.
 SaveStubFcb:         db "PAGE    HTM"
@@ -16302,15 +16382,10 @@ DrawSavePopup:
     ld      hl, SaveFilename
     call    DrawString
 
-    ; Body line 2: size on left, progress placeholder on right.
-    ld      de, SAVE_X + 8
-    ld      c, SAVE_Y + 40
-    ld      hl, SaveSizeLabel
-    call    DrawString
-    ld      de, SAVE_X + SAVE_W - 8 - 96    ; right-aligned (12 chars)
-    ld      c, SAVE_Y + 40
-    ld      hl, SaveProgressLabel
-    call    DrawString
+    ; Body line 2: "Size: X.X KB" + "Progress: Y.Y KB". The shared
+    ; PaintSaveSizeProgress renders the row; DoSave then re-calls it
+    ; on each progress tick.
+    call    PaintSaveSizeProgress
 
     ; --- Save button: black border + "Save" label ---
     ld      b, SAVE_BTN1_X / 4
@@ -16340,8 +16415,6 @@ DrawSavePopup:
 SaveTitleMsg:        db "Save file?", 0
 SaveAsLabel:         db "Save as: ", 0
 SavePathPrefix:      db "A:", 0
-SaveSizeLabel:       db "Size: -- B", 0
-SaveProgressLabel:   db "Progress: --", 0
 SaveBtnSaveMsg:      db "Save", 0
 SaveBtnCancelMsg:    db "Cancel", 0
 ; Phase 1 placeholder filename used by OpenSaveFromTitlebar until
@@ -19059,8 +19132,7 @@ SaveFilename:   ds 13                   ; 8.3 DOS filename + NUL terminator
 SaveByteCount:  dw 0                    ; size in bytes if known, 0 = unknown
 SaveBytesWritten: dw 0                  ; bytes streamed to dest during DoSave
 SaveStatus:     db 0                    ; SaveStatus_Idle / Saving / Done / Failed
-FdSuppress:     db 0                    ; FormatDec16's "have-printed-yet" flag
-SaveStatusBuf:  ds 32                   ; scratch for "Bytes saved: NNNN" etc.
+SaveStatusBuf:  ds 24                   ; scratch for "Progress: XX.X KB" etc.
 ; Popup-modal focus save: any popup-open zeroes the visible focus
 ; (FOC_* sentinel 0xFF doesn't match any button), so chrome paints
 ; with no focused frame (address bar reverts to its DGRAY unfocused
