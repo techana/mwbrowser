@@ -14682,6 +14682,14 @@ CursorMask:
 ; PollMouse: called every main-loop iteration. Reads mouse, clamps position,
 ; detects a press edge (prev=0 -> now=1) and dispatches to HandleClick.
 PollMouse:
+    ; DIAGNOSTIC: force cursor writes onto the currently DISPLAYED
+    ; page. If the cursor flicker at low Y is caused by WritesToPage
+    ; pointing at the back page (so cursor pixels land off-screen),
+    ; this hard-sync should make the flicker disappear. Remove once
+    ; diagnosed.
+    ld      a, [DisplayedPage]
+    ld      [WritesToPage], a
+
     call    EraseCursor                 ; clear old cursor before we move
     call    GetMouse
     ld      [MouseRaw], a
