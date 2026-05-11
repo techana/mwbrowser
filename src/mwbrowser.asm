@@ -276,6 +276,64 @@ Main:
     call    PaintToolbar
     call    SerialInit
 
+    ; If MSX-DOS handed us a command tail (e.g. "MWBRO foo.htm"),
+    ; copy it into UrlBuf and navigate. PSP layout:
+    ;   0x80 = length byte (DOS includes the leading space it
+    ;          inserts between the program name and the tail).
+    ;   0x81..0x80+L = command tail bytes; 0x80+L+1 = 0x0D.
+    ; We skip leading SP/TAB, then copy printable chars (>= 0x20,
+    ; < 0x7F) into UrlBuf until length runs out, a whitespace
+    ; appears, or URL_MAX-1 chars have been copied. NUL-terminate.
+    ld      a, [0x0080]
+    or      a
+    jp      z, MainLoop                  ; no tail -> idle
+    ld      b, a                          ; B = remaining count
+    ld      hl, 0x0081
+.cmdSkipWs:
+    ld      a, b
+    or      a
+    jp      z, MainLoop                  ; all whitespace -> idle
+    ld      a, [hl]
+    cp      ' '
+    jr      z, .cmdAdvWs
+    cp      0x09
+    jr      nz, .cmdCopy
+.cmdAdvWs:
+    inc     hl
+    dec     b
+    jr      .cmdSkipWs
+.cmdCopy:
+    ld      de, UrlBuf
+    ld      c, URL_MAX
+.cmdCpLoop:
+    ld      a, b
+    or      a
+    jr      z, .cmdCpDone
+    ld      a, c
+    or      a
+    jr      z, .cmdCpDone
+    ld      a, [hl]
+    cp      0x0D
+    jr      z, .cmdCpDone
+    cp      ' '
+    jr      z, .cmdCpDone
+    cp      0x09
+    jr      z, .cmdCpDone
+    ld      [de], a
+    inc     hl
+    inc     de
+    dec     b
+    dec     c
+    jr      .cmdCpLoop
+.cmdCpDone:
+    xor     a
+    ld      [de], a                       ; NUL-terminate UrlBuf
+    ; Anything copied? UrlBuf[0] != 0 means yes.
+    ld      a, [UrlBuf]
+    or      a
+    jp      z, MainLoop
+    call    NavigateAndFocusContent
+
 MainLoop:
     ; ──── DO NOT remove the `ei` below. ────────────────────────────
     ; If you HALT with interrupts disabled, the CPU never wakes up.
