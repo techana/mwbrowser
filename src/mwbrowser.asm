@@ -18095,7 +18095,21 @@ FILEBUF_BASE   equ (RuntimeRamEnd + 0xFF) & 0xFF00
                                        ; grows.
 
 FileBuf        equ FILEBUF_BASE
-FontBuf        equ FileBuf + FILE_BUF_SIZE
+; FontBuf is PINNED, not auto-computed from FileBuf+FILE_BUF_SIZE.
+; History: when FontBuf floated up to 0xC300 (because BSS additions
+; pushed FILEBUF_BASE to 0xA200) HB-F1XD froze at boot with "DI; HALT
+; detected" -- ExtractFont's 2 KB write into 0xC300..0xCB00 happens
+; to trip the disk BIOS / slot 3 expansion into a state where IFF
+; never re-enables. 0xC200 has been the working address since the
+; fix_char_corruption work (commit 370d6fb); pinning it guarantees
+; future BSS / code growth doesn't accidentally walk into the haunted
+; page boundary.
+;
+; The price: FILE_BUF_SIZE is now whatever fits between FILEBUF_BASE
+; and 0xC200 (currently 0x2000 = 8 KB). The bridge already chunks
+; pages larger than that via GET CHUNK <offset>, so the cap on
+; in-memory page size is enforced upstream.
+FontBuf        equ 0xC200
 ImgBuf         equ FontBuf + FONT_BUF_SIZE
 
 ; quick_screen_draw / lesson #1: bifurcated page-aligned glyph LUT.
