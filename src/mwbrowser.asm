@@ -32,6 +32,9 @@ DOS_CONST      equ 0x0B        ; console status (non-blocking peek)
 DOS_OPEN       equ 0x0F        ; open file via FCB
 DOS_CLOSE      equ 0x10        ; close file via FCB
 DOS_READ       equ 0x14        ; sequential read (128-byte record)
+DOS_WRITE      equ 0x15        ; sequential write (128-byte record)
+DOS_CREATE     equ 0x16        ; create file via FCB (also opens it)
+DOS_DELETE     equ 0x13        ; delete file via FCB
 DOS_SETDMA     equ 0x1A        ; set disk transfer address
 DOS_RDRND      equ 0x21        ; random read: reads the 128-byte record at
                                ; FCB+33..35 into the DMA buffer and syncs CR
@@ -15693,17 +15696,31 @@ SAVE_BTN2_X     equ SAVE_X + SAVE_W - SAVE_BTN_W - 32             ; "Cancel"
 OpenSaveFromTitlebar:
     xor     a
     ld      [SaveSource], a
-    ; Derive an 8.3 DOS filename from UrlBuf. Phase 1 stub: just
-    ; use a generic placeholder; Phase 2 will parse UrlBuf (drop the
-    ; "a:" / "http://host/" prefix, walk to the last slash, sanitise
-    ; into 8.3).
-    ld      hl, SaveStubName
-    ld      de, SaveFilename
-    ld      bc, 13
+    ld      [SaveStatus], a               ; SaveStatus_Idle
+    ; Derive an 8.3 DOS filename: BuildFcbFromUrl already parses
+    ; UrlBuf into the FCB (drive + 8.3 name padded with spaces),
+    ; correctly handling "a:foo.htm" / "foo.htm" / "FOO.HTML"
+    ; (extension truncated to 3 chars). FcbNameToDisplay then
+    ; copies the FCB name+ext into SaveFilename with a "." inserted
+    ; so the popup renders it as "NAME    .EXT" (12 + NUL = 13 B).
+    ; If UrlBuf is empty (Enter at empty bar / no page loaded),
+    ; FCB ends all-zero; fall back to a placeholder so the popup
+    ; still has something readable.
+    call    BuildFcbFromUrl
+    ld      a, [Fcb + 1]
+    or      a
+    jr      nz, .ostHaveName
+    ld      hl, SaveStubFcb               ; 11-byte FCB-format placeholder
+    ld      de, Fcb + 1
+    ld      bc, 11
     ldir
-    xor     a
-    ld      [SaveByteCount], a
-    ld      [SaveByteCount + 1], a
+.ostHaveName:
+    call    FcbNameToDisplay
+    ; Captured byte count = WindowLen (parsed HTML / text / view-mode
+    ; image -- whatever's currently in FileBuf). Link-click flow will
+    ; populate this differently in Phase 3.
+    ld      hl, [WindowLen]
+    ld      [SaveByteCount], hl
     jr      OpenSave
 
 ; Entry point for the future link-click-on-unrecognised-file path.
@@ -15730,15 +15747,186 @@ CloseSave:
     call    PopupRestoreFocusAndPaintChrome
     jp      RestorePopupBg              ; HMMM-blit the bg back
 
-; Stub for the Save button. Phase 1 just dismisses; Phase 2 will
-; kick off the BDOS write streaming loop.
+; DoSave: write FileBuf[0..WindowLen] to disk via BDOS sequential
+; F_WRITE (function 0x15). Updates the popup status line on success
+; or error so the user can confirm before dismissing.
+;
+; Approach: F_CREATE the file (truncates if it exists), zero-fill
+; the trailing partial record so we don't write FileBuf garbage past
+; EOF, then loop F_SETDMA + F_WRITE per 128-byte record. F_CLOSE on
+; success.
+;
+; Limitations (deferred to a follow-up commit):
+;   * File size is always rounded up to the next 128-byte record
+;     boundary. MSX-DOS 1 has no "write N bytes" call -- DOS 2's
+;     F_RANDWRITE would let us trim, but we're targeting DOS 1.
+;     For HTML / text that's harmless; trailing zeros are ignored
+;     by the parser. For binary saves we should add a note.
+;   * No cancel-mid-stream yet. The write runs to completion before
+;     control returns to MainLoop. A polling hook between records
+;     would let the Cancel button abort + DOS_DELETE the partial.
+;   * No live progress readout. Whole save shows "Saving..." then
+;     either "Saved." or "Save failed."
+;   * Saves whatever's in FileBuf -- text / HTML pages are fine;
+;     images (.SC6 / .PCX / .BMP) were streamed straight to VRAM
+;     during render and aren't in FileBuf, so saving an image-view
+;     URL writes the stale HTML left over from a prior load. Phase 3
+;     will re-fetch from the bridge for the link-click flow.
 DoSave:
-    ; TODO Phase 2: open SaveFilename via BDOS create+truncate, stream
-    ; bytes (from FileBuf for view-mode saves, or from the bridge GET
-    ; response for link-click saves) until EOF, update SaveByteCount /
-    ; progress readout, and close the file. Cancel deletes the partial
-    ; file.
-    jp      CloseSave
+    ; Show "Saving..." in the status row so the user gets feedback
+    ; before the (potentially multi-second) F_WRITE loop.
+    ld      a, SaveStatus_Saving
+    ld      [SaveStatus], a
+    call    PaintSaveStatusLine
+
+    ; --- Zero-fill the trailing partial record ---
+    ld      hl, [WindowLen]
+    ld      a, l
+    and     0x7F
+    jr      z, .dsNoFill                  ; aligned -- no fill needed
+    ld      b, a                          ; B = bytes already in last record
+    ld      a, 128
+    sub     b                             ; A = fill bytes
+    ld      b, a
+    ld      de, FileBuf
+    ld      hl, [WindowLen]
+    add     hl, de                        ; HL = FileBuf + WindowLen
+    xor     a
+.dsZF:
+    ld      [hl], a
+    inc     hl
+    djnz    .dsZF
+.dsNoFill:
+
+    ; --- F_CREATE ---
+    ; ResetFcbTail clears the record-counter / random-record / extent
+    ; bytes (Fcb+12..35). Without this, FCB's CR (Fcb+32) might
+    ; still hold the last byte index from the LoadFile that populated
+    ; UrlBuf, and F_WRITE would resume from THAT offset -- our
+    ; first write went to byte 7168 instead of byte 0 and the file
+    ; ended up double its intended size.
+    call    ResetFcbTail
+    ld      de, Fcb
+    ld      c, DOS_CREATE
+    call    BDOS_ENTRY
+    or      a
+    jp      nz, .dsFailed
+
+    ; --- Compute record count: (WindowLen + 127) / 128 ---
+    ld      hl, [WindowLen]
+    ld      a, h
+    or      l
+    jr      z, .dsCloseAndDone            ; nothing to write, just close
+    ld      bc, 127
+    add     hl, bc
+    ld      a, h
+    add     a, a                          ; A = h * 2
+    ld      b, a
+    ld      a, l
+    rlca
+    and     1
+    add     a, b                          ; A = (h*2) + (l>>7) = records
+    ld      b, a                          ; B = record counter
+
+    ; --- Write loop: F_SETDMA + F_WRITE per record ---
+    ld      hl, FileBuf
+.dsLoop:
+    push    bc
+    push    hl
+    ex      de, hl                        ; DE = next DMA
+    ld      c, DOS_SETDMA
+    call    BDOS_ENTRY
+    ld      de, Fcb
+    ld      c, DOS_WRITE
+    call    BDOS_ENTRY
+    pop     hl
+    pop     bc
+    or      a
+    jp      nz, .dsFailed
+    ld      de, 128
+    add     hl, de
+    djnz    .dsLoop
+
+.dsCloseAndDone:
+    ld      de, Fcb
+    ld      c, DOS_CLOSE
+    call    BDOS_ENTRY
+    or      a
+    jp      nz, .dsFailed
+    ld      a, SaveStatus_Done
+    ld      [SaveStatus], a
+    jp      PaintSaveStatusLine
+
+.dsFailed:
+    ld      a, SaveStatus_Failed
+    ld      [SaveStatus], a
+    jp      PaintSaveStatusLine
+
+; FcbNameToDisplay: copy the FCB filename (8 chars at Fcb+1) + "." +
+; extension (3 chars at Fcb+9) into SaveFilename (13 bytes incl NUL).
+; The FCB stores name/ext space-padded; we preserve those spaces so
+; the popup renders the canonical "NAME    .EXT" layout.
+FcbNameToDisplay:
+    ld      hl, Fcb + 1
+    ld      de, SaveFilename
+    ld      bc, 8
+    ldir
+    ld      a, '.'
+    ld      [de], a
+    inc     de
+    ld      hl, Fcb + 9
+    ld      bc, 3
+    ldir
+    xor     a
+    ld      [de], a
+    ret
+
+; PaintSaveStatusLine: replaces the body's "Size:" / "Progress:" row
+; with a centred status string based on SaveStatus.
+PaintSaveStatusLine:
+    ld      a, [SaveStatus]
+    cp      SaveStatus_Saving
+    ld      hl, SaveStatusSavingMsg
+    jr      z, .pslDraw
+    cp      SaveStatus_Done
+    ld      hl, SaveStatusDoneMsg
+    jr      z, .pslDraw
+    cp      SaveStatus_Failed
+    ld      hl, SaveStatusFailedMsg
+    jr      z, .pslDraw
+    ret                                    ; idle -- nothing to repaint
+.pslDraw:
+    push    hl                            ; save msg ptr across FillRect
+    ; LGRAY-fill the status row so the previous label disappears.
+    ld      b, (SAVE_X + 4) / 4
+    ld      c, SAVE_Y + 40
+    ld      d, (SAVE_W - 8) / 4
+    ld      e, 8
+    ld      a, COL_LGRAY
+    call    FillRect
+    ; Re-arm text colours (FillRect clobbered the LUT). SetTextColours
+    ; takes its bg argument in L, so set up A + L BEFORE recovering
+    ; the saved msg ptr -- doing it the other way clobbered the low
+    ; byte of HL and the popup printed garbage.
+    ld      a, COL_BLACK
+    ld      l, COL_LGRAY
+    call    SetTextColours
+    pop     hl                            ; HL = msg ptr (clean)
+    ld      de, SAVE_X + 16
+    ld      c, SAVE_Y + 40
+    jp      DrawString
+
+SaveStatus_Idle    equ 0
+SaveStatus_Saving  equ 1
+SaveStatus_Done    equ 2
+SaveStatus_Failed  equ 3
+
+SaveStatusSavingMsg: db "Saving...", 0
+SaveStatusDoneMsg:   db "Saved.", 0
+SaveStatusFailedMsg: db "Save failed.", 0
+; FCB-format placeholder when UrlBuf is empty (Open [] on a blank
+; page): 8-char name + 3-char ext, space-padded, no dot.
+SaveStubFcb:         db "PAGE    HTM"
 
 ; ClickInSavePopup: dispatch a click while the Save popup is open.
 ; Targets (X-band tests guarded by Y-band so out-of-rect clicks
@@ -18654,6 +18842,7 @@ SaveSource:     db 0                    ; 0 = titlebar [] (save current view),
                                         ; 1 = link click to unrecognised file
 SaveFilename:   ds 13                   ; 8.3 DOS filename + NUL terminator
 SaveByteCount:  dw 0                    ; size in bytes if known, 0 = unknown
+SaveStatus:     db 0                    ; SaveStatus_Idle / Saving / Done / Failed
 ; Popup-modal focus save: any popup-open zeroes the visible focus
 ; (FOC_* sentinel 0xFF doesn't match any button), so chrome paints
 ; with no focused frame (address bar reverts to its DGRAY unfocused
