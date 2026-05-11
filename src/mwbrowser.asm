@@ -2251,69 +2251,41 @@ VdpSetDisplayPage:
 ; the user sees the toolbar "rewind" to whatever stale state the back
 ; page was last left in.
 ;
-; Implementation: 128-byte RAM stage row, 29 round-trips through the
-; VDP read/write ports (~50 ms on a 3.58 MHz Z80; the page-flip itself
-; is what hides ClearContentArea's white flash, which costs ~190 ms of
-; visible blank so the trade is firmly net-positive).
+; Hardware path: one V9938 HMMM command copies the full chrome
+; band (CONTENT_Y0 rows * full screen width) from the displayed
+; page to the back page in ~5 ms vs the old per-row CPU shuttle's
+; ~50 ms. The CPU is free to do other work while the blit runs;
+; we VdpCmdWait so the caller doesn't race the next paint.
 ;
-; TODO: drop the per-row CPU shuttle for a single V9938 HMMM command
-; (see VdpCmd / VdpCmdWait near line 1880). ~5 ms vs ~50 ms, and the
-; CPU is free to do other work while the blit runs. Same shape applies
-; to PrerenderNext's chrome mirror call.
+; Source / dest pages live in the command engine's 10-bit Y address
+; space (page 0 -> Y 0..255, page 1 -> Y 256..511, ...), so the
+; SY-high and DY-high bytes carry DisplayedPage / NOT(DisplayedPage)
+; respectively. The CONTENT_Y0 rows always start at Y=0 within
+; each page so SY-low and DY-low are 0.
 ;
-; Clobbers AF, BC, HL. Restores WritesToPage to its prior value.
+; Clobbers AF, HL.
 CopyChromeToBack:
-    ld      a, [WritesToPage]
-    push    af                           ; save caller's WritesToPage
-    xor     a
-    ld      [ChromeRow], a
-.crLoop:
-    ld      a, [ChromeRow]
-    cp      CONTENT_Y0
-    jr      nc, .crDone
-
-    ; Read row from the displayed page (R14 follows WritesToPage).
     ld      a, [DisplayedPage]
-    ld      [WritesToPage], a
-    ld      a, [ChromeRow]
-    ld      c, a
-    ld      b, 0
-    call    SetVramReadPos
-    ld      hl, ImgBuf                   ; reuse the 128-byte image-stream
-    ld      b, 128                       ; scratch -- no image active here
-.crRead:
-    in      a, (VDP_DATA)
-    ld      [hl], a
-    inc     hl
-    djnz    .crRead
-
-    ; Stream the staged row into the back page.
-    ld      a, [DisplayedPage]
+    ld      [CopyChromeCmd + 3], a       ; SY-high = displayed page
     xor     1
-    ld      [WritesToPage], a
-    ld      a, [ChromeRow]
-    ld      c, a
-    ld      b, 0
-    call    SetVramWritePos
-    ld      hl, ImgBuf
-    ld      b, 128
-.crWrite:
-    ld      a, [hl]
-    out     (VDP_DATA), a
-    inc     hl
-    djnz    .crWrite
+    ld      [CopyChromeCmd + 7], a       ; DY-high = back page
+    ld      hl, CopyChromeCmd
+    call    VdpCmd
+    jp      VdpCmdWait
 
-    ld      a, [ChromeRow]
-    inc     a
-    ld      [ChromeRow], a
-    jr      .crLoop
-
-.crDone:
-    pop     af
-    ld      [WritesToPage], a
-    ret
-
-ChromeRow:    db 0
+; HMMM register block for the chrome mirror. SX/DX = 0, NX = full
+; screen width (512 px), NY = CONTENT_Y0 (rows 0..CONTENT_Y0-1).
+; SY-high (byte 3) and DY-high (byte 7) are patched per call.
+CopyChromeCmd:
+    dw      0                            ; +0..1   SX = 0
+    db      0, 0                         ; +2..3   SY low/high (high <- DisplayedPage)
+    dw      0                            ; +4..5   DX = 0
+    db      0, 0                         ; +6..7   DY low/high (high <- NOT DisplayedPage)
+    dw      WIDTH                        ; +8..9   NX = 512 (full width)
+    db      CONTENT_Y0, 0                ; +10..11 NY = chrome band height
+    db      0                            ; +12     CLR (unused for HMMM)
+    db      0                            ; +13     ARG
+    db      0xD0                         ; +14     CMD = HMMM
 
 ; quick_screen_draw / lesson #2: VdpBlank / VdpUnblank toggle R1 BL
 ; (bit 6, "display on/off"). With BL=0 the V9938 stops fetching
