@@ -167,7 +167,7 @@ URL_MAX        equ 255         ; address-bar / fetch-target buffer cap (chars
                                ; before NUL). Bumped from 95 because real
                                ; mirror.aratab.com URLs run past the 100-char
                                ; line and got truncated on click.
-FILE_BUF_SIZE  equ 0x1E00      ; 7.5 KB. Sized so FILEBUF_BASE +
+FILE_BUF_SIZE  equ 0x1C00      ; 7 KB. Sized so FILEBUF_BASE +
                                ; FILE_BUF_SIZE + FONT_BUF_SIZE + 128 +
                                ; 512 B (FastLutHi+FastLutLo, lesson #1) +
                                ; 2 KB (TransposedFontBuf, lesson #3, see
@@ -1872,6 +1872,95 @@ VdpFill:
     ret
 
 ; ============================================================================
+; V9938 command engine glue
+;
+; Drives the V9938's built-in 2D blitter (registers R32..R46, status
+; S#2.CE). Today's only caller is the popup save-bg/restore-bg path
+; (SavePopupBg / RestorePopupBg). The plumbing is general-purpose
+; though, so future passes can also point hot CPU-side blits at it
+; for big speedups -- see the TODO block below.
+;
+; TODO (command-engine wins worth chasing):
+;   * FillRect / ClearContentArea / ClearContent
+;       -> HMMV (byte-aligned rectangle fill in hardware).
+;       ClearContentArea is the biggest single CPU hit on every scroll
+;       (~100-150 ms today, ~5-10 ms via HMMV).
+;   * CopyChromeToBack and PrerenderNext's chrome mirror
+;       -> HMMM (byte-aligned VRAM->VRAM rectangle copy).
+;       ~50 ms CPU loop today, ~5 ms via HMMM.
+;   * Bitmap streamers (SC6 / PCX / BMP, RenderImageDataUri)
+;       -> HMMC (CPU->VRAM byte burst). Modest win; the decoders are
+;       still CPU-bound on the dictionary side, not the VDP port.
+;   * Smooth scroll
+;       -> YMMM (shift a VRAM band up/down N rows). Replaces today's
+;       page-flip-only scroll with line-grained scrolling at near-zero
+;       CPU cost.
+;   * Selection / focus / "found" highlight
+;       -> LMMM with LOG=XOR. Toggles a region's pixel polarity in
+;       place without touching CPU buffers; great for transient
+;       overlays that need an obvious revert.
+;
+; All of those drop in with the same VdpCmd / VdpCmdWait helpers and
+; a per-command 15-byte register block (see PopupBgSaveCmd below for
+; the block layout).
+; ============================================================================
+
+VDP_RIND       equ 0x9B          ; indirect-register-write port (R17 selects start reg)
+
+; VdpCmd: HL = pointer to a 15-byte command-register block:
+;       +0..1  SX  (source X, 9-bit)        R32-R33
+;       +2..3  SY  (source Y, 10-bit)       R34-R35
+;       +4..5  DX  (dest X)                 R36-R37
+;       +6..7  DY  (dest Y)                 R38-R39
+;       +8..9  NX  (width)                  R40-R41
+;       +10..11 NY (height)                 R42-R43
+;       +12    CLR (fill colour byte)       R44
+;       +13    ARG (direction + page bits)  R45
+;       +14    CMD (opcode | LOG)           R46
+;
+; Waits for any in-flight command to finish first, then writes all
+; 15 register bytes via R17's indirect-write autoincrement (one
+; OTIR of 15 bytes to port 0x9B). Returns AS SOON AS the command is
+; kicked off -- the CPU is free to do other work while the VDP
+; runs; callers that need to block until the blit is complete
+; should `call VdpCmdWait` after.
+VdpCmd:
+    push    hl
+    call    VdpCmdWait                  ; finish any in-flight blit first
+    pop     hl
+    di
+    ld      a, 32                       ; start at R32
+    out     (VDP_CMD), a
+    ld      a, 0x80 | 17                ; R17 = indirect write + autoinc
+    out     (VDP_CMD), a
+    ld      bc, 15 * 256 + VDP_RIND     ; B=15 count, C=0x9B port
+    otir
+    ei
+    ret
+
+; VdpCmdWait: poll S#2.CE until the command engine is idle, then
+; re-select S#0 so the BIOS IM1 handler (which reads S#0 for the
+; VBLANK flag) sees the usual register on its next read. DI throughout
+; the select/poll/restore sequence to keep the IRQ handler from
+; reading S#2 mid-poll.
+VdpCmdWait:
+    di
+    ld      a, 2                        ; status reg index
+    out     (VDP_CMD), a
+    ld      a, 0x80 | 15                ; R15 = status-reg select
+    out     (VDP_CMD), a
+.wait:
+    in      a, (VDP_CMD)                ; reads S#2
+    rra                                 ; bit 0 = CE -> CF
+    jr      c, .wait
+    xor     a
+    out     (VDP_CMD), a
+    ld      a, 0x80 | 15
+    out     (VDP_CMD), a                ; back to S#0
+    ei
+    ret
+
+; ============================================================================
 ; Graphics primitives (byte-aligned: x%4==0, w%4==0)
 ; ============================================================================
 
@@ -1928,6 +2017,12 @@ SetVramReadPos:
     jp      VdpSetReadAddr
 
 ; FillRect(B=x/4, C=y, D=w/4, E=h, A=colour). Byte-aligned.
+;
+; TODO: replace this CPU-loop with a V9938 HMMV command (see the
+; VdpCmd block near line 1880). Biggest single CPU win in the
+; codebase: ClearContentArea is a ~100-150 ms FillRect per scroll;
+; HMMV does the same in ~5-10 ms with the CPU free to do other
+; work meanwhile.
 FillRect:
     push    bc
     call    PackColour
@@ -2127,6 +2222,11 @@ VdpSetDisplayPage:
 ; VDP read/write ports (~50 ms on a 3.58 MHz Z80; the page-flip itself
 ; is what hides ClearContentArea's white flash, which costs ~190 ms of
 ; visible blank so the trade is firmly net-positive).
+;
+; TODO: drop the per-row CPU shuttle for a single V9938 HMMM command
+; (see VdpCmd / VdpCmdWait near line 1880). ~5 ms vs ~50 ms, and the
+; CPU is free to do other work while the blit runs. Same shape applies
+; to PrerenderNext's chrome mirror call.
 ;
 ; Clobbers AF, BC, HL. Restores WritesToPage to its prior value.
 CopyChromeToBack:
@@ -15450,6 +15550,8 @@ ImgOffCmd:      db "IMG OFF", 0
 ; in `call OpenAbout / jp MainLoop`.
 OpenAbout:
     call    PopupSaveFocusAndUnfocusChrome
+    ld      a, ABOUT_H
+    call    SavePopupBg                 ; HMMM-snapshot the bg under the popup
     ld      a, 2
     ld      [AboutOpen], a
     jp      DrawAboutPopup              ; DrawAboutPopup ends with `ret`
@@ -15458,8 +15560,7 @@ CloseAbout:
     xor     a
     ld      [AboutOpen], a
     call    PopupRestoreFocusAndPaintChrome
-    call    ClearContentArea
-    jp      PrintFileContent            ; PrintFileContent ends with `ret`
+    jp      RestorePopupBg              ; HMMM-blit the bg back; no re-parse
 
 ; Snapshot the toolbar Focus and force it to a sentinel that doesn't
 ; match any focusable element (ComputeFocusState compares against
@@ -15478,6 +15579,85 @@ PopupRestoreFocusAndPaintChrome:
     ld      a, [PopupFocusBefore]
     ld      [Focus], a
     jp      PaintToolbar
+
+; ----------------------------------------------------------------------------
+; Popup background save/restore via V9938 HMMM (VRAM->VRAM blit).
+;
+; On popup OPEN: snapshot the popup-region pixels from the currently
+; displayed page into a backup area at the top of VRAM page 2.
+; On popup CLOSE: blit the backup back over the popup region.
+; Replaces the slow ClearContentArea + PrintFileContent re-parse on
+; close: a 280 x 136 region copies in ~5 ms via HMMM instead of
+; ~200 ms of CPU-side parsing + rendering.
+;
+; Why page 2: MWBRO's current bitmap pipeline uses only pages 0 and
+; 1 (display + back buffer for the lesson-4 page-flip / prerender).
+; Page 2 is otherwise idle on 128 KB-VRAM MSX2 machines (HB-F1XD,
+; AX-370, HB-F700D etc. all ship with 128 KB).
+;
+; Worst-case backup size: ABOUT_W * ABOUT_H * 2 bits = 280 * 136 / 4
+; = ~9.5 KB, fits comfortably in page 2's 32 KB.
+;
+; The command engine's 10-bit Y address space stacks the 4 pages:
+;   page 0 -> Y 0..255,   page 1 -> Y 256..511,
+;   page 2 -> Y 512..767, page 3 -> Y 768..1023.
+; So SY-high (R35) == DisplayedPage selects "the page the user sees".
+;
+; TODO: probe VRAM size at boot via the BIOS work area (the bottom
+; nibble of MSXVER's RAMVAL byte distinguishes 16/64/128 KB). On a
+; 64 KB VRAM MSX2 the page-2 backup wraps to page 0 and corrupts
+; the display; fall back to the old ClearContentArea +
+; PrintFileContent re-render path for those machines. All MWBRO's
+; current test targets ship with 128 KB, so this isn't urgent.
+; ----------------------------------------------------------------------------
+
+; SavePopupBg(A = popup height in rows): HMMM-copy the popup region
+; on the displayed page to the backup area at (0, 0) on page 2.
+SavePopupBg:
+    ld      [PopupBgHeight], a            ; stash for the matching restore
+    ld      [PopupBgSaveCmd + 10], a      ; patch NY-low (height)
+    ld      a, [DisplayedPage]
+    ld      [PopupBgSaveCmd + 3], a       ; patch SY-high (source page)
+    ld      hl, PopupBgSaveCmd
+    call    VdpCmd
+    jp      VdpCmdWait                    ; block until the bg is safely saved
+
+; RestorePopupBg: mirror -- HMMM the backup back over the popup region.
+RestorePopupBg:
+    ld      a, [PopupBgHeight]
+    ld      [PopupBgRestoreCmd + 10], a   ; NY-low
+    ld      a, [DisplayedPage]
+    ld      [PopupBgRestoreCmd + 7], a    ; DY-high (dest page)
+    ld      hl, PopupBgRestoreCmd
+    call    VdpCmd
+    jp      VdpCmdWait
+
+; HMMM register-block templates. SY-high (byte 3 in save) / DY-high
+; (byte 7 in restore) carry the displayed-page selector; NY-low
+; (byte 10) carries the popup height. Both patched at runtime.
+PopupBgSaveCmd:
+    dw      SAVE_X                        ; +0..1  SX
+    db      SAVE_Y, 0                     ; +2..3  SY low/high (high <- DisplayedPage)
+    dw      0                             ; +4..5  DX
+    db      0, 2                          ; +6..7  DY = 0, page-2 (high=2)
+    dw      SAVE_W                        ; +8..9  NX
+    db      0, 0                          ; +10..11 NY low/high  (low <- height)
+    db      0                             ; +12    CLR (unused for HMMM)
+    db      0                             ; +13    ARG (forward dir)
+    db      0xD0                          ; +14    CMD = HMMM
+
+PopupBgRestoreCmd:
+    dw      0                             ; +0..1  SX
+    db      0, 2                          ; +2..3  SY = 0, page-2
+    dw      SAVE_X                        ; +4..5  DX
+    db      SAVE_Y, 0                     ; +6..7  DY low/high (high <- DisplayedPage)
+    dw      SAVE_W                        ; +8..9  NX
+    db      0, 0                          ; +10..11 NY low/high  (low <- height)
+    db      0                             ; +12    CLR
+    db      0                             ; +13    ARG
+    db      0xD0                          ; +14    CMD = HMMM
+
+PopupBgHeight: db 0
 
 ; ============================================================================
 ; Save-file popup (titlebar [] button, and later: link click to
@@ -15534,6 +15714,8 @@ OpenSaveFromLink:
 
 OpenSave:
     call    PopupSaveFocusAndUnfocusChrome
+    ld      a, SAVE_H
+    call    SavePopupBg                 ; HMMM-snapshot the bg
     ld      a, 1
     ld      [SaveOpen], a
     jp      DrawSavePopup
@@ -15544,8 +15726,7 @@ CloseSave:
     xor     a
     ld      [SaveOpen], a
     call    PopupRestoreFocusAndPaintChrome
-    call    ClearContentArea
-    jp      PrintFileContent
+    jp      RestorePopupBg              ; HMMM-blit the bg back
 
 ; Stub for the Save button. Phase 1 just dismisses; Phase 2 will
 ; kick off the BDOS write streaming loop.
