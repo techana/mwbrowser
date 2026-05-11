@@ -5162,18 +5162,25 @@ class MsxSession:
         except OSError:
             return ("404", None)
         ext = os.path.splitext(full)[1].lower()
-        # HTM/TXT flow back as the HTM frame the on-MSX renderer
-        # already knows; binary types stream as the same frame -- the
-        # MSX writer (Phase 3) will decide what to do with them.
+        # HTM/TXT/binary blobs flow as HTM (the on-MSX renderer
+        # decides how to treat the bytes -- text gets parsed,
+        # save-popup streams via GET CHUNK). Image extensions are
+        # distinct: they need to flow as their bitmap wire kind so
+        # the on-MSX RemoteImgOpen path can drain them straight to
+        # VRAM via the existing PCX / BMP / SC6 decoders.
         self.pending_chunks = []
         self.body = data
         self.page_total = 0
         self.page_served = 0
         self.img_cache = {}
         self.img_counter = 0
-        if ext in (".htm", ".html", ".txt"):
-            return ("HTM", data)
-        return ("HTM", data)  # Phase 3 will distinguish via MIME if needed.
+        if ext == ".pcx":
+            self._log("self-host PCX {} ({} B)".format(rel, len(data)))
+            return ("PCX", data)
+        if ext == ".bmp":
+            self._log("self-host BMP {} ({} B)".format(rel, len(data)))
+            return ("BMP", data)
+        return ("HTM", data)
 
     # -- HTML fetch + simplify -----------------------------------------
 

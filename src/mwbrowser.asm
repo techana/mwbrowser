@@ -171,7 +171,7 @@ URL_MAX        equ 255         ; address-bar / fetch-target buffer cap (chars
                                ; before NUL). Bumped from 95 because real
                                ; mirror.aratab.com URLs run past the 100-char
                                ; line and got truncated on click.
-FILE_BUF_SIZE  equ 0x1900      ; 6.25 KB. Sized so FILEBUF_BASE +
+FILE_BUF_SIZE  equ 0x1800      ; 6 KB exactly = SERIAL_CHUNK_RANGE_BYTES;
                                ; FILE_BUF_SIZE + FONT_BUF_SIZE + 128 +
                                ; 512 B (FastLutHi+FastLutLo, lesson #1) +
                                ; 2 KB (TransposedFontBuf, lesson #3, see
@@ -4034,6 +4034,15 @@ LoadFile:
     call    UrlStripViewPrefix
     jp      RemoteLoadView
 .lfNotView:
+    ; Direct image URL (a:pg02.pcx, http://x/y.bmp, ...) -- synthesize a
+    ; minimal HTML wrapper so the existing PrintFileContent + TagImg
+    ; path handles the decode, scrollbar, and 404/alt-fallback uniformly.
+    ; Works for both local-disk (FCB) and remote (RemoteImgOpen via
+    ; bridge PCX/BMP wire kind) paths because TagImg dispatches by
+    ; IsRemoteSession internally.
+    call    LocalUrlIsImage
+    jp      z, LoadFileLocalImg
+
     ld      hl, UrlBuf
     call    IsLocalUrl
     jr      z, .lfLocal
@@ -4044,15 +4053,6 @@ LoadFile:
     xor     a
     ld      [IsRemoteSession], a
 
-    ; Direct image URL (a:pg02.pcx, b:logo.sc6, etc.) -- synthesize a
-    ; minimal HTML wrapper so the existing PrintFileContent + TagImg
-    ; path handles the decode, scrollbar, and 404/alt-fallback uniformly.
-    ; Without this the file's raw bytes would render as text.
-    ; BuildFcbFromUrl has already uppercased + space-padded the ext
-    ; at Fcb+9..11; just compare three letters.
-    call    LocalUrlIsImage
-    jp      z, LoadFileLocalImg
-    ; fall through to normal text/html load
     call    ResetFcbTail
 
     ld      c, DOS_OPEN
@@ -4104,6 +4104,16 @@ LocalImgPrefix:  db '<center><img src="', 0
 LocalImgSuffix:  db '"></center>', 0
 
 LoadFileLocalImg:
+    ; TagImg dispatches by IsRemoteSession; set it now so remote
+    ; .pcx URLs reach RemoteImgOpen instead of the local FCB path.
+    ld      hl, UrlBuf
+    call    IsLocalUrl
+    ld      a, 0
+    jr      z, .lflSetSession
+    ld      a, 2
+.lflSetSession:
+    ld      [IsRemoteSession], a
+
     ld      hl, LocalImgPrefix
     ld      de, FileBuf
     call    LfImgCopyZ
@@ -4136,36 +4146,147 @@ LfImgCopyZ:
     inc     de
     jr      LfImgCopyZ
 
-; LocalUrlIsImage: returns Z when Fcb+9..11 matches PCX/BMP/SC6
-; (uppercase, no padding -- BuildFcbFromUrl uppercases + space-pads).
+; LocalUrlIsImage: returns Z when UrlBuf ends in ".pcx"/".bmp"/".sc6"
+; (case-insensitive). Scans UrlBuf directly instead of the FCB so it
+; works for remote URLs (where BuildFcbFromUrl's ext field can hold a
+; substring of the host part, e.g. ".0.1" from 127.0.0.1).
 LocalImgExts:    db "PCXBMPSC6"
 LocalUrlIsImage:
-    ld      b, 3                            ; three extensions
-    ld      hl, LocalImgExts
-.luiNext:
-    ld      de, Fcb + 9
-    ld      c, 3                            ; three chars per extension
-.luiCmp:
-    ld      a, [de]
-    cp      [hl]
-    jr      nz, .luiSkip
-    inc     de
+    ; Find UrlBuf length (E = strlen).
+    ld      hl, UrlBuf
+    ld      e, 0
+.luiLen:
+    ld      a, [hl]
+    or      a
+    jr      z, .luiHaveLen
     inc     hl
-    dec     c
-    jr      nz, .luiCmp
+    inc     e
+    jr      .luiLen
+.luiHaveLen:
+    ; Need at least 4 chars (".pcx" etc.) and a '.' at position E-4.
+    ld      a, e
+    cp      4
+    jr      c, .luiNo
+    sub     4
+    ld      e, a
+    ld      d, 0
+    ld      hl, UrlBuf
+    add     hl, de                          ; HL = UrlBuf + E - 4 (the '.')
+    ld      a, [hl]
+    cp      '.'
+    jr      nz, .luiNo
+    inc     hl                              ; HL -> first ext char
+    ; Compare HL..HL+2 (uppercased) against each of the three 3-char
+    ; entries in LocalImgExts.
+    ld      a, 3
+    ld      [LuiTries], a
+    ld      de, LocalImgExts
+.luiNext:
+    push    hl
+    ld      b, 3                            ; chars per candidate
+.luiCmp:
+    ld      a, [hl]
+    call    UpperCaseA
+    ld      c, a                            ; uppercased URL char
+    ld      a, [de]
+    cp      c
+    jr      nz, .luiSkip
+    inc     hl
+    inc     de
+    djnz    .luiCmp
+    pop     hl
     xor     a                               ; Z = match
     ret
 .luiSkip:
-    ; Advance HL to the next 3-char entry.
-    ld      a, c                            ; bytes left in current entry
-    add     a, l
-    ld      l, a
+    pop     hl                              ; rewind to ext start
+    ; Advance DE past the rest of this 3-char entry (B = chars left,
+    ; including the mismatching one).
+    ld      a, b
+    add     a, e
+    ld      e, a
     jr      nc, .luiNoCar
-    inc     h
+    inc     d
 .luiNoCar:
-    dec     b
+    ld      a, [LuiTries]
+    dec     a
+    ld      [LuiTries], a
     jr      nz, .luiNext
+.luiNo:
     or      1                               ; NZ
+    ret
+LuiTries: db 0
+
+; FindUrlBasename: HL on entry points at a NUL-terminated URL. Returns
+; HL pointing one char past the last '/' (or the original HL if there
+; is none). Used so OpenSaveFromTitlebar can FCB-parse just the file
+; component of a URL like "http://127.0.0.1/SERPOC.COM" instead of
+; the whole string (BuildFcbFromUrl stops at the first '.' in the
+; host, producing FCB ext from random URL bytes).
+FindUrlBasename:
+    push    hl
+    ld      d, h
+    ld      e, l                            ; DE = last "after /" so far
+.fubScan:
+    ld      a, [hl]
+    or      a
+    jr      z, .fubDone
+    cp      '/'
+    jr      nz, .fubNext
+    inc     hl
+    ld      d, h
+    ld      e, l
+    jr      .fubScan
+.fubNext:
+    inc     hl
+    jr      .fubScan
+.fubDone:
+    pop     hl
+    ; If we never saw a '/', DE still equals original HL -- fine.
+    ex      de, hl
+    ret
+
+; UrlHasComExt: Z if UrlBuf ends in ".com" (case-insensitive). Used
+; by NavigateToCurrentUrl to route non-displayable binaries (.com,
+; later .exe / .zip / etc.) to the Save popup instead of the parser.
+UrlHasComExt:
+    ld      hl, UrlBuf
+    ld      e, 0
+.uceLen:
+    ld      a, [hl]
+    or      a
+    jr      z, .uceHave
+    inc     hl
+    inc     e
+    jr      .uceLen
+.uceHave:
+    ld      a, e
+    cp      4
+    jr      c, .uceNo
+    sub     4
+    ld      e, a
+    ld      d, 0
+    ld      hl, UrlBuf
+    add     hl, de
+    ld      a, [hl]
+    cp      '.'
+    jr      nz, .uceNo
+    inc     hl
+    ld      a, [hl]
+    call    UpperCaseA
+    cp      'C'
+    jr      nz, .uceNo
+    inc     hl
+    ld      a, [hl]
+    call    UpperCaseA
+    cp      'O'
+    jr      nz, .uceNo
+    inc     hl
+    ld      a, [hl]
+    call    UpperCaseA
+    cp      'M'
+    ret     z
+.uceNo:
+    or      1
     ret
 
 ; LoadFileChunk: fill FileBuf starting at the given document offset
@@ -14303,6 +14424,15 @@ NavigateToCurrentUrl:
     or      a
     jr      nz, .navViewDone
 
+    ; .COM (and any future opaque-binary) URLs skip rendering and pop
+    ; the Save dialog directly. The user's already typed/clicked the
+    ; URL -- the bridge cached the body in self.body -- and asking
+    ; "Save?" is more useful than scrolling through a wall of garbage
+    ; bytes. PrintFileContent's normal text path still runs for HTM /
+    ; TXT and unknown extensions (treated as text by default).
+    call    UrlHasComExt
+    jp      z, .navAutoSave
+
     ld      hl, 0
     ld      [ScrollLine], hl
     call    ClearContentArea
@@ -14321,6 +14451,18 @@ NavigateToCurrentUrl:
     ; only render path that doesn't reach PrerenderNext via
     ; RefreshAfterScroll's tail, so we have to call it explicitly here.
     jp      PrerenderNext
+
+.navAutoSave:
+    ; Clear Busy and repaint chrome, then open the Save popup. The
+    ; popup's "GET SIZE" query reads the bridge's cached self.body
+    ; size (which RemoteLoadFile already populated above). DoSave's
+    ; chunk-loop then streams the body to dest via GET CHUNK.
+    xor     a
+    ld      [Busy], a
+    ld      a, 6
+    ld      [LoadPhase], a
+    call    PaintToolbar
+    jp      OpenSaveFromTitlebar
 
 .err:
     ; Load failed. If the address bar is empty (Enter pressed with no
@@ -15940,11 +16082,15 @@ OpenSaveFromTitlebar:
     ld      [SaveBytesWritten], a
     ld      [SaveBytesWritten + 1], a
 
-    ; Build the DEST FCB from UrlBuf. BuildFcbFromUrl uppercases +
-    ; pads to 8.3, then we duplicate Fcb -> SaveDestFcb so the
-    ; source open later doesn't clobber the dest descriptor.
-    ; Empty UrlBuf falls back to PAGE.HTM.
-    call    BuildFcbFromUrl
+    ; Build the DEST FCB from UrlBuf's basename. For remote URLs like
+    ; "http://127.0.0.1/SERPOC.COM" the raw UrlBuf confuses BuildFcb
+    ; (it stops at the first '.' in "127.0.0.1"), so strip off the
+    ; host part first and pass just "SERPOC.COM" to BuildFcbFromHL.
+    ; Local URLs ("a:foo.htm") have no extra '/' and the basename
+    ; pointer is just UrlBuf+2 -- fine for the FCB parser.
+    ld      hl, UrlBuf
+    call    FindUrlBasename
+    call    BuildFcbFromHL
     ld      a, [Fcb + 1]
     or      a
     jr      nz, .ostHaveName
