@@ -300,38 +300,15 @@ MainLoop:
     ;   - ~16-20 ms between keyboard peeks (still imperceptible),
     ;   - 0 % CPU between events on emulators / real hardware,
     ;   - and no busy-spin pinning openMSX's host thread at 100 %.
-    ; Cursor work BEFORE halt. Rationale:
-    ;
-    ; After `halt` wakes from VBLANK, the CPU starts running ~3000
-    ; cycles of free VDP-bandwidth time before active raster begins.
-    ; If we did PollMouse here (the historical order), the ~2000-cycle
-    ; cursor erase+save+paint would mostly fit in VBLANK -- but cursor
-    ; writes for rows at the TOP of the screen would still be in
-    ; flight when the raster started scanning those rows, producing a
-    ; visible flicker that worsened the closer the cursor got to y=0.
-    ;
-    ; Reordering: do PollMouse FIRST (during active raster of the
-    ; previous frame), THEN ei/halt to wait for next VBLANK, THEN
-    ; the keyboard check. Cursor pixels land in VRAM well before the
-    ; raster scan reaches them, regardless of cursor Y.
-    ;
-    ; First-iteration quirk: PollMouse runs once without a preceding
-    ; VBLANK wait. Harmless -- the cursor draws at its initial
-    ; position (MouseY=100 from the boot dw) and the user sees one
-    ; extra frame of cursor before the loop settles into rhythm.
+    ei
+    halt
     call    PollMouse
 
-    ; Non-blocking keyboard check. If no key, halt for VBLANK and loop.
+    ; Non-blocking keyboard check. If no key, loop again (keeps polling mouse).
     ld      c, DOS_CONST
     call    BDOS_ENTRY
     or      a
-    jr      nz, .mlKey
-    ei
-    halt
-    jp      MainLoop
-.mlKey:
-    ei
-    halt
+    jp      z, MainLoop
 
     call    EraseCursor                 ; keyboard actions may repaint UI
     ld      c, DOS_DIRIN
