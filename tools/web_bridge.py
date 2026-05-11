@@ -4977,6 +4977,16 @@ class MsxSession:
         if upper == "PROBE":
             self._log("link-rate probe -> OK HTM 0")
             return ("HTM", b"")
+        if upper == "SIZE":
+            # Save-popup probe: report the total byte length of the
+            # currently cached body without sending any payload. Wire
+            # format reuses OK HTM but with the body-length field
+            # repurposed as the total size and zero body bytes
+            # following ("OK HTM <total_bytes>\r\n"). The on-MSX side
+            # reads SerialLen and skips the body drain.
+            total = len(self.body) if self.body else 0
+            self._log("SIZE -> {}".format(total))
+            return ("SIZE", total)
         if upper == "IMG ON":
             CFG["no_images"] = False
             self._log("images ON")
@@ -5396,6 +5406,11 @@ def _serial_slow_send(conn, body, chunk=64, gap=0.005):
 
 
 def _serial_send_response(conn, kind, body):
+    if kind == "SIZE":
+        # body is the integer byte-count; emit as the OK HTM header's
+        # length field with no body bytes following.
+        conn.sendall("OK HTM {}\r\n".format(body).encode("ascii"))
+        return
     if kind in ("HTM", "PCX", "BMP"):
         header = "OK {} {}\r\n".format(kind, len(body)).encode("ascii")
         conn.sendall(header)
