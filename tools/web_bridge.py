@@ -4130,20 +4130,29 @@ def _generate_logo():
         print("  Logo   : PCX bake failed ({})".format(exc))
 
 
-def _root_listing_html():
-    """HTML directory listing of CFG['root'], rendered as a 3-column
-    table the on-MSX parser supports natively: filename | size KB |
-    mtime. Directories first (alphabetic), then files (alphabetic).
-    Directories show "<DIR>" in the size column; files show "X.X KB"
+def _root_listing_html(rel_path=""):
+    """HTML directory listing of CFG['root'][/rel_path], rendered as a
+    3-column table the on-MSX parser supports natively: filename |
+    size KB | mtime. Directories first (alphabetic), then files
+    (alphabetic). Directories show "<DIR>"; files show "X.X KB"
     (decimal precision, never bytes -- 200 B reads as "0.2 KB").
     Empty folders render a single "(empty)" row.
+
+    rel_path: posix-style relative path inside CFG['root'] ("" =
+    root). When non-empty, a leading ".." row links back to the
+    parent so the user can walk back up. Entry hrefs are absolute
+    (start with "/") and include rel_path as a prefix, so the
+    bridge's self-host dispatch can resolve them at any depth.
 
     mtime format: "YYYY-MM-DD HH:MM" -- 16 chars, fits the 512 px
     Screen-6 content width alongside an 8.3 filename and a size
     column without horizontal scrolling."""
     root = CFG.get("root", ".")
+    folder = os.path.normpath(os.path.join(root, rel_path)) if rel_path else root
+    # Slash-normalised rel_path for hrefs (no leading/trailing '/').
+    rel = rel_path.strip("/")
     try:
-        entries = sorted(os.listdir(root))
+        entries = sorted(os.listdir(folder))
     except OSError as exc:
         return ("<html><head><title>Root</title></head><body>"
                 "<h1>Bridge root unreadable</h1>"
@@ -4152,7 +4161,7 @@ def _root_listing_html():
     for name in entries:
         if name.startswith("."):
             continue
-        full = os.path.join(root, name)
+        full = os.path.join(folder, name)
         try:
             st = os.stat(full)
         except OSError:
@@ -4168,20 +4177,46 @@ def _root_listing_html():
         # as "0.0 KB" which is fine for a listing.
         return "{:.1f} KB".format(n / 1024.0)
 
+    def _href(name, trailing_slash=False):
+        # Build "/<rel>/<name>[/]" as a single posix-style path. Empty
+        # rel just yields "/<name>".
+        parts = []
+        if rel:
+            parts.append(rel)
+        parts.append(quote(name))
+        path = "/" + "/".join(parts)
+        if trailing_slash:
+            path += "/"
+        return path
+
     rows = []
+    if rel:
+        # Walk back one segment for the ".." href. At depth 1 the
+        # parent is the root ("/"). Posixpath semantics handle the
+        # join cleanly without OS-specific separators.
+        parent = rel.rsplit("/", 1)[0] if "/" in rel else ""
+        parent_href = ("/" + parent + "/") if parent else "/"
+        rows.append(
+            '<tr><td><a href="{0}">..</a></td>'
+            '<td>&lt;DIR&gt;</td>'
+            '<td>parent folder</td></tr>'.format(parent_href))
     for name, mtime in dirs:
         rows.append(
-            '<tr><td><a href="/{0}/">{0}/</a></td>'
+            '<tr><td><a href="{0}">{1}/</a></td>'
             '<td>&lt;DIR&gt;</td>'
-            '<td>{1}</td></tr>'.format(_html_escape(name), mtime))
+            '<td>{2}</td></tr>'.format(
+                _href(name, trailing_slash=True),
+                _html_escape(name), mtime))
     for name, size, mtime in files:
         rows.append(
-            '<tr><td><a href="/{0}">{0}</a></td>'
-            '<td>{1}</td>'
-            '<td>{2}</td></tr>'.format(
+            '<tr><td><a href="{0}">{1}</a></td>'
+            '<td>{2}</td>'
+            '<td>{3}</td></tr>'.format(
+                _href(name),
                 _html_escape(name), _kb(size), mtime))
     if not rows:
         rows = ['<tr><td colspan="3"><i>(empty)</i></td></tr>']
+    heading = "/" + rel if rel else root
     return ("<!DOCTYPE HTML PUBLIC \"-//IETF//DTD HTML 2.0//EN\">\n"
             "<html><head><title>Bridge root</title></head>\n"
             "<body><h1>{}</h1>\n"
@@ -4190,7 +4225,7 @@ def _root_listing_html():
             "<th align=\"left\">Size</th>"
             "<th align=\"left\">Modified</th></tr>\n"
             "{}\n</table></body></html>\n").format(
-        _html_escape(root), "\n".join(rows))
+        _html_escape(heading), "\n".join(rows))
 
 
 def _landing_html(ip, user_agent=""):
@@ -5155,12 +5190,7 @@ class MsxSession:
         if common != os.path.abspath(root):
             return ("404", None)
         if os.path.isdir(full):
-            saved = CFG["root"]
-            CFG["root"] = full
-            try:
-                html = _root_listing_html()
-            finally:
-                CFG["root"] = saved
+            html = _root_listing_html(rel)
             body = html.encode(WIRE_CHARSET, "replace")
             self.pending_chunks = []
             self.body = body
@@ -5740,16 +5770,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if common != os.path.abspath(root):
             return False
         if os.path.isdir(full):
-            # Render a sub-directory listing using the same template,
-            # rooted at this sub-path. CFG['root'] override is local to
-            # this call; reset before returning so the global stays at
-            # the user-configured top.
-            saved = CFG["root"]
-            CFG["root"] = full
-            try:
-                listing = _root_listing_html()
-            finally:
-                CFG["root"] = saved
+            # Sub-directory: render the same listing template with
+            # rel as the path-prefix so hrefs in the listing keep
+            # working from any depth.
+            listing = _root_listing_html(rel)
             self._send(200, "text/html; charset=utf-8",
                        listing.encode("utf-8"))
             return True
