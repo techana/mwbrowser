@@ -164,6 +164,7 @@ KEY_F2         equ 0xF2        ; MSX F2 -> toolbar Back
 KEY_F3         equ 0xF3        ; MSX F3 -> toolbar Forward
 KEY_F4         equ 0xF4        ; MSX F4 -> clear address bar
 KEY_F5         equ 0xF5        ; MSX F5 -> toolbar Refresh / Go
+KEY_F6         equ 0xF6        ; MSX F6 -> Save popup ("[]" titlebar button)
 
 ; ---- URL / file state ----
 URL_MAX        equ 255         ; address-bar / fetch-target buffer cap (chars
@@ -376,6 +377,13 @@ MainLoop:
     call    OpenAbout
     jp      MainLoop
 .notOpenAbout:
+
+    ; F6 mirrors the titlebar "[]" save-page click.
+    cp      KEY_F6
+    jr      nz, .notOpenSave
+    call    OpenSaveFromTitlebar
+    jp      MainLoop
+.notOpenSave:
 
     cp      KEY_TAB
     jr      nz, NotTab
@@ -1467,11 +1475,11 @@ Screen0Palette:
 ; State
 ; ============================================================================
 
-; BindFnKeys: override the MSX function-key string buffer so F1, F2,
-; and F5 inject single-byte codes (0xF1, 0xF2, 0xF5) the dispatcher
-; recognises as Back, Forward, and Refresh shortcuts. Without this the
-; default F-key expansion strings ("color", "auto", etc.) leak into
-; the address bar.
+; BindFnKeys: override the MSX function-key string buffer so F1..F6
+; inject single-byte codes (0xF1..0xF6) the dispatcher recognises as
+; About / Back / Forward / Clear-address / Refresh-or-Go / Save
+; shortcuts. Without this the default F-key expansion strings
+; ("color", "auto", etc.) leak into the address bar.
 ;   FNKSTR sits at 0xF87F, 16 bytes per slot for F1..F10.
 BindFnKeys:
     ld      hl, 0xF87F                  ; F1's slot
@@ -1496,6 +1504,11 @@ BindFnKeys:
     ld      [hl], a
     ld      hl, 0xF87F + 64             ; F5's slot
     ld      [hl], 0xF5
+    inc     hl
+    xor     a
+    ld      [hl], a
+    ld      hl, 0xF87F + 80             ; F6's slot
+    ld      [hl], 0xF6
     inc     hl
     xor     a
     ld      [hl], a
@@ -16076,14 +16089,18 @@ DrawSavePopup:
     call    DrawPopupFrame
     ; Title is painted; colour pair now back at BLACK-on-LGRAY.
 
-    ; Body line 1: path + filename. Phase 1: drive prefix hardcoded
-    ; to "A:" (the bridge / MWBRO disk we're booting from). Phase 2
-    ; will query the current drive via BDOS function 0x19.
+    ; Body line 1: "Save as: " + path + filename. Drive prefix is
+    ; hardcoded to "A:" for now; future polish will query the
+    ; current drive via BDOS function 0x19.
     ld      de, SAVE_X + 8
+    ld      c, SAVE_Y + 24
+    ld      hl, SaveAsLabel
+    call    DrawString
+    ld      de, SAVE_X + 8 + (9 * 8)        ; past "Save as: " (9 chars)
     ld      c, SAVE_Y + 24
     ld      hl, SavePathPrefix
     call    DrawString
-    ld      de, SAVE_X + 8 + 16             ; 2 chars * 8 px past "A:"
+    ld      de, SAVE_X + 8 + (11 * 8)       ; past "Save as: A:" (11 chars)
     ld      c, SAVE_Y + 24
     ld      hl, SaveFilename
     call    DrawString
@@ -16124,6 +16141,7 @@ DrawSavePopup:
 
 ; Strings used by the Save popup.
 SaveTitleMsg:        db "Save file?", 0
+SaveAsLabel:         db "Save as: ", 0
 SavePathPrefix:      db "A:", 0
 SaveSizeLabel:       db "Size: -- B", 0
 SaveProgressLabel:   db "Progress: --", 0
@@ -18275,7 +18293,7 @@ AboutLine2:     db 0x4D, 0x53, 0x58, 0x32, 0x20
                 db 0xAC, 0xC6, 0xB3, 0xA5, 0xCE, 0
 AboutLine3:     db "github.com/techana/mwbrowser", 0
 AboutLine4:     db "F1 Help  F2 Back  F3 Fwd", 0
-AboutLine5:     db "F4 Clear address  F5 Reload", 0
+AboutLine5:     db "F4 Clear  F5 Reload  F6 Save", 0
 AboutLine6:     db "M/Space PgDn  N PgUp", 0
 AboutLine7:     db "Stop Halt  Esc Quit", 0
 AboutFooter:    db "v0.7 Demo", 0
