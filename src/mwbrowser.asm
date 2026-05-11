@@ -16645,15 +16645,28 @@ DrawTitleLabel:
     call    DrawString
 
     ; Save-page button: "[]" placeholder, 8 px gap before the "?" so
-    ; the cluster reads as three distinct glyphs ("[]", "?", "X"). The
-    ; popup + click wiring is parked until the boot-on-growth bug that
-    ; trips when this file gains ~60 BSS bytes is diagnosed (see the
-    ; session notes for details). The button paints but nothing's
-    ; clickable yet.
+    ; the cluster reads as three distinct glyphs ("[]", "?", "X").
+    ; Dimmed (DGRAY on LGRAY) when the address bar holds a local
+    ; drive-letter URL -- OpenSaveFromTitlebar no-ops in that case
+    ; (use DOS COPY instead) so the disabled glyph mirrors the
+    ; behaviour. Web-bridge URLs paint BLACK as before.
+    ld      hl, UrlBuf
+    call    IsLocalUrl
+    ld      a, COL_BLACK
+    jr      nz, .dtlSaveColorReady
+    ld      a, COL_DGRAY
+.dtlSaveColorReady:
+    ld      l, COL_LGRAY
+    call    SetTextColours
     ld      de, WIDTH - 48
     ld      c, 1
     ld      hl, CharSaveBtn
     call    DrawString
+
+    ; Restore BLACK ink for the remaining titlebar glyphs.
+    ld      a, COL_BLACK
+    ld      l, COL_LGRAY
+    call    SetTextColours
 
     ; "?" button (About popup; shortcut F1). Placed left of the X.
     ld      de, WIDTH - 24

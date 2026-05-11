@@ -4841,13 +4841,15 @@ SERIAL_TR_LINE_PX      = 10
 SERIAL_MAX_CHUNK_BYTES = 6000
 
 # GET CHUNK <offset> serves a fixed-size byte-range slice of the most
-# recently fetched page body. Sized just under the on-MSX FILE_BUF_SIZE
-# (13 KB after file_load_architecture phase 4's bump) so a single CHUNK
-# response fills the browser's window without trickling MORE frames on
-# top. Distinct from SERIAL_MAX_CHUNK_BYTES (the GET MORE pixel-paginated
-# chunk cap) because CHUNK serves byte-range slices for sliding-window
-# scroll, not pixel-paginated ones for sequential reading.
-SERIAL_CHUNK_RANGE_BYTES = 12 * 1024
+# recently fetched page body. Sized to fit inside the on-MSX FileBuf
+# (FILE_BUF_SIZE = 0x1A00 = 6.5 KB after the BSS growth from prerender /
+# save-popup state). 6144 bytes leaves ~256 B headroom for the DOS
+# 128-B record padding and any in-flight serial framing. Distinct from
+# SERIAL_MAX_CHUNK_BYTES (the GET MORE pixel-paginated chunk cap)
+# because CHUNK serves byte-range slices for sliding-window scroll,
+# not pixel-paginated ones for sequential reading. Keep this a clean
+# multiple of 128 so DOS_WRITE record math stays trivial.
+SERIAL_CHUNK_RANGE_BYTES = 6 * 1024
 
 _SERIAL_LINE_END_RE = re.compile(
     rb"(?i)<br\s*/?>|</p>|</tr>|</li>|</h[1-6]>|</div>|</center>")
