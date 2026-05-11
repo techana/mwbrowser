@@ -257,6 +257,7 @@ Main:
     call    BuildTransposedFont         ; row-major mirror of FontBuf
     call    SetPalette
     call    SetBorder
+    call    DisableSprites              ; hide the uninitialised sprite plane
     call    ClearContent                ; VRAM all white (colour 0)
     call    BindFnKeys                  ; make F1 inject 0xF1 on DIRIN
     call    InitState
@@ -1673,6 +1674,24 @@ SetBorder:
     ld      a, COL_LGRAY
     out     (VDP_CMD), a
     ld      a, 0x80 | 7
+    out     (VDP_CMD), a
+    ei
+    ret
+
+; DisableSprites: write R8 with SPD=1 (sprite plane disable). The
+; V9938's default sprite attribute table after CHGMOD 6 leaves
+; uninitialised sprites scattered across the screen with mode-2
+; "transparent index 0" rules that randomly hide bitmap pixels at
+; the rows where sprite Y values happen to land. We don't use
+; sprites; just turn the plane off.
+;
+; R8 bits: 7=MS 6=LP 5=TP 4=CB 3=VR 2=0 1=SPD 0=BW
+; Set SPD=1; keep VR=1 (V9938 64 KB VRAM default).
+DisableSprites:
+    di
+    ld      a, 0x0A                      ; VR=1 (bit 3) + SPD=1 (bit 1)
+    out     (VDP_CMD), a
+    ld      a, 0x80 | 8                  ; R#8
     out     (VDP_CMD), a
     ei
     ret
@@ -14682,14 +14701,6 @@ CursorMask:
 ; PollMouse: called every main-loop iteration. Reads mouse, clamps position,
 ; detects a press edge (prev=0 -> now=1) and dispatches to HandleClick.
 PollMouse:
-    ; DIAGNOSTIC: force cursor writes onto the currently DISPLAYED
-    ; page. If the cursor flicker at low Y is caused by WritesToPage
-    ; pointing at the back page (so cursor pixels land off-screen),
-    ; this hard-sync should make the flicker disappear. Remove once
-    ; diagnosed.
-    ld      a, [DisplayedPage]
-    ld      [WritesToPage], a
-
     call    EraseCursor                 ; clear old cursor before we move
     call    GetMouse
     ld      [MouseRaw], a
