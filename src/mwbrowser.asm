@@ -167,7 +167,7 @@ URL_MAX        equ 255         ; address-bar / fetch-target buffer cap (chars
                                ; before NUL). Bumped from 95 because real
                                ; mirror.aratab.com URLs run past the 100-char
                                ; line and got truncated on click.
-FILE_BUF_SIZE  equ 0x2100      ; 8.25 KB. Sized so FILEBUF_BASE (0xA100) +
+FILE_BUF_SIZE  equ 0x2000      ; 8 KB. Sized so FILEBUF_BASE +
                                ; FILE_BUF_SIZE + FONT_BUF_SIZE + 128 +
                                ; 512 B (FastLutHi+FastLutLo, lesson #1) +
                                ; 2 KB (TransposedFontBuf, lesson #3, see
@@ -2227,6 +2227,19 @@ VdpR1Saved:     db VdpR1Default  ; last R1 value the caller asked for
 ; (0 or 1). FlipDisplayPage toggles them.
 WritesToPage: db 0
 DisplayedPage:    db 0
+
+; --- Phase-1 prerender (see PrerenderNext for the why + TODO Phase 2/3) ---
+;
+; The back page (R14 = DisplayedPage XOR 1) is currently only written
+; during a RefreshAfterScroll's transient render-then-flip. Phase 1
+; reuses it: after every successful RefreshAfterScroll, render the
+; NEXT page into the back so the user's next PageDown is an atomic
+; R#2 flip instead of a 200 ms render. PrerenderValid gates whether
+; the back actually holds a usable next-page snapshot;
+; PrerenderScrollLine pins which ScrollLine that snapshot represents
+; so any non-PageDown navigation falls through to a full render.
+PrerenderValid:      db 0
+PrerenderScrollLine: dw 0
                                  ; (snapshotted by VdpBlank, restored
                                  ; by VdpUnblank). Initialised to the
                                  ; default so VdpUnblank without a
@@ -6689,6 +6702,7 @@ LineCacheReset:
     ld      [LineCacheHead], a
     ld      [LineCacheLastLine], a
     ld      [LineCacheLastLine + 1], a
+    ld      [PrerenderValid], a          ; new doc -> back-page prerender stale
     ld      a, 1
     ld      [LineCacheStride], a
     ret
@@ -14178,7 +14192,35 @@ HistoryUpdateFlags:
 ; RefreshAfterScroll: refresh the scrollbar first (so the thumb jumps
 ; ahead of the slower content repaint and the user sees their scroll
 ; acknowledged immediately), then redraw the content area itself.
+;
+; Fast-path (added with Phase-1 prerender): if PrerenderNext ran at
+; the end of the previous RefreshAfterScroll and the back page now
+; holds a snapshot for THIS ScrollLine, just flip the display. No
+; clear, no content render, no thumb compute -- the back already has
+; all of that. The post-flip prerender of the next-next page still
+; runs so spam-PageDown keeps getting instant flips.
 RefreshAfterScroll:
+    ld      a, [PrerenderValid]
+    or      a
+    jr      z, .rasNoFastPath
+    ld      hl, [PrerenderScrollLine]
+    ld      de, [ScrollLine]
+    or      a
+    sbc     hl, de
+    jr      nz, .rasNoFastPath           ; prerender is for a different line
+
+    ; Match. Atomic flip + bookkeeping.
+    xor     a
+    ld      [PrerenderValid], a
+    ld      a, [DisplayedPage]
+    xor     1
+    call    VdpSetDisplayPage            ; preserves A; updates DisplayedPage
+    ld      [WritesToPage], a
+    ; The next-next page would be a useful prerender to have warm;
+    ; tail-call into it.
+    jp      PrerenderNext
+
+.rasNoFastPath:
     ; Phase 1: paint the busy-tinted scrollbar thumb on the currently
     ; displayed page so the user sees IMMEDIATE feedback ("page acked,
     ; rendering...") before the multi-100ms content render. With the
@@ -14238,11 +14280,11 @@ RefreshAfterScroll:
     ld      hl, [HtmlLineSkip]
     ld      a, h
     or      l
-    ret     z                            ; viewport filled normally
+    jp      z, PrerenderNext            ; viewport filled -> kick prerender
     ld      de, [ScrollLine]
     ld      a, d
     or      e
-    ret     z                            ; ScrollLine == 0, doc shorter than viewport
+    jp      z, PrerenderNext            ; ScrollLine 0, doc < viewport
     ex      de, hl
     or      a
     sbc     hl, de
@@ -14262,6 +14304,156 @@ RefreshAfterScroll:
 .rasStore:
     ld      [ScrollLine], hl
     jp      RefreshAfterScroll          ; one-shot re-render with fixed ScrollLine
+
+; ============================================================================
+; Phase-1 prerender
+;
+; Run the render pipeline a SECOND time after a successful PageDown
+; with ScrollLine bumped by PAGE_SCROLL_STEP, writing to the back
+; page. The next PageDown's RefreshAfterScroll fast-path matches the
+; stashed ScrollLine and just flips R#2 -- one VDP register write,
+; atomic at the next vblank -- instead of ~200 ms of synchronous
+; render. So back-to-back PageDowns feel instant from #2 onward; #1
+; is unchanged.
+;
+; Cost: blocking ~200 ms before MainLoop returns to halt. User
+; doesn't see it because the foreground render already flipped to
+; the visible new page; they're reading it while we prerender.
+;
+; Safety: we snapshot the foreground's line-counter state (which
+; PrintFileContent overwrites) and restore it after prerender so
+; PageDown's clamp math doesn't get confused. The prerender's
+; LineCache entries are kept -- they're valid for the document at
+; those line numbers regardless of which render added them.
+;
+; Skipped when:
+;   - Remote session (IsRemoteSession != 0). TryFetchMore /
+;     SlideForwardRemote inside a prerender is risky for now.
+;   - Candidate ScrollLine is past the document tail.
+;   - PrintFileContent hit natural EOF (HtmlLineSkip != 0 after
+;     return). The back has a partial render that we shouldn't
+;     fast-flip to.
+;
+; ----------------------------------------------------------------------------
+; TODO Phase 2 -- make prerender interruptible.
+;
+; Today the ~200 ms prerender blocks MainLoop, so a PgUp / link
+; click / line scroll that arrives mid-prerender waits one full
+; prerender-worth of latency before it gets serviced. Add a
+; checkpoint hook every N emitted rows (in EmitNewline?) that
+; polls BDOS DOS_CONST and, if a key is queued, sets a "bail"
+; flag the parser / line-flush path checks at the top of each
+; cell. Bailing cleanly requires every intermediate state to be
+; safe to abandon: VDP write address must be either committed or
+; trivially re-set, WritesToPage must remain pointing where the
+; caller expects, partial LineCache entries shouldn't poison
+; future lookups. ~150-250 lines threaded through PrintFileContent,
+; the BiDi reorder, image streamers, and form-widget paints.
+;
+; ----------------------------------------------------------------------------
+; TODO Phase 3 -- prerender BOTH directions.
+;
+; V9938 on 128 KB-VRAM MSX2 machines has 4 x 32 KB Screen-6 pages;
+; we use 2 (display + back). Pages 2 and 3 are idle. With a
+; 4-slot rotation we can keep BOTH "next page" AND "previous page"
+; warm so PgUp is also instant. Implementation requires:
+;   - WritesToPage becomes a 2-bit slot index (0..3) instead of a
+;     single bit; VdpSetR14 adds slot * 2 (R14 base 0 / 2 / 4 / 6).
+;   - VdpSetDisplayPage learns to write the higher R#2 bits (R#2 =
+;     0x1F | (slot << 5)? -- check V9938 datasheet for the exact
+;     page-select encoding above page 1).
+;   - PrerenderNext gets a sibling PrerenderPrev that targets the
+;     PgUp candidate; both pre-renders run after each successful
+;     scroll.
+;   - Slot accounting: which slot holds current, next-cached,
+;     prev-cached, scratch-for-current-render-when-flipping. Four
+;     slots is tight but enough.
+; ============================================================================
+
+PrerenderNext:
+    ld      a, [IsRemoteSession]
+    or      a
+    ret     nz
+
+    ld      hl, [ScrollLine]
+    ld      bc, PAGE_SCROLL_STEP
+    add     hl, bc
+    ld      [PrerenderCandidate], hl
+    ld      de, [HtmlLineCount]
+    or      a
+    sbc     hl, de
+    ret     nc                           ; candidate past doc tail
+
+    ; --- Snapshot the foreground state PrintFileContent clobbers ---
+    ld      hl, ScrollLine
+    ld      de, PrerenderSaved
+    ld      bc, 2
+    ldir
+    ld      hl, HtmlLineCount
+    ld      bc, 2
+    ldir
+    ld      hl, TotalLines
+    ld      bc, 2
+    ldir
+    ld      hl, HtmlLineCountSaved
+    ld      bc, 2
+    ldir
+    ld      a, [HtmlLineCountAccurate]
+    ld      [PrerenderSaved + 8], a
+
+    ; --- Apply candidate; redirect writes to the back page ---
+    ld      hl, [PrerenderCandidate]
+    ld      [ScrollLine], hl
+    ld      a, [DisplayedPage]
+    xor     1
+    ld      [WritesToPage], a
+
+    ; --- Render the next page on the back ---
+    call    ClearContentArea
+    call    PrintFileContent
+
+    ; --- Mark prerender valid only if PrintFileContent filled the
+    ;     viewport. If HtmlLineSkip is still non-zero, we hit EOF
+    ;     mid-render and the back has a partial page that would look
+    ;     broken if we ever flipped to it. Leave PrerenderValid 0
+    ;     so the next PageDown falls through to a full render. ---
+    ld      a, [HtmlLineSkip]
+    ld      b, a
+    ld      a, [HtmlLineSkip + 1]
+    or      b
+    jr      nz, .pnSkipMark
+    ld      hl, [PrerenderCandidate]
+    ld      [PrerenderScrollLine], hl
+    ld      a, 1
+    ld      [PrerenderValid], a
+.pnSkipMark:
+
+    ; --- Restore foreground state ---
+    ld      hl, PrerenderSaved
+    ld      de, ScrollLine
+    ld      bc, 2
+    ldir
+    ld      de, HtmlLineCount
+    ld      bc, 2
+    ldir
+    ld      de, TotalLines
+    ld      bc, 2
+    ldir
+    ld      de, HtmlLineCountSaved
+    ld      bc, 2
+    ldir
+    ld      a, [PrerenderSaved + 8]
+    ld      [HtmlLineCountAccurate], a
+
+    ; Restore WritesToPage = DisplayedPage so subsequent chrome/UI
+    ; paints (toolbar focus changes, About popup) land on the page
+    ; the user sees.
+    ld      a, [DisplayedPage]
+    ld      [WritesToPage], a
+    ret
+
+PrerenderCandidate: dw 0
+PrerenderSaved:     ds 9   ; ScrollLine 0..1, HtmlLineCount 2..3, TotalLines 4..5, HtmlLineCountSaved 6..7, HtmlLineCountAccurate 8
 
 ; RefreshContentInPlace: re-paint the content area WITHOUT clearing it
 ; first. Used by typing / form-state edits where the layout doesn't
