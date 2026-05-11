@@ -171,7 +171,7 @@ URL_MAX        equ 255         ; address-bar / fetch-target buffer cap (chars
                                ; before NUL). Bumped from 95 because real
                                ; mirror.aratab.com URLs run past the 100-char
                                ; line and got truncated on click.
-FILE_BUF_SIZE  equ 0x1A00      ; 6.5 KB. Sized so FILEBUF_BASE +
+FILE_BUF_SIZE  equ 0x1900      ; 6.25 KB. Sized so FILEBUF_BASE +
                                ; FILE_BUF_SIZE + FONT_BUF_SIZE + 128 +
                                ; 512 B (FastLutHi+FastLutLo, lesson #1) +
                                ; 2 KB (TransposedFontBuf, lesson #3, see
@@ -385,6 +385,23 @@ Main:
     ld      [UrlBuf + 1], a
 
 .cmdNavigate:
+    ; Sync UrlLen + UrlCursor so the address bar's caret editing
+    ; (arrow keys, backspace, etc.) starts at end-of-URL like the
+    ; legacy seed path does. Without this the caret sticks at 0
+    ; and right-arrow refuses to move.
+    ld      hl, UrlBuf
+    ld      b, 0
+.cmdLen:
+    ld      a, [hl]
+    or      a
+    jr      z, .cmdLenDone
+    inc     hl
+    inc     b
+    jr      .cmdLen
+.cmdLenDone:
+    ld      a, b
+    ld      [UrlLen], a
+    ld      [UrlCursor], a
     call    NavigateAndFocusContent
 
 MainLoop:
@@ -4027,6 +4044,15 @@ LoadFile:
     xor     a
     ld      [IsRemoteSession], a
 
+    ; Direct image URL (a:pg02.pcx, b:logo.sc6, etc.) -- synthesize a
+    ; minimal HTML wrapper so the existing PrintFileContent + TagImg
+    ; path handles the decode, scrollbar, and 404/alt-fallback uniformly.
+    ; Without this the file's raw bytes would render as text.
+    ; BuildFcbFromUrl has already uppercased + space-padded the ext
+    ; at Fcb+9..11; just compare three letters.
+    call    LocalUrlIsImage
+    jp      z, LoadFileLocalImg
+    ; fall through to normal text/html load
     call    ResetFcbTail
 
     ld      c, DOS_OPEN
@@ -4065,6 +4091,81 @@ LoadFile:
     ld      de, Fcb
     call    BDOS_ENTRY
     pop     af
+    ret
+
+; Direct image URL path: build "<center><img src=\"UrlBuf\"></center>"
+; into FileBuf and return success. PlainTextMode stays 0 (HTML); the
+; parser then dispatches TagImg, which copies the src attribute into
+; ImgNameBuf and calls RenderSc6File / RenderPcxFile / RenderBmpFile.
+; DocSize = WindowLen (single-window doc; no slide). The existing
+; "image too tall / decoder failed" fallback handles 404 cases inside
+; TagImg, so a missing pcx renders the [alt] placeholder.
+LocalImgPrefix:  db '<center><img src="', 0
+LocalImgSuffix:  db '"></center>', 0
+
+LoadFileLocalImg:
+    ld      hl, LocalImgPrefix
+    ld      de, FileBuf
+    call    LfImgCopyZ
+    ld      hl, UrlBuf
+    call    LfImgCopyZ
+    ld      hl, LocalImgSuffix
+    call    LfImgCopyZ
+    ; WindowLen = DE - FileBuf.
+    ld      hl, FileBuf
+    ex      de, hl
+    or      a
+    sbc     hl, de
+    ld      [WindowLen], hl
+    ld      [DocSize], hl
+    xor     a
+    ld      [DocSize + 2], a
+    ld      [PlainTextMode], a
+    ld      [DocOffset], a
+    ld      [DocOffset + 1], a
+    ld      [DocOffset + 2], a
+    call    LineCacheReset
+    xor     a
+    ret
+LfImgCopyZ:
+    ld      a, [hl]
+    or      a
+    ret     z
+    ld      [de], a
+    inc     hl
+    inc     de
+    jr      LfImgCopyZ
+
+; LocalUrlIsImage: returns Z when Fcb+9..11 matches PCX/BMP/SC6
+; (uppercase, no padding -- BuildFcbFromUrl uppercases + space-pads).
+LocalImgExts:    db "PCXBMPSC6"
+LocalUrlIsImage:
+    ld      b, 3                            ; three extensions
+    ld      hl, LocalImgExts
+.luiNext:
+    ld      de, Fcb + 9
+    ld      c, 3                            ; three chars per extension
+.luiCmp:
+    ld      a, [de]
+    cp      [hl]
+    jr      nz, .luiSkip
+    inc     de
+    inc     hl
+    dec     c
+    jr      nz, .luiCmp
+    xor     a                               ; Z = match
+    ret
+.luiSkip:
+    ; Advance HL to the next 3-char entry.
+    ld      a, c                            ; bytes left in current entry
+    add     a, l
+    ld      l, a
+    jr      nc, .luiNoCar
+    inc     h
+.luiNoCar:
+    dec     b
+    jr      nz, .luiNext
+    or      1                               ; NZ
     ret
 
 ; LoadFileChunk: fill FileBuf starting at the given document offset
