@@ -4131,12 +4131,16 @@ def _generate_logo():
 
 
 def _root_listing_html():
-    """HTML directory listing of CFG['root'], rendered as classic HTML
-    that the on-MSX parser can chew. One <a href="<name>"> per file or
-    subdir, sorted with directories first then files, both alphabetic.
-    Sizes shown for files; directories get a trailing '/' to disambiguate.
-    Empty folders render a single '(empty)' line so the user knows the
-    page loaded."""
+    """HTML directory listing of CFG['root'], rendered as a 3-column
+    table the on-MSX parser supports natively: filename | size KB |
+    mtime. Directories first (alphabetic), then files (alphabetic).
+    Directories show "<DIR>" in the size column; files show "X.X KB"
+    (decimal precision, never bytes -- 200 B reads as "0.2 KB").
+    Empty folders render a single "(empty)" row.
+
+    mtime format: "YYYY-MM-DD HH:MM" -- 16 chars, fits the 512 px
+    Screen-6 content width alongside an 8.3 filename and a size
+    column without horizontal scrolling."""
     root = CFG.get("root", ".")
     try:
         entries = sorted(os.listdir(root))
@@ -4149,27 +4153,43 @@ def _root_listing_html():
         if name.startswith("."):
             continue
         full = os.path.join(root, name)
+        try:
+            st = os.stat(full)
+        except OSError:
+            continue
+        mtime = time.strftime("%Y-%m-%d %H:%M", time.localtime(st.st_mtime))
         if os.path.isdir(full):
-            dirs.append(name)
+            dirs.append((name, mtime))
         elif os.path.isfile(full):
-            try:
-                size = os.path.getsize(full)
-            except OSError:
-                size = -1
-            files.append((name, size))
+            files.append((name, st.st_size, mtime))
+
+    def _kb(n):
+        # Always one decimal place; sub-byte and zero-byte both show
+        # as "0.0 KB" which is fine for a listing.
+        return "{:.1f} KB".format(n / 1024.0)
+
     rows = []
-    for name in dirs:
-        rows.append('<li><a href="/{0}/">{0}/</a></li>'.format(
-            _html_escape(name)))
-    for name, size in files:
-        size_str = "" if size < 0 else " &nbsp; ({} B)".format(size)
-        rows.append('<li><a href="/{0}">{0}</a>{1}</li>'.format(
-            _html_escape(name), size_str))
+    for name, mtime in dirs:
+        rows.append(
+            '<tr><td><a href="/{0}/">{0}/</a></td>'
+            '<td>&lt;DIR&gt;</td>'
+            '<td>{1}</td></tr>'.format(_html_escape(name), mtime))
+    for name, size, mtime in files:
+        rows.append(
+            '<tr><td><a href="/{0}">{0}</a></td>'
+            '<td>{1}</td>'
+            '<td>{2}</td></tr>'.format(
+                _html_escape(name), _kb(size), mtime))
     if not rows:
-        rows = ["<li><i>(empty)</i></li>"]
+        rows = ['<tr><td colspan="3"><i>(empty)</i></td></tr>']
     return ("<!DOCTYPE HTML PUBLIC \"-//IETF//DTD HTML 2.0//EN\">\n"
             "<html><head><title>Bridge root</title></head>\n"
-            "<body><h1>{}</h1>\n<ul>\n{}\n</ul></body></html>\n").format(
+            "<body><h1>{}</h1>\n"
+            "<table border=\"0\" cellpadding=\"2\" cellspacing=\"0\">\n"
+            "<tr><th align=\"left\">Name</th>"
+            "<th align=\"left\">Size</th>"
+            "<th align=\"left\">Modified</th></tr>\n"
+            "{}\n</table></body></html>\n").format(
         _html_escape(root), "\n".join(rows))
 
 

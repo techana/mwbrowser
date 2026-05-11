@@ -4265,17 +4265,26 @@ DisplayableExts:
 
 UrlIsBinary:
     ; Forward-scan UrlBuf: HL ends pointing at the NUL terminator,
-    ; DE captures the pointer to the last '.' (or stays 0 if none).
+    ; DE captures the pointer to the last '.', BUT only counts dots
+    ; AFTER the final '/' (so the dots in "127.0.0.1" don't confuse
+    ; URLs like "http://127.0.0.1/" -- the trailing slash resets DE
+    ; and the classifier treats the URL as having no extension =
+    ; displayable directory listing).
     ld      hl, UrlBuf
     ld      de, 0
 .uibScan:
     ld      a, [hl]
     or      a
     jr      z, .uibScanDone
+    cp      '/'
+    jr      z, .uibResetDot
     cp      '.'
     jr      nz, .uibNextChar
     ld      d, h
     ld      e, l
+    jr      .uibNextChar
+.uibResetDot:
+    ld      de, 0
 .uibNextChar:
     inc     hl
     jr      .uibScan
