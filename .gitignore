@@ -4,11 +4,19 @@
 !.gitignore
 !README.md
 !README-ar.md
+!BENCHMARKS.md
 !src/
 !src/mwbrowser.asm
 !src/iso8859_6.inc
+!src/serial_poc.asm
 !dist/
 !dist/mwbro.com
+!dist/mwbro_baseline.com
+!dist/serpoc.com
+!tools/plug_rs232.tcl
+!tools/plug_mouse.tcl
+!tools/bench_*.tcl
+!tools/NOTES_serial_bridge.md
 !samples/
 !samples/*.htm
 !samples/*.html
@@ -22,3 +30,37 @@
 !tools/
 !tools/*.py
 !tools/*.sh
+!samples/PG.HTM
+!samples/PG[0-9][0-9].SC6
+!samples/PG[0-9][0-9].PCX
+!samples/PG[0-9][0-9].PNG
+
+!FILE_LOAD_DESIGN.md
+!BITMAP_PIPELINE_DESIGN.md
+
+!samples/AUTOEXEC.BAT
+
+# quick_screen_draw branch: zero-latency Screen-6 research samples
+# (extracted, patched, assembled with sjasmplus) + the LESSONS write-up
+# that captures which design ideas are worth porting to MWBrowser.
+!research/
+!research/zero-latency screen6/
+!research/zero-latency screen6/MSX2 Assembly Fast Screen Display.md
+!research/zero-latency screen6/SHOWTXT.ASM.txt
+!research/zero-latency screen6/LESSONS.md
+!research/zero-latency screen6/build/
+!research/zero-latency screen6/build/showtxt.asm
+!research/zero-latency screen6/build/zlk.asm
+!research/zero-latency screen6/build/SOME.TXT
+!tools/shot_zlss.tcl
+!tools/shot_zlk.tcl
+!tools/shot_qsd.tcl
+!tools/shot_qsd2.tcl
+
+# new_html_simplifier branch: the bridge's local-file root.  Empty by
+# default in the repo; the bridge mints it on first launch (with a
+# user prompt) and the contents are user-supplied so we don't track
+# any files inside it -- only the placeholder so the directory exists
+# on fresh clones.
+!tools/root/
+!tools/root/.gitkeep

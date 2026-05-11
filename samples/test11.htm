@@ -1,0 +1,86 @@
+<HTML>
+<HEAD><TITLE>Form Test (HTML 2)</TITLE></HEAD>
+<BODY>
+<H1>Forms</H1>
+<P>HTML 2.0 form elements rendered by MSX WBrowser.
+The Send button posts the entered values to the bridge as a query string.</P>
+
+<HR>
+
+<H2>Search (text + submit)</H2>
+<FORM action="http://search.example.com/q" method="GET">
+<P>Find:
+<INPUT type="text" name="q" size="24" maxlength="40" value="MSX">
+<INPUT type="submit" name="go" value="Search">
+</P>
+</FORM>
+
+<HR>
+
+<H2>Login (text + password + submit/reset)</H2>
+<FORM action="http://login.example.com/auth" method="POST">
+<P>User:
+<INPUT type="text" name="user" size="16" maxlength="32" value="">
+</P>
+<P>Pass:
+<INPUT type="password" name="pwd" size="16" maxlength="32" value="">
+</P>
+<P>
+<INPUT type="submit" name="ok" value="Sign in">
+<INPUT type="reset" value="Clear">
+<INPUT type="hidden" name="csrf" value="abc123">
+</P>
+</FORM>
+
+<HR>
+
+<H2>Survey (checkbox + radio + select + textarea)</H2>
+<FORM action="http://forms.example.com/poll" method="POST">
+
+<P>Subscribe?
+<INPUT type="checkbox" name="news" value="yes" checked>
+Newsletter
+<INPUT type="checkbox" name="beta" value="yes">
+Beta updates
+</P>
+
+<P>Favourite MSX:
+<INPUT type="radio" name="msx" value="1" checked> MSX1
+<INPUT type="radio" name="msx" value="2"> MSX2
+<INPUT type="radio" name="msx" value="2+"> MSX2+
+<INPUT type="radio" name="msx" value="tr"> Turbo R
+</P>
+
+<P>Country:
+<SELECT name="country">
+<OPTION value="sa" selected>Saudi Arabia</OPTION>
+<OPTION value="jp">Japan</OPTION>
+<OPTION value="nl">Netherlands</OPTION>
+<OPTION value="br">Brazil</OPTION>
+<OPTION value="es">Spain</OPTION>
+</SELECT>
+</P>
+
+<P>Comments:<BR>
+<TEXTAREA name="notes" rows="3" cols="40">Type your message here.</TEXTAREA>
+</P>
+
+<P>
+<INPUT type="submit" name="send" value="Send">
+<INPUT type="reset" value="Reset">
+</P>
+</FORM>
+
+<HR>
+
+<H2>Image submit + isindex</H2>
+<FORM action="http://map.example.com/click" method="GET">
+<P>Click the icon to submit:
+<INPUT type="image" src="GO.PCX" name="loc" alt="Go" width="32" height="32">
+</P>
+</FORM>
+
+<ISINDEX prompt="Quick keyword search:">
+
+</BODY>
+</HTML>

@@ -1,0 +1,449 @@
+; SHOWTXT.ASM
+; Assemble as MSX-DOS2 .COM, e.g. with SJASMPlus/Glass-style syntax.
+;
+; Reads A:\SOME.TXT, renders it to SCREEN 6 page 1, then flips to page 1.
+; 64 columns x 26 rows, 8x8 font, no scrolling.
+;
+; Foreground pixel color = 3, background = 0.
+
+        org     #0100
+;       output  "SHOWTXT.COM"
+
+; ------------------------------------------------------------
+; BIOS / DOS
+; ------------------------------------------------------------
+
+BDOS        equ #0005
+
+RDSLT       equ #000C
+CHGET       equ #009F
+CHGMOD      equ #005F
+LDIRVM      equ #005C
+EXTROM      equ #015F
+
+SETPAG      equ #013D       ; SUB-ROM
+DPPAGE      equ #FAF5
+ACPAGE      equ #FAF6
+CGPNT       equ #F91F       ; slot + address of current MSX font
+
+DOS_STROUT  equ #09
+DOS_OPEN    equ #43
+DOS_CLOSE   equ #45
+DOS_READ    equ #48
+DOS_TERM    equ #62
+
+; ------------------------------------------------------------
+; SCREEN 6 layout
+; ------------------------------------------------------------
+
+SCREEN_BYTES equ #6A00      ; 512 * 212 / 4
+VRAM_PAGE1   equ #8000
+
+COLS         equ 64
+ROWS         equ 26
+LINE_BYTES   equ 128        ; 512 pixels / 4 pixels per byte
+ROW_STRIDE   equ 1024       ; 8 scanlines * 128 bytes
+
+TEXT_MAX     equ 4096
+
+; ------------------------------------------------------------
+; Main
+; ------------------------------------------------------------
+
+Start:
+        call    ReadFile
+        jr      nc,.file_ok
+
+        ld      de,MsgFileError
+        call    PrintString
+        ld      b,1
+        jp      ExitDOS
+
+.file_ok:
+        call    CopySystemFont
+        call    ClearScreenBuffer
+        call    RenderTextToBuffer
+
+        ; Change to SCREEN 6 only after the RAM bitmap is ready.
+        ld      a,6
+        call    CHGMOD
+
+        ; Upload complete prepared bitmap to hidden page 1.
+        ld      hl,ScreenBuf
+        ld      de,VRAM_PAGE1
+        ld      bc,SCREEN_BYTES
+        call    LDIRVM
+
+        ; Display page 1.
+        ld      a,1
+        ld      (DPPAGE),a
+        ld      (ACPAGE),a
+        ld      ix,SETPAG
+        call    EXTROM
+
+        ; Wait for key, then restore SCREEN 0 and return to DOS.
+        ; Remove this part if you want the program to stay on SCREEN 6.
+        call    CHGET
+        xor     a
+        call    CHGMOD
+
+        ld      b,0
+ExitDOS:
+        ld      c,DOS_TERM
+        call    BDOS
+
+; ------------------------------------------------------------
+; Read A:\SOME.TXT into TextBuf, zero-terminate it
+; ------------------------------------------------------------
+
+ReadFile:
+        ld      de,FileName
+        ld      a,#01              ; no write, read allowed
+        ld      c,DOS_OPEN
+        call    BDOS
+        or      a
+        jr      nz,.error
+
+        ld      (FileHandle),b
+
+        ld      b,(FileHandle)
+        ld      de,TextBuf
+        ld      hl,TEXT_MAX
+        ld      c,DOS_READ
+        call    BDOS
+
+        push    af
+        push    hl
+
+        ld      b,(FileHandle)
+        ld      c,DOS_CLOSE
+        call    BDOS
+
+        pop     hl                 ; bytes actually read
+        pop     af
+        or      a
+        jr      nz,.error
+
+        ld      de,TextBuf
+        add     hl,de
+        ld      (hl),0             ; zero terminator
+
+        or      a                  ; clear carry
+        ret
+
+.error:
+        scf
+        ret
+
+; ------------------------------------------------------------
+; Copy current MSX 8x8 font from ROM slot into RAM
+; CGPNT = slot byte + 16-bit address
+; ------------------------------------------------------------
+
+CopySystemFont:
+        ld      a,(CGPNT)
+        ld      (FontSlot),a
+        ld      hl,(CGPNT+1)
+        ld      de,FontBuf
+        ld      bc,2048            ; 256 chars * 8 bytes
+
+.copy_loop:
+        push    bc
+        push    de
+        push    hl
+
+        ld      a,(FontSlot)
+        call    RDSLT              ; A = byte read from slot:HL
+        ei
+
+        pop     hl
+        pop     de
+        ld      (de),a
+
+        inc     hl
+        inc     de
+
+        pop     bc
+        dec     bc
+        ld      a,b
+        or      c
+        jr      nz,.copy_loop
+        ret
+
+; ------------------------------------------------------------
+; Clear RAM bitmap buffer
+; ------------------------------------------------------------
+
+ClearScreenBuffer:
+        ld      hl,ScreenBuf
+        ld      de,ScreenBuf+1
+        ld      bc,SCREEN_BYTES-1
+        xor     a
+        ld      (hl),a
+        ldir
+        ret
+
+; ------------------------------------------------------------
+; Render text into RAM bitmap
+; ------------------------------------------------------------
+
+RenderTextToBuffer:
+        ld      hl,TextBuf
+        ld      (SrcPtr),hl
+
+        ld      hl,ScreenBuf
+        ld      (LineBase),hl
+
+        xor     a
+        ld      (Col),a
+        ld      (Row),a
+
+.loop:
+        ld      hl,(SrcPtr)
+        ld      a,(hl)
+        inc     hl
+        ld      (SrcPtr),hl
+
+        or      a
+        ret     z
+
+        cp      #1A                ; Ctrl-Z EOF marker
+        ret     z
+
+        cp      #0D                ; CR
+        jr      z,.cr
+
+        cp      #0A                ; LF
+        jr      z,.lf
+
+        cp      #09                ; TAB
+        jr      z,.tab
+
+        cp      32
+        jr      c,.loop            ; ignore other control chars
+
+        call    DrawAndAdvance
+        ret     c
+        jr      .loop
+
+.cr:
+        call    NewLine
+        ret     c
+
+        ; Swallow LF after CR.
+        ld      hl,(SrcPtr)
+        ld      a,(hl)
+        cp      #0A
+        jr      nz,.loop
+        inc     hl
+        ld      (SrcPtr),hl
+        jr      .loop
+
+.lf:
+        call    NewLine
+        ret     c
+        jr      .loop
+
+.tab:
+        ld      a,' '
+        call    DrawAndAdvance
+        ret     c
+        ld      a,(Col)
+        and     7
+        jr      nz,.tab
+        jr      .loop
+
+; ------------------------------------------------------------
+; Draw char in A at current Col/Row, then advance cursor
+; Carry set = screen full
+; ------------------------------------------------------------
+
+DrawAndAdvance:
+        push    af
+        ld      a,(Row)
+        cp      ROWS
+        jr      c,.ok
+        pop     af
+        scf
+        ret
+
+.ok:
+        pop     af
+        call    DrawChar
+
+        ld      a,(Col)
+        inc     a
+        cp      COLS
+        jr      c,.store_col
+
+        xor     a
+        ld      (Col),a
+        call    NewLine
+        ret
+
+.store_col:
+        ld      (Col),a
+        or      a                  ; clear carry
+        ret
+
+; ------------------------------------------------------------
+; Move to next text row
+; Carry set = no more rows
+; ------------------------------------------------------------
+
+NewLine:
+        xor     a
+        ld      (Col),a
+
+        ld      a,(Row)
+        inc     a
+        ld      (Row),a
+        cp      ROWS
+        jr      nc,.full
+
+        ld      hl,(LineBase)
+        ld      bc,ROW_STRIDE
+        add     hl,bc
+        ld      (LineBase),hl
+
+        or      a                  ; clear carry
+        ret
+
+.full:
+        scf
+        ret
+
+; ------------------------------------------------------------
+; Draw one 8x8 character to RAM bitmap
+;
+; SCREEN 6 byte:
+;   4 pixels per byte, 2 bits per pixel.
+;   Font bit 1 becomes color 3 = binary 11.
+; ------------------------------------------------------------
+
+DrawChar:
+        push    af
+
+        ; DE = FontBuf + A*8
+        ld      l,a
+        ld      h,0
+        add     hl,hl              ; *2
+        add     hl,hl              ; *4
+        add     hl,hl              ; *8
+        ld      de,FontBuf
+        add     hl,de
+        ex      de,hl
+
+        ; IX = LineBase + Col*2
+        ld      hl,(LineBase)
+        ld      a,(Col)
+        add     a,a
+        ld      c,a
+        ld      b,0
+        add     hl,bc
+        push    hl
+        pop     ix
+
+        pop     af
+
+        ld      b,8
+
+.row_loop:
+        ld      a,(de)
+        inc     de
+        ld      c,a
+
+        ; high nibble -> first byte
+        rrca
+        rrca
+        rrca
+        rrca
+        and     #0F
+        call    ExpandNibble
+        ld      (ix+0),a
+
+        ; low nibble -> second byte
+        ld      a,c
+        and     #0F
+        call    ExpandNibble
+        ld      (ix+1),a
+
+        push    bc
+        ld      bc,LINE_BYTES
+        add     ix,bc
+        pop     bc
+
+        djnz    .row_loop
+        ret
+
+; ------------------------------------------------------------
+; A = nibble 0..15
+; returns A = 4 SCREEN 6 pixels, color 3 on bits that are 1
+; ------------------------------------------------------------
+
+ExpandNibble:
+        push    hl
+        push    de
+
+        ld      e,a
+        ld      d,0
+        ld      hl,Expand4
+        add     hl,de
+        ld      a,(hl)
+
+        pop     de
+        pop     hl
+        ret
+
+; ------------------------------------------------------------
+; DOS helper
+; ------------------------------------------------------------
+
+PrintString:
+        ld      c,DOS_STROUT
+        jp      BDOS
+
+; ------------------------------------------------------------
+; Data
+; ------------------------------------------------------------
+
+Expand4:
+        db #00,#03,#0C,#0F,#30,#33,#3C,#3F
+        db #C0,#C3,#CC,#CF,#F0,#F3,#FC,#FF
+
+FileName:
+        db "A:",#5C,"SOME.TXT",0
+
+MsgFileError:
+        db "Cannot read A:",#5C,"SOME.TXT",13,10,"$"
+
+FileHandle:
+        db 0
+
+FontSlot:
+        db 0
+
+SrcPtr:
+        dw 0
+
+LineBase:
+        dw 0
+
+Col:
+        db 0
+
+Row:
+        db 0
+
+; ------------------------------------------------------------
+; Buffers
+; ------------------------------------------------------------
+
+ScreenBuf:
+        defs SCREEN_BYTES
+
+TextBuf:
+        defs TEXT_MAX+1
+
+FontBuf:
+        defs 2048

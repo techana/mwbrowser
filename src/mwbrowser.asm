@@ -21,8 +21,8 @@
 ; Back/Forward are disabled and swallow Enter/Space.
 ; ============================================================================
 
-    .MSXDOS
-    .bios
+    DEVICE NOSLOT64K                ; SjASMPlus: full 64 KB address space
+    ORG 0x0100                      ; MSX-DOS 1 .COM entry point
 
 ; ---- DOS / VDP / BIOS equates ----
 BDOS_ENTRY     equ 0x0005
@@ -32,11 +32,36 @@ DOS_CONST      equ 0x0B        ; console status (non-blocking peek)
 DOS_OPEN       equ 0x0F        ; open file via FCB
 DOS_CLOSE      equ 0x10        ; close file via FCB
 DOS_READ       equ 0x14        ; sequential read (128-byte record)
+DOS_WRITE      equ 0x15        ; sequential write (128-byte record)
+DOS_CREATE     equ 0x16        ; create file via FCB (also opens it)
+DOS_DELETE     equ 0x13        ; delete file via FCB
 DOS_SETDMA     equ 0x1A        ; set disk transfer address
+DOS_RDRND      equ 0x21        ; random read: reads the 128-byte record at
+                               ; FCB+33..35 into the DMA buffer and syncs CR
+                               ; from those bytes. Does NOT auto-increment
+                               ; R0/R1/R2; pair with sequential DOS_READ for
+                               ; the records past the first if you want
+                               ; "seek then stream".
 
 VDP_DATA       equ 0x98
 VDP_CMD        equ 0x99
 VDP_PAL        equ 0x9A
+
+; ---- MSX BIOS entry points (invoked via CALLBIOS macro below) ----
+; Matches the byte sequence asMSX's ".CALLBIOS NAME" emitted:
+;   ld iy, (EXPTBL)  ; 4 B
+;   ld ix, NAME      ; 4 B
+;   call CALSLT      ; 3 B   (CALSLT pages the BIOS slot into page 0)
+BIOS_CHGMOD    equ 0x005F      ; change screen mode (A = mode)
+BIOS_RDSLT     equ 0x000C      ; read byte from a slot
+CALSLT         equ 0x001C      ; inter-slot call target
+EXPTBL         equ 0xFCC0      ; main BIOS slot table (read by CALSLT)
+
+    MACRO CALLBIOS entry
+        ld      iy, (EXPTBL)
+        ld      ix, entry
+        call    CALSLT
+    ENDM
 
 ; Work-area pointer CGPNT (0xF91F) is a 3-byte record that tells us where the
 ; live MSX font lives: byte 0 = slot specifier, bytes 1..2 = address in that
@@ -58,7 +83,9 @@ CGPNT          equ 0xF91F      ; slot (1B) + address (2B, LE) of font table
 ; are BLACK (value 3) for pure black. Separator, thumb, and unfocused
 ; borders use DGRAY (value 0), which dithers pal 0+pal 2 into a mid-gray
 ; visibly darker than LGRAY.
-COL_DGRAY      equ 0       ; pair (pal 0 dgray + pal 2 white) -> dither
+COL_DGRAY      equ 0       ; solid pal 0 = dark gray (~RGB 73,73,73);
+                            ; in a pair-paletted byte alongside pal 2 it
+                            ; dithers to mid-grey (used by the chrome).
 COL_LGRAY      equ 1       ; solid pal 1 = light gray
 COL_WHITE      equ 2       ; solid pal 2 = white
 COL_BLACK      equ 3       ; solid pal 3 = black
@@ -76,15 +103,28 @@ CONTENT_Y0     equ 29
 CONTENT_Y1     equ 211
 
 BTN_Y0         equ 12
-BTN_W          equ 60
+BTN_W          equ 32          ; halved from 60 so the address bar can grow
 BTN_H          equ 15
 ; Toolbar layout (left to right): Back, Forward, Address bar, Refresh.
-; Refresh sits at the far right of the toolbar; Address bar fills the middle.
-BTN1_X         equ 4                    ; Back,    byte col 1
-BTN3_X         equ 68                   ; Forward, byte col 17
-ADDR_X0        equ 132                  ; byte col 33
-ADDR_X1        equ 427                  ; byte col 106 (ADDR width = 296 px)
-BTN2_X         equ 432                  ; Refresh, byte col 108 (ends at x=491)
+; Refresh sits at the far right of the toolbar; Address bar fills the
+; middle. All X values are on 4-px byte-column boundaries.
+BTN1_X         equ 4                    ; Back,    byte col 1 (ends at 35)
+BTN3_X         equ 40                   ; Forward, byte col 10 (ends at 71)
+ADDR_X0        equ 76                   ; byte col 19
+ADDR_X1        equ 471                  ; ADDR width = 396 px (99 byte-cols)
+BTN2_X         equ 476                  ; Refresh, byte col 119 (ends at 507);
+                                        ; right-edge gap = 4 px to screen pixel
+                                        ; 511, matching Back's 4-px left margin.
+                                        ; The toolbar background paints across
+                                        ; the full 512-px width (the scrollbar
+                                        ; only starts at content row Y=29), so
+                                        ; the button can sit past pixel 491.
+
+; Chars that fit in the address bar's text area. Text starts 5 px in
+; from ADDR_X0 (1-px gap after the 4-px border) and must stop before
+; the clear-x glyph at ADDR_X1-12.
+; ((ADDR_X1-12) - (ADDR_X0+5)) / 8 = 378 / 8 = 47 (integer floor).
+URL_VISIBLE    equ 47
 
 ; Scrollbar is 20 wide (5 bytes) -- 1 byte wider than before. An 8-wide arrow
 ; icon (2 bytes) sits inside 1-byte (4-px) left/right track borders.
@@ -108,29 +148,99 @@ FOC_COUNT      equ 5
 
 ; ---- keys ----
 KEY_ESC        equ 0x1B
+KEY_STOP       equ 0x03         ; MSX STOP key (BIOS DIRIN reports as Ctrl-C)
 KEY_BACKSPACE  equ 0x08
 KEY_TAB        equ 0x09
 KEY_ENTER      equ 0x0D
 KEY_SPACE      equ 0x20
 KEY_UP         equ 0x1E        ; MSX DIRIN returns 0x1E for up arrow
 KEY_DOWN       equ 0x1F        ; 0x1F for down arrow
+KEY_LEFT       equ 0x1D        ; left arrow
+KEY_RIGHT      equ 0x1C        ; right arrow
 KEY_CLS        equ 0x0C        ; MSX CLS / Ctrl+L -- clears address bar
-KEY_F1         equ 0xF1        ; MSX F1 key (opens About popup)
+KEY_F1         equ 0xF1        ; MSX F1 -> About / help popup
+KEY_F2         equ 0xF2        ; MSX F2 -> toolbar Back
+KEY_F3         equ 0xF3        ; MSX F3 -> toolbar Forward
+KEY_F4         equ 0xF4        ; MSX F4 -> clear address bar
+KEY_F5         equ 0xF5        ; MSX F5 -> toolbar Refresh / Go
+KEY_F6         equ 0xF6        ; MSX F6 -> Save popup ("[]" titlebar button)
 
 ; ---- URL / file state ----
-URL_MAX        equ 96
-FILE_BUF_SIZE  equ 0x9000      ; 36 KB — fits image-heavy pages from the bridge
+URL_MAX        equ 255         ; address-bar / fetch-target buffer cap (chars
+                               ; before NUL). Bumped from 95 because real
+                               ; mirror.aratab.com URLs run past the 100-char
+                               ; line and got truncated on click.
+FILE_BUF_SIZE  equ 0x1800      ; 6 KB exactly = SERIAL_CHUNK_RANGE_BYTES;
+                               ; FILE_BUF_SIZE + FONT_BUF_SIZE + 128 +
+                               ; 512 B (FastLutHi+FastLutLo, lesson #1) +
+                               ; 2 KB (TransposedFontBuf, lesson #3, see
+                               ; research/zero-latency screen6/LESSONS.md)
+                               ; lands at exactly 0xD500 -- below both
+                               ; MSX-DOS 1.03's
+                               ; *runtime* HIMEM (~0xDF94 on Sony HB-F1XD,
+                               ; queried via BIOS HIMSAV @ 0xFC4A) AND
+                               ; the .COM's initial SP (~0xDDC8 -- MSX-DOS
+                               ; sets this when loading the .COM).
+                               ;
+                               ; Two distinct constraints made earlier
+                               ; sizes wrong:
+                               ;
+                               ;  (a) above HIMEM = DOS scratch territory.
+                               ;      MSX-DOS pulls HIMEM down to ~0xDF94
+                               ;      to reserve sector cache / FAT / FCB
+                               ;      DMA. Memory from 0xDF94..0xF380 is
+                               ;      DOS-owned; any BDOS I/O can clobber
+                               ;      bytes there. The FontBuf at 0xE800
+                               ;      we tried first sat inside that
+                               ;      region -- every disk read corrupted
+                               ;      font glyphs and the renderer painted
+                               ;      garbage for chars whose font byte
+                               ;      offsets happened to overlap (the
+                               ;      's','t','v','w' cluster bug).
+                               ;
+                               ;  (b) below HIMEM but above SP = stack
+                               ;      collision territory. The .COM's
+                               ;      runtime SP starts at ~0xDDC8 and
+                               ;      grows down. Buffers between SP and
+                               ;      HIMEM get clobbered by stack writes
+                               ;      whenever a deep call chain runs.
+                               ;      The FontBuf at 0xD400..0xDBFF we
+                               ;      tried second straddled the active
+                               ;      stack -- ExtractFont's 2 KB write
+                               ;      smashed return addresses and MWBRO
+                               ;      crashed with a black screen at boot.
+                               ;
+                               ; 0xD480 leaves ~2.3 KB of stack headroom
+                               ; below 0xDDC8, comfortable for our call
+                               ; depth.
+                               ;
+                               ; The bridge's 6 KB chunks still fit two
+                               ; chunks per FileBuf; wikipedia-class long
+                               ; articles flow via TryFetchMore.
 FONT_BUF_SIZE  equ 2048        ; 256 glyphs * 8 rows
 CONTENT_X_END  equ 491         ; scrollbar now starts at x=492
 TEXT_LINE_H    equ 8           ; MSX font row height
 TEXT_MAX_LINES equ (CONTENT_Y1 - CONTENT_Y0 + 1) / TEXT_LINE_H  ; 22 lines
 CONTENT_W_BYTES equ (CONTENT_X_END + 1) / 4                     ; 124 bytes
 
-; ---- About popup geometry (must be byte-aligned: X and W multiples of 4) ----
-ABOUT_X        equ 128
-ABOUT_Y        equ 50
-ABOUT_W        equ 240
-ABOUT_H        equ 108
+; ---- Help popup geometry (must be byte-aligned: X and W multiples of 4) ----
+; ABOUT_W bumped from 240 -> 280 to fit the "Show images [ ] أظهر الصور"
+; checkbox row alongside the F-key cheat-sheet; ABOUT_H bumped 108 -> 136
+; for the extra checkbox row + the new scroll-key line (M/Space PgDn,
+; N PgUp) the user asked us to surface.
+ABOUT_X        equ 108
+ABOUT_Y        equ 40
+ABOUT_W        equ 280
+ABOUT_H        equ 136
+; Pixel X of the checkbox cell within the popup -- referenced by both
+; the painter and the click hit-test so they can't drift apart. Row
+; layout (all 8-px chars):
+;   "Show images " (12) + "[ ]" (3) + " " (1) + Arabic tail (10)
+;   = 26 chars * 8 px = 208 px wide
+;   centred in ABOUT_W=280  ->  margin = (280-208)/2 = 36
+;   Latin starts at ABOUT_X+36, box at ABOUT_X+36+96 = +132.
+IMG_CHK_X      equ ABOUT_X + 132
+IMG_CHK_Y      equ ABOUT_Y + 50
 
 ; ---- button state bits ----
 BTN_DISABLED   equ 0x01
@@ -143,11 +253,16 @@ BTN_FOCUSED    equ 0x02
 Main:
     ld      [EntrySP], sp               ; remember caller's SP for clean Esc exit
     ld      a, 6
-    .CALLBIOS CHGMOD                    ; Screen 6
+    CALLBIOS BIOS_CHGMOD                    ; Screen 6
+
+    call    Force212Lines               ; some BIOSes leave R#9 LN=0
 
     call    ExtractFont                 ; pull BIOS font into FontBuf (once)
+    call    BuildFastLut                ; populate FastLutHi/Lo from FontLUT
+    call    BuildTransposedFont         ; row-major mirror of FontBuf
     call    SetPalette
     call    SetBorder
+    call    InitCursorSprite            ; mouse cursor = V9938 hardware sprite 0
     call    ClearContent                ; VRAM all white (colour 0)
     call    BindFnKeys                  ; make F1 inject 0xF1 on DIRIN
     call    InitState
@@ -158,8 +273,169 @@ Main:
     call    DrawScrollbar
     call    DrawTitleLabel
     call    PaintToolbar
+    call    SerialInit
+
+    ; If MSX-DOS handed us a command tail (e.g. "MWBRO foo.htm"),
+    ; copy it into UrlBuf and navigate. PSP layout:
+    ;   0x80 = length byte (DOS includes the leading space it
+    ;          inserts between the program name and the tail).
+    ;   0x81..0x80+L = command tail bytes; 0x80+L+1 = 0x0D.
+    ; We skip leading SP/TAB, then copy printable chars (>= 0x20,
+    ; < 0x7F) into UrlBuf until length runs out, a whitespace
+    ; appears, or URL_MAX-1 chars have been copied. NUL-terminate.
+    ld      a, [0x0080]
+    or      a
+    jp      z, MainLoop                  ; no tail -> idle
+    ld      b, a                          ; B = remaining count
+    ld      hl, 0x0081
+.cmdSkipWs:
+    ld      a, b
+    or      a
+    jp      z, MainLoop                  ; all whitespace -> idle
+    ld      a, [hl]
+    cp      ' '
+    jr      z, .cmdAdvWs
+    cp      0x09
+    jr      nz, .cmdCopy
+.cmdAdvWs:
+    inc     hl
+    dec     b
+    jr      .cmdSkipWs
+.cmdCopy:
+    ld      de, UrlBuf
+    ld      c, URL_MAX
+.cmdCpLoop:
+    ld      a, b
+    or      a
+    jr      z, .cmdCpDone
+    ld      a, c
+    or      a
+    jr      z, .cmdCpDone
+    ld      a, [hl]
+    cp      0x0D
+    jr      z, .cmdCpDone
+    cp      ' '
+    jr      z, .cmdCpDone
+    cp      0x09
+    jr      z, .cmdCpDone
+    ld      [de], a
+    inc     hl
+    inc     de
+    dec     b
+    dec     c
+    jr      .cmdCpLoop
+.cmdCpDone:
+    xor     a
+    ld      [de], a                       ; NUL-terminate UrlBuf
+    ; Anything copied? UrlBuf[0] != 0 means yes.
+    ld      a, [UrlBuf]
+    or      a
+    jp      z, MainLoop
+
+    ; A bare filename (no ':' at all) should load from the current
+    ; MSX-DOS drive, not the web bridge. Drive-letter URLs ("a:foo")
+    ; and scheme URLs ("http://x") both contain a ':', so a single
+    ; "any colon in UrlBuf" scan handles both cases. Bare ".../IP"
+    ; literals are now also treated as local; type the explicit
+    ; "http://1.2.3.4" if you want the bridge.
+    ld      hl, UrlBuf
+    ld      e, 0                           ; E = length counter
+.cmdScanColon:
+    ld      a, [hl]
+    or      a
+    jr      z, .cmdBareName
+    cp      ':'
+    jp      z, .cmdNavigate                ; found ':' -> leave UrlBuf alone
+    inc     hl
+    inc     e
+    jr      .cmdScanColon
+
+.cmdBareName:
+    ; Cap E so the shifted copy fits: E + 2 (prefix) + 1 (NUL) <= URL_MAX + 1.
+    ld      a, e
+    cp      URL_MAX - 2
+    jr      c, .cmdLenOk
+    ld      e, URL_MAX - 2
+    ld      hl, UrlBuf + URL_MAX - 2
+    ld      [hl], 0                        ; force terminator before shift
+.cmdLenOk:
+    ; memmove UrlBuf right 2 bytes via LDDR. Source last byte =
+    ; UrlBuf + E (NUL terminator), dest last byte = UrlBuf + E + 2,
+    ; count = E + 1 bytes (whole string including NUL).
+    ld      a, e                           ; save original length
+    ld      d, 0
+    ld      hl, UrlBuf
+    add     hl, de                         ; HL = UrlBuf + E
+    ld      d, h
+    ld      e, l
+    inc     de
+    inc     de                             ; DE = UrlBuf + E + 2
+    ld      c, a
+    ld      b, 0
+    inc     bc                             ; BC = E + 1
+    lddr
+
+    ; Get current MSX-DOS drive: function 0x19, returns A = 0=A,1=B,...
+    ld      c, 0x19
+    call    BDOS_ENTRY
+    add     a, 'A'
+    ld      [UrlBuf], a
+    ld      a, ':'
+    ld      [UrlBuf + 1], a
+
+.cmdNavigate:
+    ; Sync UrlLen + UrlCursor so the address bar's caret editing
+    ; (arrow keys, backspace, etc.) starts at end-of-URL like the
+    ; legacy seed path does. Without this the caret sticks at 0
+    ; and right-arrow refuses to move.
+    ld      hl, UrlBuf
+    ld      b, 0
+.cmdLen:
+    ld      a, [hl]
+    or      a
+    jr      z, .cmdLenDone
+    inc     hl
+    inc     b
+    jr      .cmdLen
+.cmdLenDone:
+    ld      a, b
+    ld      [UrlLen], a
+    ld      [UrlCursor], a
+    call    NavigateAndFocusContent
 
 MainLoop:
+    ; ──── DO NOT remove the `ei` below. ────────────────────────────
+    ; If you HALT with interrupts disabled, the CPU never wakes up.
+    ; This was a months-long bug:
+    ;   - The original code had bare `halt` with the comment
+    ;     "MSX-DOS leaves interrupts enabled during a .COM session,
+    ;      so the EI guard isn't needed here."
+    ;   - That assumption holds on HB-F1XD (where every test in the
+    ;     development branch ran clean) but is FALSE on Sony HB-F700D,
+    ;     Al-Alamiah AX-370, and likely a wider class of MSX2 BIOSes
+    ;     that hand control to the .COM with IFF=0.
+    ;   - Symptom on emulators: openMSX warns
+    ;     "warning: DI; HALT detected, which means a hang."
+    ;   - Symptom on real hardware: machine freezes; an eventual
+    ;     reset / NMI runs our shutdown code and the V9938 palette
+    ;     ends up holding Screen0Palette -- which fooled an earlier
+    ;     CLAUDE.md into theorising an "AX-370 ~15565 B TPA cap."
+    ;     There is no such cap. The hang is purely the bare HALT.
+    ; The Z80 architecture guarantees EI's effect is delayed by one
+    ; instruction, so the HALT below cannot take an interrupt before
+    ; it executes -- this idiom is safe and is the canonical MSX
+    ; vsync wait. (Reference: Z80 manual §4.1, MSX Assembly Page §2.)
+    ; ──────────────────────────────────────────────────────────────
+    ;
+    ; HALT pauses the CPU until the next interrupt -- on MSX with
+    ; default IM 1, that's the 50/60 Hz VBLANK from the VDP. Pacing
+    ; the idle loop on VBLANK gives us:
+    ;   - ~16-20 ms between mouse polls (more than smooth enough),
+    ;   - ~16-20 ms between keyboard peeks (still imperceptible),
+    ;   - 0 % CPU between events on emulators / real hardware,
+    ;   - and no busy-spin pinning openMSX's host thread at 100 %.
+    ei
+    halt
     call    PollMouse
 
     ; Non-blocking keyboard check. If no key, loop again (keeps polling mouse).
@@ -176,7 +452,7 @@ MainLoop:
     ; When the About popup is open everything except Esc is swallowed.
     ld      a, [AboutOpen]
     or      a
-    jr      z, .noPopup
+    jr      z, .checkSavePopup
     ld      a, b
     cp      KEY_ESC
     jr      nz, .popupSwallow
@@ -184,56 +460,130 @@ MainLoop:
 .popupSwallow:
     jp      MainLoop
 
+.checkSavePopup:
+    ; Same swallow + Esc-closes contract for the Save-file popup. Esc
+    ; matches clicking Cancel / X (per the design spec: any cancel
+    ; mid-download drops the partial file -- handled by CloseSave).
+    ld      a, [SaveOpen]
+    or      a
+    jr      z, .noPopup
+    ld      a, b
+    cp      KEY_ESC
+    jr      nz, .popupSwallow
+    call    CloseSave
+    jp      MainLoop
+
 .noPopup:
     ld      a, b
     cp      KEY_ESC
     jp      z, Shutdown
 
-    cp      KEY_F1                      ; F1 opens About popup
-    jr      z, .openAboutFromKey
-    cp      '?'                         ; "?" also opens it
+    ; MSX STOP key: shortcut for the toolbar's X / Refresh button.
+    ; Re-runs the current URL just like a click on the X (or Enter on
+    ; the focused refresh button). Works regardless of where the focus
+    ; currently sits.
+    cp      KEY_STOP
+    jp      z, DoGo
+
+    ; Function-key shortcuts: F2 Back, F3 Forward, F4 clear address,
+    ; F5 Refresh. F1 is About (handled above). Fired straight from the
+    ; global dispatch -- skips the per-focus "Enter or Space" ceremony.
+    cp      KEY_F2
+    jp      z, DoBack
+    cp      KEY_F3
+    jp      z, DoForward
+    cp      KEY_F4
+    jp      z, DoF4Clear
+    cp      KEY_F5
+    jp      z, DoGo
+
+    ; About popup now lives behind F1 only -- '?' is a typeable URL
+    ; character (query strings!) so it can't double as a shortcut.
+    cp      KEY_F1
     jr      nz, .notOpenAbout
-.openAboutFromKey:
     call    OpenAbout
     jp      MainLoop
 .notOpenAbout:
 
+    ; F6 mirrors the titlebar "[]" save-page click.
+    cp      KEY_F6
+    jr      nz, .notOpenSave
+    call    OpenSaveFromTitlebar
+    jp      MainLoop
+.notOpenSave:
+
     cp      KEY_TAB
     jr      nz, NotTab
-    ; Tab in Content sub-cycles through visible links (dotted underline
-    ; marks the active one) before rolling back to the toolbar via the
-    ; normal CycleFocus path.
+    ; Tab in Content sub-cycles through (a) visible links and (b) form
+    ; widgets before rolling back to the toolbar via CycleFocus. Order:
+    ; links 0..N-1 -> form fields 0..M-1 -> toolbar. Shift+Tab walks
+    ; the same chain backwards.
+    call    IsShiftDown
+    jr      nz, .tabForward
+    call    TabReverse
+    jp      MainLoop
+.tabForward:
     ld      a, [Focus]
     cp      FOC_CONTENT
     jr      nz, .tabCycle
+    ; Tab order inside the content area: form widgets first, then
+    ; links, then roll over to the toolbar via CycleFocus. Forms before
+    ; links is the right priority for search-box-style pages like
+    ; frogfind (where the only links live in the footer below the
+    ; search box); a strict document-order walk would be nicer but
+    ; requires a unified interactive list the parser doesn't build.
+    ld      a, [HtmlFormFocus]
+    cp      0xFF
+    jr      nz, .tabFormAdv
+    ; No form focus yet. Try starting there first.
+    call    FormFirstFocusableSlot      ; A = slot index, or 0xFF
+    cp      0xFF
+    jr      nz, .tabFormStart
+    ; No focusable form slot -- fall through to link walk.
+    jr      .tabTryLinkStart
+.tabFormStart:
+    ld      [HtmlFormFocus], a
+    call    RefreshContentInPlace
+    jp      MainLoop
+.tabFormAdv:
+    call    FormNextFocusableSlot       ; A = next slot, or 0xFF
+    cp      0xFF
+    jr      z, .tabFormsDone
+    ld      [HtmlFormFocus], a
+    call    RefreshContentInPlace
+    jp      MainLoop
+.tabFormsDone:
+    ; Past the last form slot. Drop form focus and walk links next.
+    ld      a, 0xFF
+    ld      [HtmlFormFocus], a
+.tabTryLinkStart:
     ld      a, [LinkCount]
     or      a
-    jr      z, .tabCycle                ; no links -> normal cycle
+    jr      z, .tabDone                 ; no links either -> toolbar
     ld      a, [HtmlFocusLink]
     cp      0xFF
-    jr      nz, .tabAdv
-    ; First Tab in Content: focus link 0.
-    xor     a
+    jr      nz, .tabLinkAdv
+    xor     a                           ; first link
     ld      [HtmlFocusLink], a
-    call    RefreshAfterScroll
+    call    RefreshContentInPlace
     jp      MainLoop
-.tabAdv:
-    ; Already focused on a link -- advance to the next one.
-    ld      b, a                        ; B = current focus
+.tabLinkAdv:
+    ld      b, a
     ld      a, [LinkCount]
     dec     a
     cp      b
-    jr      c, .tabExit                 ; focus past the last link
-    jr      z, .tabExit
+    jr      c, .tabLinksDone
+    jr      z, .tabLinksDone
     inc     b
     ld      a, b
     ld      [HtmlFocusLink], a
-    call    RefreshAfterScroll
+    call    RefreshContentInPlace
     jp      MainLoop
-.tabExit:
+.tabLinksDone:
     ld      a, 0xFF
     ld      [HtmlFocusLink], a
-    call    RefreshAfterScroll
+.tabDone:
+    call    RefreshContentInPlace
 .tabCycle:
     call    CycleFocus
     call    PaintToolbar
@@ -262,6 +612,16 @@ OnBack:
     jp      nz, MainLoop
 DoBack:
     call    GoBack
+    jp      MainLoop
+
+; F4: clear the address bar from anywhere and shift focus to it so the
+; user can immediately start typing a new URL without aiming the
+; mouse. Same end state as Ctrl+L (KEY_CLS) but globally accessible.
+DoF4Clear:
+    call    UrlClear
+    ld      a, FOC_ADDRESS
+    ld      [Focus], a
+    call    PaintToolbar
     jp      MainLoop
 
 OnForward:
@@ -293,27 +653,129 @@ OnAddress:
     call    NavigateAndFocusContent
     jp      MainLoop
 NotAddrEnter:
+    ; URL-edit hot path: typing, backspace, cursor arrows, clear --
+    ; none of these change the focused element, the button glyphs,
+    ; or the busy state, so a full PaintToolbar redraw is wasted
+    ; work AND introduces a per-keystroke flicker on Back / Refresh
+    ; / Forward. Repaint just the address bar via the focused
+    ; shortcut.
     cp      KEY_BACKSPACE
     jr      nz, NotBackspace
     call    UrlBackspace
-    call    PaintToolbar
+    call    PaintAddressBarFocused
     jp      MainLoop
 NotBackspace:
+    cp      KEY_LEFT
+    jr      nz, NotAddrLeft
+    call    UrlCursorLeft
+    call    PaintAddressBarFocused
+    jp      MainLoop
+NotAddrLeft:
+    cp      KEY_RIGHT
+    jr      nz, NotAddrRight
+    call    UrlCursorRight
+    call    PaintAddressBarFocused
+    jp      MainLoop
+NotAddrRight:
     cp      KEY_CLS                     ; Ctrl+L / MSX CLS
     jr      nz, NotCls
     call    UrlClear
-    call    PaintToolbar
+    call    PaintAddressBarFocused
     jp      MainLoop
 NotCls:
-    cp      0x20                        ; printable range 0x20..0x7E
+    ; Accept Latin printable (0x20..0x7E) plus the high-half ISO-8859-6
+    ; range (0x80..0xFE). On AX-370 the BIOS keyboard ISR debounces the
+    ; CODE/KANA key, flips its workarea flag, and starts emitting Arabic
+    ; codepoints through DOS_DIRIN -- so the user can press CODE at the
+    ; URL bar / address-bar and start typing Arabic without us doing
+    ; anything special on the matrix side. We just have to stop dropping
+    ; the bytes here. 0x7F (DEL) and 0xFF (used as a sentinel elsewhere)
+    ; are still ignored.
+    cp      0x20
     jp      c, MainLoop
     cp      0x7F
-    jp      nc, MainLoop
-    call    UrlAppend
-    call    PaintToolbar
+    jp      z, MainLoop
+    cp      0xFF
+    jp      z, MainLoop
+    call    UrlInsert
+    call    PaintAddressBarFocused
     jp      MainLoop
 
 OnContent:
+    ; Form-field interaction: routing depends on the focused slot's
+    ; type. Text/pass: BS pops, Enter submits, printable ASCII appends.
+    ; Checkbox/radio: Space toggles. Submit/reset/button: Space or
+    ; Enter triggers submit. Anything not handled here falls through
+    ; to the normal scroll / nav handlers below.
+    ld      a, [HtmlFormFocus]
+    cp      0xFF
+    jr      z, .ocNoForm
+    call    FormGetTypePtr              ; HL -> FormType[HtmlFormFocus]
+    ld      a, [hl]
+    cp      'T'
+    jr      z, .ocText
+    cp      'P'
+    jr      z, .ocText
+    cp      'C'
+    jr      z, .ocToggle
+    cp      'R'
+    jr      z, .ocToggle
+    cp      'S'
+    jr      z, .ocFireBtn
+    cp      'B'
+    jr      z, .ocFireBtn
+    cp      'X'
+    jr      z, .ocFireReset
+    cp      'L'
+    jr      z, .ocSelect
+    jr      .ocNoForm
+.ocSelect:
+    ld      a, b
+    cp      ' '
+    jp      z, DoFormSelectCycle
+    cp      KEY_ENTER
+    jp      z, DoFormSubmit
+    jr      .ocNoForm
+.ocText:
+    ld      a, b
+    cp      KEY_BACKSPACE
+    jp      z, DoFormBackspace
+    cp      KEY_ENTER
+    jp      z, DoFormSubmit
+    cp      ' '
+    jr      c, .ocNoForm
+    cp      0x7F
+    jr      z, .ocNoForm                ; DEL: ignore (BS handled above)
+    cp      0xFF
+    jr      z, .ocNoForm                ; sentinel: ignore
+    ; Latin (0x20..0x7E) AND ISO-8859-6 Arabic high half (0x80..0xFE)
+    ; both flow into DoFormType. The AX-370 BIOS turns the CODE/KANA
+    ; key into Arabic codepoints, the form-render pipeline shapes them
+    ; via ArFlush at paint time, so the value buffer just stores the
+    ; raw bytes and lets the renderer figure out joining forms.
+    jp      DoFormType
+.ocToggle:
+    ld      a, b
+    cp      ' '
+    jp      z, DoFormToggle
+    cp      KEY_ENTER
+    jp      z, DoFormSubmit
+    jr      .ocNoForm
+.ocFireBtn:
+    ld      a, b
+    cp      KEY_ENTER
+    jp      z, DoFormSubmit
+    cp      ' '
+    jp      z, DoFormSubmit
+    jr      .ocNoForm
+.ocFireReset:
+    ld      a, b
+    cp      KEY_ENTER
+    jp      z, DoFormReset
+    cp      ' '
+    jp      z, DoFormReset
+    jr      .ocNoForm
+.ocNoForm:
     ld      a, b
     cp      KEY_ENTER
     jp      z, DoLinkEnter              ; if a link is Tab-focused, open it
@@ -352,6 +814,700 @@ DoScrollUp:
     call    ScrollUp
     jp      MainLoop
 
+; IsShiftDown: return Z set (CF=0 + Z=1) when the Shift key is
+; pressed, NZ otherwise. Reads MSX keyboard matrix row 6 bit 0 via
+; the PPI at port 0xAA. Briefly disables interrupts so the BIOS
+; keyboard ISR doesn't fight the row-select. Preserves BC, DE, HL.
+IsShiftDown:
+    di
+    in      a, (0xAA)
+    ld      c, a                            ; save PPI C
+    and     0xF0
+    or      6                               ; select row 6
+    out     (0xAA), a
+    in      a, (0xA9)                       ; read row 6
+    ld      b, a
+    ld      a, c
+    out     (0xAA), a                       ; restore PPI C
+    ei
+    ld      a, b
+    and     0x01                            ; bit 0 = Shift (0 = pressed)
+    ret
+
+; TabReverse: walk the Content-area focus chain backwards. Current
+; forward order is links -> form slots -> toolbar; reverse is the
+; opposite. Called from MainLoop's Tab handler when Shift is down.
+TabReverse:
+    ld      a, [Focus]
+    cp      FOC_CONTENT
+    jp      nz, CycleFocusBack
+    ; --- form slot focused: go to previous form slot, else last link,
+    ;     else drop focus (and CycleFocusBack next time). ---
+    ld      a, [HtmlFormFocus]
+    cp      0xFF
+    jr      z, .trLinkBack
+    call    FormPrevFocusableSlot           ; A = prev or 0xFF
+    cp      0xFF
+    jr      z, .trFormToLink
+    ld      [HtmlFormFocus], a
+    call    RefreshContentInPlace
+    ret
+.trFormToLink:
+    ; Past the first form slot. Clear form focus; go to last link if any.
+    ld      a, 0xFF
+    ld      [HtmlFormFocus], a
+    ld      a, [LinkCount]
+    or      a
+    jr      z, .trDropAll
+    dec     a
+    ld      [HtmlFocusLink], a
+    call    RefreshContentInPlace
+    ret
+.trLinkBack:
+    ld      a, [HtmlFocusLink]
+    cp      0xFF
+    jr      z, .trDropAll
+    or      a
+    jr      z, .trDropLink
+    dec     a
+    ld      [HtmlFocusLink], a
+    call    RefreshContentInPlace
+    ret
+.trDropLink:
+    ld      a, 0xFF
+    ld      [HtmlFocusLink], a
+    call    RefreshContentInPlace
+.trDropAll:
+    ; No link / form to focus -- hand off to the toolbar cycle.
+    call    CycleFocusBack
+    call    PaintToolbar
+    ret
+
+; CycleFocusBack: rotate Focus one step backward through the toolbar
+; states (inverse of CycleFocus). Wraps at FOC_BACK.
+CycleFocusBack:
+    ld      a, [Focus]
+    or      a
+    jr      z, .cfbWrap
+    dec     a
+    ld      [Focus], a
+    ret
+.cfbWrap:
+    ld      a, FOC_COUNT - 1
+    ld      [Focus], a
+    ret
+
+; DoFormType: append the printable ASCII char in B to the focused
+; text/password slot's value, then paint JUST the new char into the
+; next free cell of its input box -- bypassing PrintFileContent so
+; every keystroke doesn't re-walk and re-paint the whole page. Normal
+; scrolling / nav will re-render and pick up any divergence.
+DoFormType:
+    ld      a, [HtmlFormFocus]
+    cp      0xFF
+    jp      z, MainLoop
+    call    FormGetValuePtr
+    xor     a
+    ld      [DftLen], a
+.dftLen:
+    ld      a, [hl]
+    or      a
+    jr      z, .dftAtEnd
+    inc     hl
+    ld      a, [DftLen]
+    inc     a
+    ld      [DftLen], a
+    cp      FORM_VALUE_MAX
+    jr      c, .dftLen
+.dftAtEnd:
+    ld      a, [DftLen]
+    cp      FORM_VALUE_MAX
+    jp      nc, MainLoop                ; full -> drop
+    ld      a, b
+    ld      [hl], a
+    inc     hl
+    xor     a
+    ld      [hl], a
+    ; If the just-appended byte is an ISO-8859-6 high half codepoint
+    ; (Arabic / extended), the joining form of the previous letter may
+    ; have shifted -- the fast paint-one-cell path renders the new
+    ; glyph in isolation and skips ArFlush, which is what produced the
+    ; "isolated forms while typing, correct shape after focus loss"
+    ; bug. Run a full in-place render so ArFlush re-shapes the run;
+    ; Latin (< 0x80) still gets the cheap per-keystroke paint.
+    ld      a, b
+    cp      0x80
+    jr      c, .dftLatin
+    call    RefreshContentInPlace
+    jp      MainLoop
+.dftLatin:
+    ; For password slots, paint '*' so the live display stays masked.
+    ld      a, [HtmlFormFocus]
+    call    FormGetTypePtr
+    ld      a, [hl]
+    cp      'P'
+    ld      a, b
+    jr      nz, .dftHaveChar
+    ld      a, '*'
+.dftHaveChar:
+    call    FormPaintCharAtEnd
+    jp      MainLoop
+
+DftLen:         db 0
+
+; DoFormBackspace: remove the last char, then overpaint that cell
+; with the empty-interior WG_BOX_M widget so the trailing glyph
+; visually disappears.
+DoFormBackspace:
+    ld      a, [HtmlFormFocus]
+    cp      0xFF
+    jp      z, MainLoop
+    call    FormGetValuePtr
+    xor     a
+    ld      [DftLen], a
+.dfbLen:
+    ld      a, [hl]
+    or      a
+    jr      z, .dfbAtEnd
+    inc     hl
+    ld      a, [DftLen]
+    inc     a
+    ld      [DftLen], a
+    jr      .dfbLen
+.dfbAtEnd:
+    ld      a, [DftLen]
+    or      a
+    jp      z, MainLoop
+    dec     hl
+    xor     a
+    ld      [hl], a
+    ld      a, [DftLen]
+    dec     a
+    ld      [DftLen], a
+    ; If anything left in the value buffer is an ISO-8859-6 high byte
+    ; (Arabic), the trailing letter's joining form can shift after a
+    ; deletion -- run a full in-place render so ArFlush re-shapes
+    ; what's left. Pure-Latin values keep the cheap M-cell overpaint.
+    call    FormGetValuePtr
+.dfbScan:
+    ld      a, [hl]
+    or      a
+    jr      z, .dfbLatin
+    cp      0x80
+    jr      nc, .dfbArabic
+    inc     hl
+    jr      .dfbScan
+.dfbArabic:
+    call    RefreshContentInPlace
+    jp      MainLoop
+.dfbLatin:
+    ; The freed cell needs the focused-variant M (black border) when
+    ; the slot is focused, else plain dgray M -- without this the
+    ; black focus frame gets a gray gap exactly where the char used
+    ; to be.
+    ld      a, WG_BOX_MF                 ; focused (text/pass ALWAYS focused here:
+                                         ; Backspace only reaches DoFormBackspace via
+                                         ; OnContent's typing dispatch, which only
+                                         ; fires when HtmlFormFocus points at our slot).
+    call    FormPaintCharAtEnd
+    jp      MainLoop
+
+; FormPaintCharAtEnd: paint A (either a printable char or a widget
+; sentinel id < WG_LAST+1) at cell (DftLen + 1) of the focused slot's
+; input box. Cell 0 is the WG_BOX_L edge, so the first value glyph
+; sits at cell 1. Clobbers everything.
+FormPaintCharAtEnd:
+    ld      [FpcChar], a
+    ld      a, [HtmlFormFocus]
+    ld      e, a
+    ld      d, 0
+    ; HL = FormScreenX[slot] (16-bit pixel X).
+    ld      hl, FormScreenX
+    add     hl, de
+    add     hl, de
+    ld      a, [hl]
+    inc     hl
+    ld      h, [hl]
+    ld      l, a
+    ; HL = byteCol = pixel X / 4.
+    srl     h
+    rr      l
+    srl     h
+    rr      l
+    ld      a, [DftLen]
+    inc     a
+    add     a, a                        ; cells are 2 byte-cols wide
+    add     a, l
+    ld      b, a                        ; B = byteCol
+    ; C = FormScreenY[slot].
+    ld      hl, FormScreenY
+    add     hl, de
+    ld      a, [hl]
+    ld      c, a
+    ; Sentinel IDs (< 0x10) take the widget-bitmap path; printable
+    ; chars go through the normal font blit.
+    ld      a, [FpcChar]
+    cp      WG_LAST + 1
+    jr      nc, .fpcText
+    or      a
+    jr      z, .fpcText
+    jp      DrawWidgetGlyph
+.fpcText:
+    ; DrawCharFast reads HtmlStyleFlags + HtmlFg; make sure we're
+    ; painting with plain-text defaults rather than whatever style the
+    ; last LineDrawCells cell left behind.
+    push    af
+    xor     a
+    ld      [HtmlStyleFlags], a
+    pop     af
+    jp      DrawCharFast
+
+FpcChar:        db 0
+
+; DoFormToggle: flip the checked state of the currently-focused
+; checkbox/radio. The state lives in the slot's value buffer: an empty
+; value = unchecked, "1" = checked. When the slot is a radio button,
+; first clear every sibling slot whose NAME matches (radio group
+; semantics); then set this one.
+DoFormToggle:
+    ld      a, [HtmlFormFocus]
+    cp      0xFF
+    jp      z, MainLoop
+    ld      [DftSlot], a
+    call    FormGetTypePtr
+    ld      a, [hl]
+    cp      'R'
+    jr      nz, .dftIsCheck
+    ; Radio: clear group-mates first.
+    call    DoFormClearRadioGroup
+.dftIsCheck:
+    ; Toggle the focused slot's value.
+    ld      a, [DftSlot]
+    call    FormGetValuePtr
+    ld      a, [hl]
+    or      a
+    jr      z, .dftSet                  ; was empty -> set to "1"
+    ; Already non-empty (checked or other) -> clear, but only for
+    ; checkboxes; for radios clicking a checked button keeps it on.
+    ld      a, [DftSlot]
+    call    FormGetTypePtr
+    ld      a, [hl]
+    cp      'R'
+    jr      z, .dftDone                 ; radio: stays on
+    ld      a, [DftSlot]
+    call    FormGetValuePtr
+    xor     a
+    ld      [hl], a                     ; checkbox -> off
+    jr      .dftDone
+.dftSet:
+    ld      a, [DftSlot]
+    call    FormGetValuePtr
+    ld      a, '1'
+    ld      [hl], a
+    inc     hl
+    xor     a
+    ld      [hl], a
+.dftDone:
+    call    RefreshContentInPlace
+    jp      MainLoop
+
+DftSlot:        db 0
+
+; DoFormSelectCycle: advance the focused <select>'s visible option
+; index. FormSelectIdx[slot] = (FormSelectIdx[slot] + 1) mod
+; FormOptCount[slot]. Triggers a re-render so the new option's text
+; appears inside the box.
+DoFormSelectCycle:
+    ld      a, [HtmlFormFocus]
+    cp      0xFF
+    jp      z, MainLoop
+    ld      e, a
+    ld      d, 0
+    ld      hl, FormOptCount
+    add     hl, de
+    ld      a, [hl]
+    or      a
+    jp      z, MainLoop                     ; no options yet -> do nothing
+    ld      b, a                            ; B = count
+    ld      hl, FormSelectIdx
+    add     hl, de
+    ld      a, [hl]
+    inc     a
+    cp      b
+    jr      c, .dfsWrite
+    xor     a                                ; wrap to 0
+.dfsWrite:
+    ld      [hl], a
+    call    RefreshContentInPlace
+    jp      MainLoop
+
+; DoFormClearRadioGroup: empty the value buffer of every slot whose
+; NAME matches the focused slot's NAME (excluding the focused slot
+; itself). HtmlFormFocus + DftSlot must be set on entry. Clobbers all.
+DoFormClearRadioGroup:
+    ld      a, [DftSlot]
+    call    FormGetNamePtr
+    ; Stash that name pointer for the inner-loop comparisons. Use
+    ; explicit byte stores -- SjASMPlus's `ld [addr], hl` shorthand
+    ; was producing wrong opcodes that scribbled into FormScreenX.
+    ld      a, l
+    ld      [DfcrNamePtr], a
+    ld      a, h
+    ld      [DfcrNamePtr + 1], a
+    ld      a, [FormCount]
+    or      a
+    ret     z
+    ld      b, a
+    ld      c, 0
+.dfcrLoop:
+    push    bc
+    ld      a, [DftSlot]
+    cp      c
+    jr      z, .dfcrSkip                ; don't clear self
+    ld      a, c
+    call    FormGetTypePtr
+    ld      a, [hl]
+    cp      'R'
+    jr      nz, .dfcrSkip               ; only radios in group
+    ld      a, c
+    call    FormGetNamePtr              ; HL -> this slot's name
+    ld      a, [DfcrNamePtr]
+    ld      e, a
+    ld      a, [DfcrNamePtr + 1]
+    ld      d, a
+    push    bc                          ; FormStrEq clobbers C; save it
+    call    FormStrEq
+    pop     bc
+    or      a
+    jr      z, .dfcrSkip                ; different name
+    ; Same group -> clear value.
+    ld      a, c
+    call    FormGetValuePtr
+    xor     a
+    ld      [hl], a
+.dfcrSkip:
+    pop     bc
+    inc     c
+    djnz    .dfcrLoop
+    ret
+
+DfcrNamePtr:    dw 0
+
+; FormStrEq: HL and DE point to NUL-terminated strings (max
+; FORM_NAME_MAX + 1 chars). Returns A=1 (NZ) on equal, A=0 (Z) on
+; mismatch. Clobbers BC, HL, DE.
+FormStrEq:
+    ld      b, FORM_NAME_MAX + 1
+.fseLoop:
+    ld      a, [de]
+    ld      c, a
+    ld      a, [hl]
+    cp      c
+    jr      nz, .fseNo
+    or      a
+    jr      z, .fseYes
+    inc     hl
+    inc     de
+    djnz    .fseLoop
+.fseYes:
+    ld      a, 2
+    or      a
+    ret
+.fseNo:
+    xor     a
+    ret
+
+; DoFormReset: triggered when Enter / Space is pressed on a focused
+; reset button (or it's clicked). Drops FormSticky so the next render
+; treats every <input> as fresh, then re-parses the page so each
+; widget reloads its initial VALUE= text and checkbox/radio state.
+; Mouse focus is cleared too so the just-clicked Reset button doesn't
+; stay highlighted afterward -- it would look glued to the user's
+; cursor otherwise. RefreshContentInPlace skips ClearContentArea, so
+; the re-render simply over-paints the stale widget cells (M-cells
+; have a white interior, so shrinking a value back to its default
+; cleans up automatically).
+DoFormReset:
+    xor     a
+    ld      [FormSticky], a
+    ld      a, 0xFF
+    ld      [HtmlFormFocus], a
+    call    RefreshContentInPlace
+    jp      MainLoop
+
+; DoFormSubmit: triggered when Enter is pressed on a focused form field
+; (or when a submit/button widget is clicked). Walks FormFields and
+; sends "name=value&...\r\n" over the UART. The bridge on the host side
+; is expected to echo something back so the operator can verify the
+; round trip. Skips slots with empty NAME or hidden TYPE so the wire
+; format matches what a real form post would carry.
+; DoFormSubmit: turn the current form state into a URL of the form
+;   /submit?name1=value1&name2=value2
+; and navigate to it. This reuses the existing RemoteGet pipeline
+; (which already works for regular URL loads) -- the bridge echoes
+; back an HTML page showing the received fields, and the browser
+; renders it as the new content just like any other navigation. No
+; extra wire format, no extra UART hang paths to worry about.
+DoFormSubmit:
+    ; Build UrlBuf = HtmlFormAction + ('?' or '&') + name=value pairs.
+    ; HtmlFormAction holds the absolute URL the bridge rewrote into the
+    ; <form action=...> attr, so the browser sends the request directly
+    ; to the real target (e.g. http://frogfind.com/?q=msx) instead of
+    ; going through a bridge-side /submit indirection. Falls back to
+    ; "/submit?" when no form action was parsed so the form-echo
+    ; helper (tools/form_bridge.py) still works for standalone tests.
+    ld      a, [HtmlFormAction]
+    or      a
+    jr      z, .dfsFallback
+    ld      hl, HtmlFormAction
+    ld      de, UrlBuf
+    ld      b, 0                        ; B = count copied
+.dfsCopy:
+    ld      a, [hl]
+    or      a
+    jr      z, .dfsCopied
+    ld      [de], a
+    inc     hl
+    inc     de
+    inc     b
+    jr      .dfsCopy
+.dfsCopied:
+    ld      a, b
+    ld      [UrlLen], a
+    ; Append the separator between the action and our first key=value.
+    ; '?' if the action has no query yet, '&' otherwise. Either way the
+    ; first .dfsLoop iteration must NOT emit another separator, so
+    ; DfsAmpPending starts at 0.
+    ld      c, '?'
+    ld      hl, HtmlFormAction
+.dfsScanQ:
+    ld      a, [hl]
+    or      a
+    jr      z, .dfsAppendSep            ; end of action, no '?' seen
+    cp      '?'
+    jr      nz, .dfsScanNext
+    ld      c, '&'
+    jr      .dfsAppendSep
+.dfsScanNext:
+    inc     hl
+    jr      .dfsScanQ
+.dfsAppendSep:
+    ld      a, c
+    call    UrlAppendA
+    xor     a
+    ld      [DfsAmpPending], a
+    ld      [DfsIdx], a
+    jr      .dfsLoop
+
+.dfsFallback:
+    ld      hl, .dfsPrefix
+    ld      de, UrlBuf
+    ld      bc, .dfsPrefixEnd - .dfsPrefix
+    ldir
+    ld      a, .dfsPrefixEnd - .dfsPrefix
+    ld      [UrlLen], a
+    xor     a
+    ld      [DfsAmpPending], a
+    ld      [DfsIdx], a
+.dfsLoop:
+    ld      a, [DfsIdx]
+    ld      b, a
+    ld      a, [FormCount]
+    cp      b
+    jp      z, .dfsDone
+    ld      a, b
+    call    FormGetTypePtr
+    ld      a, [hl]
+    cp      'S'
+    jr      z, .dfsSkip                 ; submit/button: don't include
+    cp      'B'
+    jr      z, .dfsSkip
+    cp      'X'
+    jr      z, .dfsSkip                 ; reset: never goes on the wire
+    cp      'I'
+    jr      z, .dfsSkip                 ; image: skip for now
+    ; text/pass/check/radio/hidden all get sent. NAME must be non-empty
+    ; or there's nothing to key the value under.
+    ld      a, [DfsIdx]
+    call    FormGetNamePtr
+    ld      a, [hl]
+    or      a
+    jr      z, .dfsSkip
+    ; '&' separator for all pairs after the first.
+    ld      a, [DfsAmpPending]
+    or      a
+    jr      z, .dfsNoAmp
+    ld      a, '&'
+    call    UrlAppendA
+.dfsNoAmp:
+    ld      a, 2
+    ld      [DfsAmpPending], a
+    ; name= (percent-encode in case the field name carries spaces or
+    ; reserved chars).
+    ld      a, [DfsIdx]
+    call    FormGetNamePtr
+    call    UrlAppendEncZ
+    ld      a, '='
+    call    UrlAppendA
+    ; value (percent-encode -- without this a typed "msx generation"
+    ; ships as ".../?q=msx generation" and frogfind serves a 404).
+    ld      a, [DfsIdx]
+    call    FormGetValuePtr
+    call    UrlAppendEncZ
+.dfsSkip:
+    ld      a, [DfsIdx]
+    inc     a
+    ld      [DfsIdx], a
+    jp      .dfsLoop
+.dfsDone:
+    ; NUL-terminate.
+    ld      a, [UrlLen]
+    ld      e, a
+    ld      d, 0
+    ld      hl, UrlBuf
+    add     hl, de
+    xor     a
+    ld      [hl], a
+    ; Hand off to the existing navigation path -- RemoteGet sends the
+    ; request, parses "OK HTM <len>", reads the body into FileBuf,
+    ; PrintFileContent renders it. Must `call` + `jp MainLoop`: the
+    ; navigation chain ends in PaintToolbar's ret, so a naive
+    ; `jp NavigateAndFocusContent` would return to whatever random
+    ; address the stack happens to hold (we reached DoFormSubmit via
+    ; jp from OnContent, so there's no caller frame up there).
+    call    NavigateAndFocusContent
+    jp      MainLoop
+.dfsPrefix:     db "http:/submit?"
+.dfsPrefixEnd:
+
+; UrlAppendA: append the single byte in A to UrlBuf (if room). Updates
+; UrlLen. Clobbers HL, DE.
+UrlAppendA:
+    push    af
+    ld      a, [UrlLen]
+    cp      URL_MAX
+    jr      nc, .uaaFull
+    ld      e, a
+    ld      d, 0
+    ld      hl, UrlBuf
+    add     hl, de
+    pop     af
+    ld      [hl], a
+    ld      a, [UrlLen]
+    inc     a
+    ld      [UrlLen], a
+    ret
+.uaaFull:
+    pop     af
+    ret
+
+; UrlEncIsSafe: returns Z when A is an "unreserved" URL character per
+; RFC 3986 (A-Z a-z 0-9 - . _ ~), NZ otherwise. Preserves A so the
+; caller can either pass it to UrlAppendA raw or fall through to a
+; %XX percent-encoding path.
+UrlEncIsSafe:
+    cp      '0'
+    jr      c, .checkLowPunct
+    cp      '9' + 1
+    jr      c, .uesYes
+    cp      'A'
+    jr      c, .uesNo
+    cp      'Z' + 1
+    jr      c, .uesYes
+    cp      '_'
+    jr      z, .uesYes
+    cp      'a'
+    jr      c, .uesNo
+    cp      'z' + 1
+    jr      c, .uesYes
+    cp      '~'
+    jr      z, .uesYes
+.uesNo:
+    or      1                           ; NZ
+    ret
+.checkLowPunct:
+    cp      '-'
+    jr      z, .uesYes
+    cp      '.'
+    jr      z, .uesYes
+    jr      .uesNo
+.uesYes:
+    xor     a                           ; Z
+    ret
+
+; UrlAppendEncA: like UrlAppendA, but percent-encodes A when it isn't
+; an unreserved char. Uses HexDigits below for the hex nybbles.
+UrlAppendEncA:
+    push    af
+    call    UrlEncIsSafe
+    jr      nz, .encode
+    pop     af
+    jp      UrlAppendA
+.encode:
+    pop     af
+    push    af                          ; save raw byte
+    ld      c, a                        ; C = byte
+    ld      a, '%'
+    call    UrlAppendA
+    ld      a, c
+    rrca
+    rrca
+    rrca
+    rrca
+    and     0x0F
+    ld      e, a
+    ld      d, 0
+    ld      hl, HexDigits
+    add     hl, de
+    ld      a, [hl]
+    call    UrlAppendA
+    pop     af
+    and     0x0F
+    ld      e, a
+    ld      d, 0
+    ld      hl, HexDigits
+    add     hl, de
+    ld      a, [hl]
+    jp      UrlAppendA
+
+HexDigits:      db "0123456789ABCDEF"
+
+; UrlAppendEncZ: HL -> NUL-terminated string; append each char to
+; UrlBuf percent-encoded as needed (form-field values, names with
+; special characters, etc.).
+UrlAppendEncZ:
+    ld      a, [hl]
+    or      a
+    ret     z
+    push    hl
+    call    UrlAppendEncA
+    pop     hl
+    inc     hl
+    jr      UrlAppendEncZ
+
+; UrlAppendZ: HL -> NUL-terminated string; append each char to UrlBuf
+; (stops at NUL or URL_MAX).
+UrlAppendZ:
+    ld      a, [hl]
+    or      a
+    ret     z
+    push    hl
+    call    UrlAppendA
+    pop     hl
+    inc     hl
+    jr      UrlAppendZ
+
+DfsIdx:         db 0
+DfsAmpPending:  db 0
+
+; FormGetTypePtr: A = slot. Returns HL -> FormType[A].
+FormGetTypePtr:
+    ld      e, a
+    ld      d, 0
+    ld      hl, FormType
+    add     hl, de
+    ret
+
 ; DoLinkEnter: Enter pressed while Focus=Content. If a link is currently
 ; Tab-focused, copy its href into UrlBuf and navigate. Otherwise fall
 ; through so Enter just returns to MainLoop.
@@ -382,29 +1538,43 @@ Shutdown:
 
     di
     xor     a
-    out     [VDP_CMD], a                ; palette index 0
+    out     (VDP_CMD), a                ; palette index 0
     ld      a, 0x80 | 16
-    out     [VDP_CMD], a
+    out     (VDP_CMD), a
     ld      hl, Screen0Palette
     ld      b, 32
 .palLoop:
     ld      a, [hl]
-    out     [VDP_PAL], a
+    out     (VDP_PAL), a
     inc     hl
     djnz    .palLoop
     ei
 
     xor     a
-    .CALLBIOS CHGMOD
+    CALLBIOS BIOS_CHGMOD
 
     ; Explicitly restore R7 = 0xF4 (fg=15 white, bg=4 dark blue). CHGMOD
     ; does not reset this register, so the Screen 6 value lingers.
     di
     ld      a, 0xF4
-    out     [VDP_CMD], a
+    out     (VDP_CMD), a
     ld      a, 0x80 | 7
-    out     [VDP_CMD], a
+    out     (VDP_CMD), a
     ei
+
+    ; Hand the disk state back to DOS cleanly before TERM. Close the
+    ; FCB we loaded files through (ignore the result; we don't care if
+    ; it wasn't open) and reset DMA to the default command-tail area
+    ; at 0x0080 so the next .COM CCP loads doesn't read into our old
+    ; FileBuf. Without this, a subsequent `MWBRO` from the prompt hits
+    ; "Disk error reading drive A" because DOS's internal record
+    ; pointer was left pointing at stale state from our last read.
+    ld      c, DOS_CLOSE
+    ld      de, Fcb
+    call    BDOS_ENTRY
+    ld      c, DOS_SETDMA
+    ld      de, 0x0080
+    call    BDOS_ENTRY
 
     ld      c, DOS_TERM
     jp      BDOS_ENTRY
@@ -432,17 +1602,43 @@ Screen0Palette:
 ; State
 ; ============================================================================
 
-; BindFnKeys: override the MSX function-key string buffer so F1 injects
-; the single byte 0xF1 into the DIRIN stream (matching KEY_F1 in the
-; dispatch). Without this, F1's default expansion string (e.g., "color")
-; comes through instead and the About popup never opens.
-;   FNKSTR is at 0xF87F with 16 bytes per key (F1..F10).
+; BindFnKeys: override the MSX function-key string buffer so F1..F6
+; inject single-byte codes (0xF1..0xF6) the dispatcher recognises as
+; About / Back / Forward / Clear-address / Refresh-or-Go / Save
+; shortcuts. Without this the default F-key expansion strings
+; ("color", "auto", etc.) leak into the address bar.
+;   FNKSTR sits at 0xF87F, 16 bytes per slot for F1..F10.
 BindFnKeys:
     ld      hl, 0xF87F                  ; F1's slot
     ld      [hl], 0xF1
     inc     hl
     xor     a
-    ld      [hl], a                     ; NUL-terminate
+    ld      [hl], a
+    ld      hl, 0xF87F + 16             ; F2's slot
+    ld      [hl], 0xF2
+    inc     hl
+    xor     a
+    ld      [hl], a
+    ld      hl, 0xF87F + 32             ; F3's slot
+    ld      [hl], 0xF3
+    inc     hl
+    xor     a
+    ld      [hl], a
+    ld      hl, 0xF87F + 48             ; F4's slot
+    ld      [hl], 0xF4
+    inc     hl
+    xor     a
+    ld      [hl], a
+    ld      hl, 0xF87F + 64             ; F5's slot
+    ld      [hl], 0xF5
+    inc     hl
+    xor     a
+    ld      [hl], a
+    ld      hl, 0xF87F + 80             ; F6's slot
+    ld      [hl], 0xF6
+    inc     hl
+    xor     a
+    ld      [hl], a
     ret
 
 ; Initialise Focus / Busy / Url. Called once from Main.
@@ -466,6 +1662,7 @@ InitState:
 .done:
     ld      a, b
     ld      [UrlLen], a
+    ld      [UrlCursor], a              ; caret at end of seeded URL
     ret
 
 ; Advance Focus by 1 modulo FOC_COUNT.
@@ -479,45 +1676,123 @@ CycleFocus:
     ld      [Focus], a
     ret
 
-; UrlAppend: A (on entry) = char to append (printable). NUL-terminates.
-UrlAppend:
-    ld      c, a
+; UrlInsert: A (on entry) = char to insert at the current cursor
+; position. Shifts UrlBuf[UrlCursor..UrlLen] right by one byte to make
+; room, drops A in, bumps both UrlLen and UrlCursor, NUL-terminates.
+; No-op when the buffer is full.
+UrlInsert:
+    ld      c, a                          ; C = char to insert
     ld      a, [UrlLen]
     cp      URL_MAX
     ret     nc
+    ; HL = &UrlBuf[len] (position of the trailing NUL). We walk it
+    ; backward, copying [HL] to [HL+1] each step until we land on
+    ; the cursor's slot.
+    ld      a, [UrlLen]
     ld      e, a
     ld      d, 0
     ld      hl, UrlBuf
     add     hl, de
-    ld      [hl], c
+    ; B = len - cursor + 1 (one extra iter so the NUL also shifts).
+    ld      a, [UrlLen]
+    ld      b, a
+    ld      a, [UrlCursor]
+    cpl
+    add     a, 1                          ; A = -cursor
+    add     a, b
+    inc     a
+    ld      b, a
+.uiShift:
+    ld      a, [hl]
     inc     hl
-    xor     a
     ld      [hl], a
+    dec     hl
+    dec     hl
+    djnz    .uiShift
+    ; HL now sits one byte before the cursor slot; +1 to land on it.
+    inc     hl
+    ld      [hl], c
     ld      a, [UrlLen]
     inc     a
     ld      [UrlLen], a
+    ld      a, [UrlCursor]
+    inc     a
+    ld      [UrlCursor], a
     ret
 
-; UrlClear: zero the address bar (UrlLen=0, UrlBuf[0]=NUL).
+; UrlClear: zero the address bar (UrlLen=0, UrlCursor=0, UrlBuf[0]=NUL).
 UrlClear:
     xor     a
     ld      [UrlLen], a
+    ld      [UrlCursor], a
     ld      [UrlBuf], a
     ret
 
-; UrlBackspace: decrement UrlLen, NUL-terminate at new length.
+; UrlBackspace: delete the char immediately before the cursor (DEL-back
+; semantics, like a real text input). Shifts UrlBuf[cursor..len] left
+; by 1 into [cursor-1..len-1], decrements both UrlLen and UrlCursor.
+; No-op when the cursor is already at column 0.
 UrlBackspace:
-    ld      a, [UrlLen]
+    ld      a, [UrlCursor]
     or      a
     ret     z
-    dec     a
-    ld      [UrlLen], a
+    ; Shift UrlBuf[cursor..len] left by 1.
+    ld      a, [UrlCursor]
     ld      e, a
     ld      d, 0
     ld      hl, UrlBuf
-    add     hl, de
-    xor     a
+    add     hl, de                        ; HL -> UrlBuf[cursor]
+    ld      a, [UrlLen]
+    ld      b, a
+    ld      a, [UrlCursor]
+    sub     b
+    neg                                   ; A = len - cursor
+    inc     a                             ; +1 for the trailing NUL
+    ld      b, a
+.ubShift:
+    ld      a, [hl]
+    dec     hl
     ld      [hl], a
+    inc     hl
+    inc     hl
+    djnz    .ubShift
+    ld      a, [UrlLen]
+    dec     a
+    ld      [UrlLen], a
+    ld      a, [UrlCursor]
+    dec     a
+    ld      [UrlCursor], a
+    ret
+
+; UrlCursorLeft: nudge the address-bar caret one column toward the
+; start. No-op when already at column 0.
+UrlCursorLeft:
+    ld      a, [UrlCursor]
+    or      a
+    ret     z
+    dec     a
+    ld      [UrlCursor], a
+    ret
+
+; UrlCursorRight: nudge the caret one column toward the end. No-op
+; when already at UrlLen (just past the last typed char).
+UrlCursorRight:
+    ld      a, [UrlCursor]
+    ld      b, a
+    ld      a, [UrlLen]
+    cp      b
+    ret     z
+    inc     b
+    ld      a, b
+    ld      [UrlCursor], a
+    ret
+
+; UrlCursorEnd: park the caret at UrlLen (after the last char). Used
+; whenever a fresh URL gets dropped into UrlBuf (link click, history
+; nav, init) so the user sees the end of it without scrolling.
+UrlCursorEnd:
+    ld      a, [UrlLen]
+    ld      [UrlCursor], a
     ret
 
 ; ComputeFocusState: A (on entry) = focus index to check.
@@ -537,16 +1812,16 @@ ComputeFocusState:
 SetPalette:
     di
     xor     a
-    out     [VDP_CMD], a                ; index 0
+    out     (VDP_CMD), a                ; index 0
     ld      a, 0x80 | 16
-    out     [VDP_CMD], a
+    out     (VDP_CMD), a
     ei
 
     ld      hl, PaletteData
     ld      b, 8
 .loop:
     ld      a, [hl]
-    out     [VDP_PAL], a
+    out     (VDP_PAL), a
     inc     hl
     djnz    .loop
     ret
@@ -561,11 +1836,124 @@ PaletteData:
 SetBorder:
     di
     ld      a, COL_LGRAY
-    out     [VDP_CMD], a
+    out     (VDP_CMD), a
     ld      a, 0x80 | 7
-    out     [VDP_CMD], a
+    out     (VDP_CMD), a
     ei
     ret
+
+; Force212Lines: set R#9 LN=1 so the V9938 displays 212 rows.
+;
+; HB-F1XD's BIOS leaves R#9 = 0x80 after CHGMOD 6 (LN=1, NT=0). The
+; AX-370's BIOS leaves it as 0x02 (LN=0, NT=1) -- capping visible
+; output at 192 lines, so the bottom 20 rows of MWBRO's content area
+; never reach the screen on AX-370 (and on PAL HB-F700D, where the
+; default is similar).
+;
+; R#9 itself is write-only on the V9938, but the BIOS keeps a mirror
+; at 0xFFE8 (RG9SAV). Read that, preserve NT (PAL/NTSC), force LN=1,
+; write back to both the chip and the mirror so subsequent BIOS code
+; that rewrites R#9 (e.g. on slot switches) keeps the same value.
+Force212Lines:
+    ld      a, [0xFFE8]                  ; RG9SAV (R#9 mirror)
+    and     0x02                         ; preserve only NT (PAL/NTSC) bit
+    or      0x80                         ; OR in LN=1 (212-line mode)
+    ld      [0xFFE8], a                  ; update the BIOS mirror
+    di
+    out     (VDP_CMD), a
+    ld      a, 0x80 | 9
+    out     (VDP_CMD), a
+    ei
+    ret
+
+; InitCursorSprite: program V9938 sprite engine to render the mouse
+; pointer as hardware sprite 0. Replaces the original software
+; save/paint cursor, which raced the NTSC raster at low Y (cursor's
+; row band scanned out while EraseCursor was still mid-restore, so
+; the bottom rows of the pointer disappeared for ~1/60 s of every
+; few frames -> visible flicker that vanished under PAL's wider
+; vblank window).
+;
+; We pin SAT/SPT/colour-table locations explicitly so we don't
+; inherit whatever R5/R6/R11 the BIOS's CHGMOD 6 left behind:
+;   R5  = 0xEC -> SAT at VRAM 0x07600
+;   R6  = 0x0F -> SPT at VRAM 0x07800
+;   R11 = 0x00 -> SAT high bits clear
+;   colour table is implicitly at SAT - 0x200 = 0x07400.
+; All three sit in the off-screen tail of page 0 (Screen 6 display
+; ends at 0x06A00 = row 212 * 128). Page 1 shares the sprite tables
+; -- the V9938 sprite engine reads them from a fixed absolute VRAM
+; address regardless of which bitmap page R2 is displaying, so the
+; cursor follows the user across the page-flip in RefreshAfterScroll.
+;
+; Screen 6 sprites are doubled horizontally on display (one sprite
+; pixel covers two screen pixels), so the 8-wide pattern below
+; renders as ~14 screen pixels at its widest -- close to the old
+; software arrow's 7-pixel width but recognisably the same shape.
+InitCursorSprite:
+    di
+    ld      a, 0xEC                      ; R5 = SAT high bits
+    out     (VDP_CMD), a
+    ld      a, 0x80 | 5
+    out     (VDP_CMD), a
+    ld      a, 0x0F                      ; R6 = SPT high bits
+    out     (VDP_CMD), a
+    ld      a, 0x80 | 6
+    out     (VDP_CMD), a
+    xor     a                            ; R11 = 0
+    out     (VDP_CMD), a
+    ld      a, 0x80 | 11
+    out     (VDP_CMD), a
+    ld      a, 1                         ; R14 = segment 1 (0x4000..0x7FFF)
+    out     (VDP_CMD), a
+    ld      a, 0x80 | 14
+    out     (VDP_CMD), a
+    ei
+
+    ; --- 8 pattern bytes at 0x07800 (= 0x3800 within segment 1) ---
+    ld      hl, 0x3800
+    call    VdpSetWriteAddr
+    ld      hl, CursorSpritePattern
+    ld      b, 8
+.ptn:
+    ld      a, [hl]
+    out     (VDP_DATA), a
+    inc     hl
+    djnz    .ptn
+
+    ; --- 8 colour bytes at 0x07400 -- palette slot 3 (black), no flags ---
+    ld      hl, 0x3400
+    call    VdpSetWriteAddr
+    ld      a, 0x03
+    ld      b, 8
+.col:
+    out     (VDP_DATA), a
+    djnz    .col
+
+    ; --- SAT[0] hidden; SAT[1].Y = 0xD8 terminates the sprite list ---
+    ld      hl, 0x3600
+    call    VdpSetWriteAddr
+    ld      a, 0xD9                      ; Y >= 0xD9 hides the sprite
+    out     (VDP_DATA), a
+    xor     a
+    out     (VDP_DATA), a                ; X
+    out     (VDP_DATA), a                ; pattern number
+    out     (VDP_DATA), a                ; reserved (mode-2 colour lives elsewhere)
+    ld      a, 0xD8
+    out     (VDP_DATA), a                ; SAT[1].Y = end-of-list marker
+    ret
+
+CursorSpritePattern:
+    ; Source: resources/mouse_pointer_2.png (8x8). Each sprite pixel
+    ; covers 2 screen pixels horizontally in Screen 6.
+    db      0xC0     ; ##......     row 0
+    db      0xA0     ; #.#.....     row 1
+    db      0x90     ; #..#....     row 2
+    db      0x88     ; #...#...     row 3
+    db      0xB8     ; #.###...     row 4
+    db      0xF0     ; ####....     row 5
+    db      0x38     ; ..###...     row 6
+    db      0x18     ; ...##...     row 7
 
 ; ============================================================================
 ; VDP primitives (direct I/O; no BIOS)
@@ -575,11 +1963,11 @@ SetBorder:
 VdpSetWriteAddr:
     di
     ld      a, l
-    out     [VDP_CMD], a
+    out     (VDP_CMD), a
     ld      a, h
     and     0x3F
     or      0x40                        ; write mode
-    out     [VDP_CMD], a
+    out     (VDP_CMD), a
     ei
     ret
 
@@ -587,26 +1975,138 @@ VdpSetWriteAddr:
 VdpSetReadAddr:
     di
     ld      a, l
-    out     [VDP_CMD], a
+    out     (VDP_CMD), a
     ld      a, h
     and     0x3F                        ; mode = 00 (read)
-    out     [VDP_CMD], a
+    out     (VDP_CMD), a
     ei
     ret
 
 ; VdpFill: DE bytes of value A, starting at VRAM addr in HL.
+;
+; Inner loop uses DJNZ as the per-iteration counter (8-bit, B reg)
+; with the `LD B,0 -> 256-iter` trick from the MSX Assembly Page,
+; bumping a high-byte counter in C every 256 bytes. Per-byte cost
+; drops from the previous `out / dec de / or-ze test / jr nz` (50
+; T-states / byte) to `out / djnz` (24 T-states / byte) -- ~52 %
+; faster on the only bulk caller (ClearContent's 27 KB startup
+; paint, which now finishes ~195 ms earlier on a 3.58 MHz Z80).
 VdpFill:
     push    af
     call    VdpSetWriteAddr
     pop     af
-.loop:
-    out     [VDP_DATA], a
-    dec     de
-    ld      b, a
-    ld      a, d
-    or      e
-    ld      a, b
-    jr      nz, .loop
+
+    ; Split DE into (C = full-256 chunks = D, B = remainder = E).
+    ; If E (remainder) is zero, jump straight to the chunk loop;
+    ; otherwise emit the leading remainder via a single djnz pass.
+    ld      c, d                            ; C = high byte of count
+    ld      b, e                            ; B = low byte (== remainder)
+    inc     b
+    dec     b
+    jr      z, .vfChunks                    ; remainder == 0 -> chunks only
+.vfTail:
+    out     (VDP_DATA), a                   ; 11 T
+    djnz    .vfTail                         ; 13 taken / 8 not
+.vfChunks:
+    ; C iterations of 256 bytes (B=0 -> wraps 0xFF..0x01..0x00).
+    inc     c
+    dec     c
+    ret     z                                ; no full chunks left
+    ld      b, 0                            ; B = 0 -> 256 iterations
+.vfNext:
+    out     (VDP_DATA), a
+    djnz    .vfNext
+    dec     c
+    jr      nz, .vfNext
+    ret
+
+; ============================================================================
+; V9938 command engine glue
+;
+; Drives the V9938's built-in 2D blitter (registers R32..R46, status
+; S#2.CE). Today's only caller is the popup save-bg/restore-bg path
+; (SavePopupBg / RestorePopupBg). The plumbing is general-purpose
+; though, so future passes can also point hot CPU-side blits at it
+; for big speedups -- see the TODO block below.
+;
+; TODO (command-engine wins worth chasing):
+;   * FillRect / ClearContentArea / ClearContent
+;       -> HMMV (byte-aligned rectangle fill in hardware).
+;       ClearContentArea is the biggest single CPU hit on every scroll
+;       (~100-150 ms today, ~5-10 ms via HMMV).
+;   * CopyChromeToBack and PrerenderNext's chrome mirror
+;       -> HMMM (byte-aligned VRAM->VRAM rectangle copy).
+;       ~50 ms CPU loop today, ~5 ms via HMMM.
+;   * Bitmap streamers (SC6 / PCX / BMP, RenderImageDataUri)
+;       -> HMMC (CPU->VRAM byte burst). Modest win; the decoders are
+;       still CPU-bound on the dictionary side, not the VDP port.
+;   * Smooth scroll
+;       -> YMMM (shift a VRAM band up/down N rows). Replaces today's
+;       page-flip-only scroll with line-grained scrolling at near-zero
+;       CPU cost.
+;   * Selection / focus / "found" highlight
+;       -> LMMM with LOG=XOR. Toggles a region's pixel polarity in
+;       place without touching CPU buffers; great for transient
+;       overlays that need an obvious revert.
+;
+; All of those drop in with the same VdpCmd / VdpCmdWait helpers and
+; a per-command 15-byte register block (see PopupBgSaveCmd below for
+; the block layout).
+; ============================================================================
+
+VDP_RIND       equ 0x9B          ; indirect-register-write port (R17 selects start reg)
+
+; VdpCmd: HL = pointer to a 15-byte command-register block:
+;       +0..1  SX  (source X, 9-bit)        R32-R33
+;       +2..3  SY  (source Y, 10-bit)       R34-R35
+;       +4..5  DX  (dest X)                 R36-R37
+;       +6..7  DY  (dest Y)                 R38-R39
+;       +8..9  NX  (width)                  R40-R41
+;       +10..11 NY (height)                 R42-R43
+;       +12    CLR (fill colour byte)       R44
+;       +13    ARG (direction + page bits)  R45
+;       +14    CMD (opcode | LOG)           R46
+;
+; Waits for any in-flight command to finish first, then writes all
+; 15 register bytes via R17's indirect-write autoincrement (one
+; OTIR of 15 bytes to port 0x9B). Returns AS SOON AS the command is
+; kicked off -- the CPU is free to do other work while the VDP
+; runs; callers that need to block until the blit is complete
+; should `call VdpCmdWait` after.
+VdpCmd:
+    push    hl
+    call    VdpCmdWait                  ; finish any in-flight blit first
+    pop     hl
+    di
+    ld      a, 32                       ; start at R32
+    out     (VDP_CMD), a
+    ld      a, 0x80 | 17                ; R17 = indirect write + autoinc
+    out     (VDP_CMD), a
+    ld      bc, 15 * 256 + VDP_RIND     ; B=15 count, C=0x9B port
+    otir
+    ei
+    ret
+
+; VdpCmdWait: poll S#2.CE until the command engine is idle, then
+; re-select S#0 so the BIOS IM1 handler (which reads S#0 for the
+; VBLANK flag) sees the usual register on its next read. DI throughout
+; the select/poll/restore sequence to keep the IRQ handler from
+; reading S#2 mid-poll.
+VdpCmdWait:
+    di
+    ld      a, 2                        ; status reg index
+    out     (VDP_CMD), a
+    ld      a, 0x80 | 15                ; R15 = status-reg select
+    out     (VDP_CMD), a
+.wait:
+    in      a, (VDP_CMD)                ; reads S#2
+    rra                                 ; bit 0 = CE -> CF
+    jr      c, .wait
+    xor     a
+    out     (VDP_CMD), a
+    ld      a, 0x80 | 15
+    out     (VDP_CMD), a                ; back to S#0
+    ei
     ret
 
 ; ============================================================================
@@ -666,30 +2166,69 @@ SetVramReadPos:
     jp      VdpSetReadAddr
 
 ; FillRect(B=x/4, C=y, D=w/4, E=h, A=colour). Byte-aligned.
+;
+; Hardware path: kicks off a V9938 HMMV (high-speed move-VRAM-value)
+; rectangle fill via the command engine and waits for completion.
+; ~10x faster than the old CPU `out` loop for big rectangles
+; (ClearContentArea drops from ~150 ms to ~15 ms per scroll); a wash
+; or slight overhead for single-row rectangles, which we accept since
+; they're rare and the code path is much simpler than maintaining two
+; implementations.
+;
+; The destination page is taken from WritesToPage so the lesson-4
+; page-flip + prerender still target the back buffer correctly.
 FillRect:
     push    bc
-    call    PackColour
+    call    PackColour                       ; A = packed colour byte
     pop     bc
-    ld      [PackedColour], a
-.nextRow:
-    push    bc
-    push    de
-    call    SetVramWritePos
-    pop     de
-    push    de
-    ld      a, [PackedColour]
-    ld      b, d
-.rowLoop:
-    out     [VDP_DATA], a
-    djnz    .rowLoop
-    pop     de
-    pop     bc
-    inc     c
-    dec     e
-    jr      nz, .nextRow
-    ret
+    ld      [PackedColour], a                ; kept for ClearContent's bulk VdpFill
+    ld      [FillRectCmd + 12], a            ; HMMV CLR
 
-PackedColour:  db 0
+    ; DX = x_byte_col * 4 (convert to pixel-X).
+    push    bc
+    ld      l, b
+    ld      h, 0
+    add     hl, hl
+    add     hl, hl
+    ld      [FillRectCmd + 4], hl
+
+    ; DY = y + 256 * WritesToPage (10-bit page-aware Y).
+    pop     bc
+    ld      l, c
+    ld      a, [WritesToPage]
+    ld      h, a
+    ld      [FillRectCmd + 6], hl
+
+    ; NX = w_byte_col * 4 (pixel width).
+    ld      l, d
+    ld      h, 0
+    add     hl, hl
+    add     hl, hl
+    ld      [FillRectCmd + 8], hl
+
+    ; NY = h.
+    ld      l, e
+    ld      h, 0
+    ld      [FillRectCmd + 10], hl
+
+    ld      hl, FillRectCmd
+    call    VdpCmd
+    jp      VdpCmdWait
+
+; HMMV register block. SX/SY unused for fills; CLR / DX / DY / NX / NY
+; patched per call. ARG = 0 (forward direction, no source page bits).
+FillRectCmd:
+    dw      0                                ; +0..1   SX (unused)
+    dw      0                                ; +2..3   SY (unused)
+    dw      0                                ; +4..5   DX  <- patched
+    dw      0                                ; +6..7   DY  <- patched
+    dw      0                                ; +8..9   NX  <- patched
+    dw      0                                ; +10..11 NY  <- patched
+    db      0                                ; +12     CLR <- patched
+    db      0                                ; +13     ARG
+    db      0xC0                             ; +14     CMD = HMMV
+
+PackedColour:  db 0                          ; ClearContent's bulk fill reads this
 
 DrawHLine:
     ld      e, 1
@@ -763,34 +2302,192 @@ RectH:        db 0
 ; Pages split at 0x4000 because R#14 does not auto-increment past the 14-bit
 ; internal VRAM pointer; each 16 KB slab is filled separately.
 ClearContent:
+    ; HMMV via FillRect: hardware fills the full 512x212 visible
+    ; bitmap in a single command (~10 ms). No R14 juggling, no
+    ; VdpBlank/Unblank dance, no visible black flash on boot --
+    ; the original lesson-#2 blank-during-fill trick mattered when
+    ; we were CPU-OUT-streaming 27 KB through the data port; HMMV
+    ; arbitrates VRAM access internally so the display can keep
+    ; scanning out without slowing the fill.
+    ld      b, 0                            ; x byte col
+    ld      c, 0                            ; y
+    ld      d, WIDTH / 4                    ; width in byte cols (= 128)
+    ld      e, 212                          ; height (full visible bitmap)
     ld      a, COL_WHITE
-    call    PackColour
-    ld      [PackedColour], a
+    jp      FillRect
 
-    call    VdpSetR14Zero
-    ld      hl, 0x0000
-    ld      de, 0x4000
-    ld      a, [PackedColour]
-    call    VdpFill
-
-    ld      a, 1
-    call    VdpSetR14
-    ld      hl, 0x0000
-    ld      de, 212 * 128 - 0x4000
-    ld      a, [PackedColour]
-    call    VdpFill
-
-    jp      VdpSetR14Zero
-
-VdpSetR14Zero:
-    xor     a
 VdpSetR14:
+    ; quick_screen_draw / lesson #4: when WritesToPage is set,
+    ; add 2 to the front-page R14 base so VRAM writes land in the
+    ; off-screen page-1 region (R14 = 2 + first/second-half bit).
+    ; Page 0 covers VRAM 0x00000..0x07FFF (R14=0,1); page 1 covers
+    ; 0x08000..0x0FFFF (R14=2,3). After a render to back, a flip
+    ; via VdpSetDisplayPage swaps which page the V9938 actually
+    ; outputs to the screen.
+    push    bc
+    ld      b, a                         ; B = front R14
+    ld      a, [WritesToPage]
+    add     a, a                         ; A = 0 or 2
+    add     a, b                         ; A = front R14 + offset
+    pop     bc
     di
-    out     [VDP_CMD], a
+    out     (VDP_CMD), a
     ld      a, 0x80 | 14
-    out     [VDP_CMD], a
+    out     (VDP_CMD), a
     ei
     ret
+
+; VdpSetDisplayPage: write R2 to switch which Screen-6 page the V9938
+; sends to the screen. 0 = page 0 (default after CHGMOD 6, R2 = 0x1F),
+; 1 = page 1 (R2 = 0x3F -- bit 5 selects the higher 32 KB region).
+;   A = 0 or 1.
+VdpSetDisplayPage:
+    ; A on return is contract-preserved: RefreshAfterScroll's phase-6
+    ; idle-state setup reuses it as `ld [WritesToPage], a`. Without
+    ; the push/pop below we'd clobber A with the 0x80|2 R#2 write
+    ; byte, store 0x82 into WritesToPage, and VdpSetR14 would then
+    ; route every subsequent paint to R14 = (0x82*2 + b) mod 4 -- the
+    ; *back* page -- so popups (DrawAboutPopup) and any FillRect
+    ; redraw would land off-screen after the first PageDown.
+    push    af
+    ld      [DisplayedPage], a
+    or      a
+    ld      a, 0x1F                      ; page 0
+    jr      z, .vsdpHave
+    ld      a, 0x3F                      ; page 1
+.vsdpHave:
+    di
+    out     (VDP_CMD), a
+    ld      a, 0x80 | 2
+    out     (VDP_CMD), a
+    ei
+    pop     af
+    ret
+
+; CopyChromeToBack: replicate the titlebar + toolbar bands (rows
+; 0..CONTENT_Y0-1, full width) from the currently displayed page to the
+; back page so a subsequent VdpSetDisplayPage flip lands on a screen
+; with identical chrome.
+;
+; Used by RefreshAfterScroll's page-flip flow: the user keeps seeing
+; the OLD displayed page (with current titlebar/toolbar/spinner state)
+; while the renderer composes the NEW content area on the back page.
+; At flip time, both pages need matching chrome above CONTENT_Y0 or
+; the user sees the toolbar "rewind" to whatever stale state the back
+; page was last left in.
+;
+; Hardware path: one V9938 HMMM command copies the full chrome
+; band (CONTENT_Y0 rows * full screen width) from the displayed
+; page to the back page in ~5 ms vs the old per-row CPU shuttle's
+; ~50 ms. The CPU is free to do other work while the blit runs;
+; we VdpCmdWait so the caller doesn't race the next paint.
+;
+; Source / dest pages live in the command engine's 10-bit Y address
+; space (page 0 -> Y 0..255, page 1 -> Y 256..511, ...), so the
+; SY-high and DY-high bytes carry DisplayedPage / NOT(DisplayedPage)
+; respectively. The CONTENT_Y0 rows always start at Y=0 within
+; each page so SY-low and DY-low are 0.
+;
+; Clobbers AF, HL.
+CopyChromeToBack:
+    ld      a, [DisplayedPage]
+    ld      [CopyChromeCmd + 3], a       ; SY-high = displayed page
+    xor     1
+    ld      [CopyChromeCmd + 7], a       ; DY-high = back page
+    ld      hl, CopyChromeCmd
+    call    VdpCmd
+    jp      VdpCmdWait
+
+; HMMM register block for the chrome mirror. SX/DX = 0, NX = full
+; screen width (512 px), NY = CONTENT_Y0 (rows 0..CONTENT_Y0-1).
+; SY-high (byte 3) and DY-high (byte 7) are patched per call.
+CopyChromeCmd:
+    dw      0                            ; +0..1   SX = 0
+    db      0, 0                         ; +2..3   SY low/high (high <- DisplayedPage)
+    dw      0                            ; +4..5   DX = 0
+    db      0, 0                         ; +6..7   DY low/high (high <- NOT DisplayedPage)
+    dw      WIDTH                        ; +8..9   NX = 512 (full width)
+    db      CONTENT_Y0, 0                ; +10..11 NY = chrome band height
+    db      0                            ; +12     CLR (unused for HMMM)
+    db      0                            ; +13     ARG
+    db      0xD0                         ; +14     CMD = HMMM
+
+; quick_screen_draw / lesson #2: VdpBlank / VdpUnblank toggle R1 BL
+; (bit 6, "display on/off"). With BL=0 the V9938 stops fetching
+; pattern + colour data from VRAM so 100 % of memory cycles are
+; handed to the Z80; OUT (VDP_DATA),a no longer pays a wait-state
+; tax during active raster. The screen flashes black for the
+; duration of the wrapped burst, so we only blank around the bulk
+; transfers (ClearContent's 27 KB fill, RenderSc6File's image
+; stream, RenderRemoteBitmap's serial->VRAM stream) -- not around
+; per-cell glyph emits where the flash would be visible to the
+; user.
+;
+; R1 layout (V9938): bit 7=0, bit 6=BL, bit 5=IE0(vblank IRQ),
+; bit 4=IE1, bits 3..2 = mode (M1/M2), bit 1=0, bit 0=SI(sprite).
+;
+; The serial path already toggles R1 via SerialMaskVblank /
+; SerialUnmaskVblank (clears IE0 around bursts to keep vblank IRQs
+; from glitching the i8251 poll). To compose cleanly with that, the
+; blank pair *snapshots* whatever R1 held on entry into VdpR1Saved,
+; clears just the BL bit, and restores the snapshot on Unblank.
+; Net result: bracketing a block with VdpBlank / VdpUnblank is
+; transparent to whatever IE0 / IE1 / SI state the caller chose.
+VdpR1Default       equ 0xE0     ; cold-start fallback when nothing
+                                ; has written R1 yet (matches
+                                ; SerialR1Value's "BIOS shadow gives
+                                ; 0x60, 0xE0 renders cleanly" note)
+VdpBlank:
+    ld      a, [VdpR1Saved]
+    or      a
+    jr      nz, .vbHave
+    ld      a, VdpR1Default
+.vbHave:
+    ld      [VdpR1Saved], a
+    and     ~0x40                ; clear BL
+    jr      VdpWriteR1
+VdpUnblank:
+    ld      a, [VdpR1Saved]
+    or      a
+    jr      nz, .vuHave
+    ld      a, VdpR1Default
+.vuHave:
+VdpWriteR1:
+    di
+    out     (VDP_CMD), a
+    ld      a, 0x80 | 1
+    out     (VDP_CMD), a
+    ei
+    ret
+
+VdpR1Saved:     db VdpR1Default  ; last R1 value the caller asked for
+; quick_screen_draw / lesson #4 plumbing: a Screen-6 back-buffer in
+; VRAM page 1 lets RefreshAfterScroll render the next viewport off-
+; screen and page-flip when ready, eliminating the "white blank"
+; the user sees during the render. WritesToPage=1 redirects all
+; VdpSetR14-driven writes to page 1's R14 region (offset by +2).
+; DisplayedPage tracks which page the V9938 is currently outputting
+; (0 or 1). FlipDisplayPage toggles them.
+WritesToPage: db 0
+DisplayedPage:    db 0
+
+; --- Phase-1 prerender (see PrerenderNext for the why + TODO Phase 2/3) ---
+;
+; The back page (R14 = DisplayedPage XOR 1) is currently only written
+; during a RefreshAfterScroll's transient render-then-flip. Phase 1
+; reuses it: after every successful RefreshAfterScroll, render the
+; NEXT page into the back so the user's next PageDown is an atomic
+; R#2 flip instead of a 200 ms render. PrerenderValid gates whether
+; the back actually holds a usable next-page snapshot;
+; PrerenderScrollLine pins which ScrollLine that snapshot represents
+; so any non-PageDown navigation falls through to a full render.
+PrerenderValid:      db 0
+PrerenderScrollLine: dw 0
+                                 ; (snapshotted by VdpBlank, restored
+                                 ; by VdpUnblank). Initialised to the
+                                 ; default so VdpUnblank without a
+                                 ; matching VdpBlank still leaves a
+                                 ; sane R1.
 
 ; ============================================================================
 ; High-level GUI painting
@@ -834,22 +2531,38 @@ DrawScrollbar:
     ld      a, COL_DGRAY
     call    DrawRectBorder
 
-    ; Thumb at computed position + size (solid black so it stands out).
-    ; Inset by 1 byte on each side so it sits inside the dark-gray frame
-    ; instead of overlapping it. ComputeThumb must be called whenever
-    ; ScrollLine or TotalLines changes; here we just read the current values.
+    ; Thumb at computed position + size. Solid black on the "settled"
+    ; draw (default); dimmer dark-gray on the "busy" draw, which
+    ; RefreshAfterScroll uses to cue the user that we're mid-paint
+    ; and unresponsive to keys for ~the next render. Toggling the
+    ; thumb tint instead of suppressing the redraw keeps the thumb
+    ; tracking ScrollLine on every key press.
     ld      a, [ThumbTop]
     ld      c, a
     ld      a, [ThumbHeight]
     ld      e, a
     ld      b, SCROLL_X0 / 4 + 1
     ld      d, (SCROLL_X1 - SCROLL_X0 + 1) / 4 - 3
+    ld      a, [ThumbBusy]
+    or      a
+    jr      z, .thumbColorBlack
+    ld      a, COL_DGRAY
+    jr      .thumbFill
+.thumbColorBlack:
     ld      a, COL_BLACK
+.thumbFill:
     call    FillRect
 
-    ; Shave 1 MSX pixel off the right side of the thumb: the byte adjacent
-    ; to the 2-byte solid block gets pattern 11_11_11_01 = 0xFD (3 pixels
-    ; black, 1 pixel LGRAY on the right).
+    ; Shave 1 MSX pixel off the right side of the thumb. Cap byte:
+    ; settled (black) thumb -> 11_11_11_01 = 0xFD (3 black + 1 lgray);
+    ; busy (dark-gray) thumb -> 00_00_00_01 = 0x01 (3 dgray + 1 lgray).
+    ld      a, [ThumbBusy]
+    or      a
+    ld      a, 0xFD                         ; default (settled)
+    jr      z, .thumbCapReady
+    ld      a, 0x01                         ; busy variant
+.thumbCapReady:
+    ld      [ThumbCapByte], a
     ld      a, [ThumbTop]
     ld      c, a
     ld      a, [ThumbHeight]
@@ -859,8 +2572,8 @@ DrawScrollbar:
     push    de
     ld      b, SCROLL_X0 / 4 + 3
     call    SetVramWritePos
-    ld      a, 0xFD
-    out     [VDP_DATA], a
+    ld      a, [ThumbCapByte]
+    out     (VDP_DATA), a
     pop     de
     pop     bc
     inc     c
@@ -871,13 +2584,143 @@ DrawScrollbar:
     call    DrawUpArrow
     jp      DrawDownArrow
 
-; CountTotalLines: walk FileBuf[0..FileLen-1] counting LF bytes; stores into
+; ExtrapolateHtmlLineCountIfShort: when PrintFileContent bailed via the
+; viewport-full short-circuit (parser cursor < FileBuf + WindowLen),
+; we still owe the caller a HtmlLineCount big enough that PageDown's
+; clamp doesn't pin them to the current viewport. We tried various
+; estimators (power-of-2 scaling, then linear ratio); both had the
+; same failure mode: the per-render estimate is computed from
+; partial data and DECREASES as the parser walks deeper into the
+; doc, which then SHRINKS PageDown's clamp below the user's current
+; ScrollLine and silently jams them at "stuck at page 2".
+;
+; Simpler approach: cap HtmlLineCount at 0xFFFF (saturated) on every
+; short-circuit. PageDown then advances freely until the user
+; actually overshoots; the snap-back path in RefreshAfterScroll
+; catches the overshoot, latches the exact count into HtmlLineCount,
+; sets HtmlLineCountAccurate, and lands the viewport on the last
+; full page. From that point on PageDown clamps correctly against
+; the true count. Trade-off: until the snap-back fires once, the
+; scroll-thumb sits tiny at 22/0xFFFF -- cosmetic only.
+;
+; No-op when:
+; * consumed == WindowLen (parser walked to natural EOF; HtmlLineCount
+;   is already exact -- latch the accuracy flag).
+; * HtmlLineCountAccurate flag set (a previous render already
+;   discovered the exact count via natural EOF or snap-back -- never
+;   stomp it with the saturated default).
+ExtrapolateHtmlLineCountIfShort:
+    ld      a, [HtmlLineCountAccurate]
+    or      a
+    ret     nz                           ; already exact -> never extrapolate
+    ld      hl, [ParserCursor]
+    ld      de, FileBuf
+    or      a
+    sbc     hl, de                       ; HL = consumed
+    ld      a, h
+    or      l
+    ret     z                            ; nothing consumed -> bail
+    ld      de, [WindowLen]
+    or      a
+    sbc     hl, de
+    jr      c, .eaShort
+    ; consumed >= WindowLen: parser walked the whole doc, count is
+    ; now exact. Latch the flag so future renders skip extrapolation,
+    ; and lock TotalLines to the same exact value so the scroll
+    ; thumb sizes correctly.
+    ld      a, 1
+    ld      [HtmlLineCountAccurate], a
+    ld      hl, [HtmlLineCount]
+    ld      [TotalLines], hl
+    ld      [HtmlLineCountSaved], hl
+    ret
+.eaShort:
+    ; Pre-condition: HtmlLineCount holds the partial render count for
+    ; THIS pass. Compute a TotalLines estimate for the scroll-thumb
+    ; math (estimated = current_count * total / consumed) BEFORE
+    ; saturating HtmlLineCount, then saturate.
+    ld      hl, [ParserCursor]
+    ld      de, FileBuf
+    or      a
+    sbc     hl, de                       ; HL = consumed
+    ld      de, [WindowLen]              ; DE = total
+.eaTscale:
+    ld      a, h
+    or      a
+    jr      z, .eaTscaled
+    srl     h
+    rr      l
+    srl     d
+    rr      e
+    jr      .eaTscale
+.eaTscaled:
+    ld      a, l                         ; A = scaled consumed low byte
+    or      a
+    jr      z, .eaSatBoth                ; consumed underflowed -> saturate
+    ld      c, a                         ; C = scaled consumed (DivU16By8 input)
+    ld      h, d
+    ld      l, e                         ; HL = scaled total
+    call    DivU16By8                    ; HL = ratio (typically 1..32)
+    ld      a, h
+    or      a
+    jr      nz, .eaTSat                  ; ratio >> 256 -> saturate
+    ld      a, l
+    or      a
+    jr      z, .eaTSat
+    cp      1
+    jr      z, .eaTKeepCount             ; ratio == 1: estimate = count
+    ld      b, a                         ; B = ratio
+    ld      hl, [HtmlLineCount]          ; current parser count (still un-saturated)
+    ld      d, h
+    ld      e, l
+    ld      hl, 0
+.eaTMul:
+    add     hl, de
+    jr      c, .eaTSat
+    djnz    .eaTMul
+    jr      .eaTStore
+.eaTKeepCount:
+    ld      hl, [HtmlLineCount]
+.eaTStore:
+    ; HL = computed estimate (ratio * count). Bump up if it would
+    ; round down to less than ScrollLine + TEXT_MAX_LINES so the
+    ; thumb math stays well-formed (ScrollLine fraction <= 1).
+    ld      [TotalLines], hl             ; tentative store
+    ld      de, [ScrollLine]
+    ld      hl, TEXT_MAX_LINES
+    add     hl, de                       ; HL = ScrollLine + 22 = floor
+    ex      de, hl                       ; DE = floor
+    ld      hl, [TotalLines]             ; HL = estimate
+    or      a
+    sbc     hl, de                       ; HL = estimate - floor; CF=1 if estimate < floor
+    jr      nc, .eaSatCount              ; estimate >= floor, leave it
+    ; estimate < floor: replace with floor
+    ex      de, hl                       ; HL = floor
+    ld      [TotalLines], hl
+.eaSatCount:
+    ; PageDown clamp: HtmlLineCount = 0xFFFF so PageDown advances
+    ; freely. The snap-back path latches the exact count when the
+    ; user overshoots.
+    ld      hl, 0xFFFF
+    ld      [HtmlLineCount], hl
+    ret
+.eaTSat:
+    ld      hl, 0xFFFF
+    ld      [TotalLines], hl
+    jr      .eaSatCount
+.eaSatBoth:
+    ld      hl, 0xFFFF
+    ld      [TotalLines], hl
+    ld      [HtmlLineCount], hl
+    ret
+
+; CountTotalLines: walk FileBuf[0..WindowLen-1] counting LF bytes; stores into
 ; TotalLines (saturated at 255). Called after every successful load so the
 ; thumb math has a fresh denominator.
 CountTotalLines:
     ld      hl, FileBuf
-    ld      bc, [FileLen]
-    ld      d, 0
+    ld      bc, [WindowLen]
+    ld      de, 0                       ; DE = 16-bit line count
 .loop:
     ld      a, b
     or      c
@@ -887,13 +2730,15 @@ CountTotalLines:
     dec     bc
     cp      0x0A
     jr      nz, .loop
-    inc     d
-    jr      nz, .loop                   ; saturate at 255
-    dec     d
+    ; Saturate the count at 0xFFFF so a gigantic text file can't wrap.
+    inc     de
+    ld      a, d
+    or      e
+    jr      nz, .loop
+    dec     de
     jr      .loop
 .done:
-    ld      a, d
-    ld      [TotalLines], a
+    ld      [TotalLines], de
     ret
 
 ; ComputeThumb: set ThumbTop + ThumbHeight from ScrollLine and TotalLines.
@@ -901,14 +2746,41 @@ CountTotalLines:
 ;   Else:
 ;     ThumbHeight = max(4, TEXT_MAX_LINES * TRACK_H / TotalLines)
 ;     ThumbTop    = THUMB_Y0 + (ScrollLine * TRACK_H / TotalLines)
+;
+; TotalLines / ScrollLine are 16-bit; DivU16By8 only takes an 8-bit
+; divisor. Compute a common right-shift that collapses TotalLines into
+; 8 bits and apply it to ScrollLine too -- precision loss inside a
+; ~200 px scroll track is at worst one pixel, which is imperceptible.
 ComputeThumb:
-    ld      a, [TotalLines]
+    ld      hl, [TotalLines]
+    ld      a, h
+    or      a
+    jr      nz, .ctLong
+    ld      a, l
     cp      TEXT_MAX_LINES + 1
-    jr      c, .fullThumb
+    jp      c, .fullThumb
+.ctLong:
+    ; Scale TotalLines / ScrollLine so TotalLines fits in 8 bits.
+    ld      de, [ScrollLine]
+    ld      b, 0                        ; B = shift count (debug only)
+.ctScale:
+    ld      a, h
+    or      a
+    jr      z, .ctScaled
+    srl     h
+    rr      l
+    srl     d
+    rr      e
+    inc     b
+    jr      .ctScale
+.ctScaled:
+    ld      c, l                        ; C = divisor (scaled TotalLines, <=255)
+    ld      a, c
+    or      a
+    jp      z, .fullThumb               ; degenerate: zero total -> full thumb
 
-    ld      c, a                        ; C = divisor (TotalLines)
-
-    ; ThumbHeight = TEXT_MAX_LINES * TRACK_H / TotalLines
+    push    de                          ; save scaled ScrollLine
+    ; ThumbHeight = TEXT_MAX_LINES * TRACK_H / (scaled TotalLines)
     ld      hl, TEXT_MAX_LINES * (THUMB_Y1 - THUMB_Y0 + 1)
     call    DivU16By8
     ld      a, l
@@ -917,19 +2789,22 @@ ComputeThumb:
     ld      a, 4
 .h_ok:
     ld      [ThumbHeight], a
-
-    ; ThumbTop = THUMB_Y0 + (ScrollLine * TRACK_H / TotalLines)
-    ld      a, [ScrollLine]
-    or      a
+    pop     de                          ; DE = scaled ScrollLine
+    ld      a, d
+    or      e
     jr      z, .topAtZero
-    ld      b, a                        ; B = ScrollLine (multiplier)
+    ; ThumbTop = THUMB_Y0 + (scaled ScrollLine * TRACK_H / scaled TotalLines)
+    ; Multiplier may exceed 255 post-scale, so use a 16-bit add loop.
+    push    bc
     ld      hl, 0
-    ld      de, THUMB_Y1 - THUMB_Y0 + 1
+    ld      bc, THUMB_Y1 - THUMB_Y0 + 1
 .mulLoop:
-    add     hl, de
-    djnz    .mulLoop
-    ld      a, [TotalLines]
-    ld      c, a
+    add     hl, bc
+    dec     de
+    ld      a, d
+    or      e
+    jr      nz, .mulLoop
+    pop     bc
     call    DivU16By8
     ld      a, l
     add     a, THUMB_Y0
@@ -1022,7 +2897,7 @@ PaintToolbar:
 .backFgSet:
     ld      l, COL_LGRAY
     call    SetTextColours
-    ld      de, BTN1_X + 26
+    ld      de, BTN1_X + 12
     ld      c, BTN_Y0 + 4
     ld      hl, CharLess
     call    DrawString
@@ -1045,9 +2920,9 @@ PaintToolbar:
     ld      a, COL_BLACK
     ld      l, COL_LGRAY
     call    SetTextColours
-    ld      de, BTN2_X + 26
+    ld      de, BTN2_X + 12
     ld      c, BTN_Y0 + 4
-    ld      hl, CharX
+    ld      hl, BusyChar
     call    DrawString
 .refDone:
 
@@ -1074,7 +2949,7 @@ PaintToolbar:
 .fwdFgSet:
     ld      l, COL_LGRAY
     call    SetTextColours
-    ld      de, BTN3_X + 26
+    ld      de, BTN3_X + 12
     ld      c, BTN_Y0 + 4
     ld      hl, CharGreater
     call    DrawString
@@ -1183,7 +3058,7 @@ SetVramByte:
     ld      [SVB_TMP], a
     call    SetVramWritePos
     ld      a, [SVB_TMP]
-    out     [VDP_DATA], a
+    out     (VDP_DATA), a
     ret
 
 RC_LB: db 0
@@ -1195,12 +3070,11 @@ RC_BY: db 0
 SVB_TMP: db 0
 
 ; DrawRefreshGlyph: center the 8x8 right-arrow bitmap inside the refresh
-; button. A = button byte col on entry. The icon is 2 bytes wide and 8 rows
-; tall; we place it at byte col + 7 (button is 15 bytes wide, (15-2)/2 ~= 6,
-; bumped to 7 so it reads centred given the button's left padding) and
-; y = BTN_Y0 + 4 so it sits vertically centred.
+; button. A = button byte col on entry. The icon is 2 bytes wide and 8
+; rows tall; place it at byte col + 3 so the 8-px-wide icon sits
+; centred in the new 32-px (8 byte-col) button. y = BTN_Y0 + 4.
 DrawRefreshGlyph:
-    add     a, 7
+    add     a, 3
     ld      b, a                        ; B = byte column
     ld      c, BTN_Y0 + 4               ; C = top row
     ld      d, 2                        ; D = 2 bytes/row
@@ -1242,7 +3116,7 @@ DrawBitmapReverse:
     ld      b, d
 .rowLoop:
     ld      a, [hl]
-    out     [VDP_DATA], a
+    out     (VDP_DATA), a
     inc     hl
     djnz    .rowLoop
     pop     hl                          ; restore current row start
@@ -1258,6 +3132,42 @@ DrawBitmapReverse:
     dec     e
     jr      nz, .nextRow
     ret
+
+; DrawWidgetGlyph: paint an 8x8 form-widget cell (text-input edge,
+; checkbox, radio button, ...) into VRAM at (B*4, C). Glyph A is the
+; widget id (WG_BOX_L .. WG_RAD_ON). Looks the bitmap up in
+; WidgetBitmaps and tail-calls DrawBitmap. Clobbers AF, DE, HL.
+DrawWidgetGlyph:
+    ; Widget ids are 1-based, so index = id * 2 lands on the right
+    ; word entry (the table starts with a `dw 0` placeholder for id 0
+    ; so we don't have to subtract 1 first).
+    add     a, a                            ; *2 (table holds words)
+    ld      e, a
+    ld      d, 0
+    ld      hl, WidgetBitmaps
+    add     hl, de
+    ld      a, [hl]
+    inc     hl
+    ld      h, [hl]
+    ld      l, a                            ; HL = bitmap pointer
+    ; Paint WG_HEIGHT rows starting WG_Y_RAISE px above TextY so the
+    ; widget straddles the 8-px text baseline (3 px headroom + 8 px text
+    ; + 3 px footroom = 14 px). Clamp at the top of the content area so
+    ; the very first text row in a paragraph doesn't paint into the
+    ; chrome titlebar.
+    ld      a, c
+    sub     WG_Y_RAISE
+    jr      nc, .dwgYOk
+    xor     a
+.dwgYOk:
+    cp      CONTENT_Y0
+    jr      nc, .dwgYStore
+    ld      a, CONTENT_Y0
+.dwgYStore:
+    ld      c, a
+    ld      d, 2                            ; 2 bytes/row (8 px wide)
+    ld      e, WG_HEIGHT
+    jr      DrawBitmap
 
 ; DrawBitmap: blit packed Screen-6 bitmap to VRAM at (B*4, C), D bytes * E rows.
 ;   B = byte column (x/4)
@@ -1275,7 +3185,7 @@ DrawBitmap:
     ld      b, d                        ; bytes/row counter
 .rowLoop:
     ld      a, [hl]
-    out     [VDP_DATA], a
+    out     (VDP_DATA), a
     inc     hl
     djnz    .rowLoop
     pop     de
@@ -1284,6 +3194,19 @@ DrawBitmap:
     dec     e
     jr      nz, .nextRow
     ret
+
+; PaintAddressBarFocused: address-bar-only repaint shortcut for the
+; URL-typing hot path. The full PaintToolbar redraws the Back /
+; Refresh / Forward buttons + address bar; when the user is just
+; editing the URL we don't need to touch the buttons, and skipping
+; them eliminates the visible per-keystroke toolbar flicker.
+; Reachable only from the OnAddress dispatch (Focus is FOC_ADDRESS by
+; definition), so the focused-border path is the only one needed --
+; set ButtonState directly to BTN_FOCUSED.
+PaintAddressBarFocused:
+    ld      a, BTN_FOCUSED
+    ld      [ButtonState], a
+    ; fall through
 
 ; PaintAddressBar: white interior + focus-coloured border + URL text.
 ; Uses [ButtonState] for focus bit.
@@ -1310,39 +3233,72 @@ PaintAddressBar:
     call    DrawRectBorder
 .addrBorderDone:
 
-    ; URL text.
+    ; URL text. Show URL_VISIBLE chars starting at WindowStart so the
+    ; caret (UrlCursor) is always inside the visible window. We pick
+    ; WindowStart so:
+    ;   - if UrlLen fits, WindowStart = 0
+    ;   - else, end-anchor (WindowStart = UrlLen - URL_VISIBLE) by
+    ;     default; if the caret moved left past WindowStart we slide
+    ;     the window left (WindowStart = UrlCursor) so it stays in view
     ld      a, COL_BLACK
     ld      l, COL_WHITE
     call    SetTextColours
-    ld      de, ADDR_X0 + 4
-    ld      c, BTN_Y0 + 4
+    ld      a, [UrlLen]
+    cp      URL_VISIBLE + 1
+    jr      c, .urlNoScroll
+    sub     URL_VISIBLE                 ; A = end-anchored start
+    ld      b, a
+    ld      a, [UrlCursor]
+    cp      b
+    jr      nc, .urlStartHave
+    ld      b, a                        ; cursor scrolled past window: slide left
+.urlStartHave:
+    ld      a, b
+    jr      .urlStartReady
+.urlNoScroll:
+    xor     a
+.urlStartReady:
+    ld      [.urlVisStart], a           ; cache for caret math below
+    ld      e, a
+    ld      d, 0
     ld      hl, UrlBuf
+    add     hl, de
+    ld      de, ADDR_X0 + 5             ; 1 px gap between border and text
+    ld      c, BTN_Y0 + 4
     call    DrawString
 
-    ; Text caret: a 4-px-wide black column just past the URL when the
-    ; address bar has focus, so it's obvious that typing will land here.
+    ; Text caret: 4-px-wide black column at (UrlCursor - VisStart) * 8
+    ; when the address bar has focus.
     ld      a, [ButtonState]
     and     BTN_FOCUSED
     jr      z, .noCaret
-    ld      a, [UrlLen]
-    add     a, a
-    add     a, a
-    add     a, a                        ; A = UrlLen * 8 (px offset)
-    ld      e, a
-    ld      d, 0
-    ld      hl, ADDR_X0 + 4
-    add     hl, de                      ; HL = caret pixel X
+    ld      a, [UrlCursor]
+    ld      b, a
+    ld      a, [.urlVisStart]
+    cpl
+    add     a, 1                        ; -VisStart
+    add     a, b                        ; A = UrlCursor - VisStart
+    ld      l, a
+    ld      h, 0
+    add     hl, hl
+    add     hl, hl
+    add     hl, hl                       ; HL = (cursor - start) * 8
+    ld      de, ADDR_X0 + 5
+    add     hl, de
     srl     h
     rr      l
     srl     h
-    rr      l                           ; HL = byte col
-    ld      b, l                        ; B = byteCol
+    rr      l                            ; HL = byte col
+    ld      b, l
     ld      c, BTN_Y0 + 3
-    ld      d, 1                        ; 1 byte wide = 4 px
+    ld      d, 1                         ; 1 byte = 4 px wide
     ld      e, BTN_H - 6
     ld      a, COL_BLACK
     call    FillRect
 .noCaret:
+    jr      .caretSkipData
+.urlVisStart:   db 0                    ; scratch: window-start cache
+.caretSkipData:
 
     ; Clear-button glyph at right edge of the address bar (visual hint for
     ; Ctrl+L = MSX CLS). Dark-gray so it doesn't compete with the URL.
@@ -1355,38 +3311,120 @@ PaintAddressBar:
     jp      DrawString
 
 ; ============================================================================
-; Text rendering via BIOS GRPPRT
-;   GRPPRT (0x008D) draws A at graphic cursor (GRPACX, GRPACY) using FORCLR/
-;   BAKCLR. CALSLT is invoked via .CALLBIOS.
+; Text rendering -- direct VRAM blit via DrawCharFast
+;
+; Was BIOS GRPPRT (0x008D) until the lesson-4 page-flip in
+; RefreshAfterScroll exposed GRPPRT's fatal flaw: it ALWAYS writes to
+; page 0 (its addressing is Y*128 + X/4 against absolute VRAM, no R2
+; or R14 indirection). When DisplayedPage flips to page 1, any DrawString
+; renders to the off-screen buffer -- popup body text and toolbar URL
+; just vanish.
+;
+; The DrawCharFast loop below honours WritesToPage via SetVramWritePos
+; -> VdpSetR14, so chrome text follows the page flip correctly. We keep
+; FORCLR/BAKCLR writes for any code still reading them, but the actual
+; render path no longer uses them.
 ; ============================================================================
 
 FORCLR          equ 0xF3E9
 BAKCLR          equ 0xF3EA
-GRPACX          equ 0xFCB7
-GRPACY          equ 0xFCB9
 
-; DrawString(DE=x pixel, C=y pixel, HL=NUL-terminated string).
+; DrawString(DE=pixel X, C=pixel Y, HL=NUL-terminated string).
+; Renders left-to-right via DrawCharFast. Each glyph is 8 px wide
+; (2 byte cols). Caller is expected to have called SetTextColours
+; first so CurrentFontLUT points at the right colour pair.
+;
+; Force HtmlStyleFlags = 0 and HtmlScaleY = 1 for the duration of
+; the loop, then restore. Chrome / popup / spinner text must not
+; inherit bold / italic / underline / 2x-scale state from in-flight
+; HTML body rendering -- BusyHeartbeat re-enters DrawString from
+; inside PrintFileContent, and if the parser was mid-<h1> the
+; spinner would stretch 16 px tall and bleed onto the chrome/
+; content separator.
 DrawString:
-    ld      [GRPACX], de
-    ld      a, c
-    ld      [GRPACY], a
+    ld      a, [HtmlStyleFlags]
+    push    af
     xor     a
-    ld      [GRPACY + 1], a
+    ld      [HtmlStyleFlags], a
+    ld      a, [HtmlScaleY]
+    push    af
+    ld      a, 1
+    ld      [HtmlScaleY], a
+
+    ; byte_col = pixel_X / 4. Pixel X is 16-bit (chrome+content goes
+    ; up to 511), so handle high byte.
+    push    hl
+    ex      de, hl
+    srl     h
+    rr      l
+    srl     h
+    rr      l
+    ld      a, l                        ; A = byte_col (low byte; X/4 <= 127 fits)
+    pop     hl                          ; HL = string ptr
+    ld      b, a                        ; B = byte_col for DrawCharFast
 .loop:
     ld      a, [hl]
     or      a
-    ret     z
+    jr      z, .done
     push    hl
-    .CALLBIOS GRPPRT
+    push    bc
+    call    DrawCharFast                ; A=char, B=byte_col, C=row_y; clobbers C
+    pop     bc
     pop     hl
+    inc     b
+    inc     b                           ; advance 8 px = 2 byte cols
     inc     hl
     jr      .loop
+.done:
+    pop     af
+    ld      [HtmlScaleY], a
+    pop     af
+    ld      [HtmlStyleFlags], a
+    ret
 
-; SetTextColours(A=fg, L=bg).
+; SetTextColours(A=fg palette index 0..3, L=bg palette index 0..3).
+; Updates FORCLR/BAKCLR (legacy) AND picks the matching CurrentFontLUT
+; so the next DrawString / DrawCharFast renders with the requested
+; colour pair. Combos covered:
+;   (BLACK,WHITE) -> FontLUT
+;   (BLACK,LGRAY) -> FontLUT_BlackOnLgray
+;   (DGRAY,WHITE) -> FontLUT_DGray
+;   (DGRAY,LGRAY) -> FontLUT_DGrayOnLgray
+;   (LGRAY,WHITE) -> FontLUT_LGray
+;   anything else -> FontLUT (default)
 SetTextColours:
     ld      [FORCLR], a
+    push    af
     ld      a, l
     ld      [BAKCLR], a
+    pop     af                          ; A = fg, L = bg
+
+    cp      COL_BLACK
+    jr      z, .fgBlack
+    cp      COL_DGRAY
+    jr      z, .fgDgray
+    cp      COL_LGRAY
+    jr      z, .fgLgray
+    ld      hl, FontLUT
+    jr      .stash
+.fgBlack:
+    ld      a, l
+    cp      COL_LGRAY
+    ld      hl, FontLUT_BlackOnLgray
+    jr      z, .stash
+    ld      hl, FontLUT
+    jr      .stash
+.fgDgray:
+    ld      a, l
+    cp      COL_LGRAY
+    ld      hl, FontLUT_DGrayOnLgray
+    jr      z, .stash
+    ld      hl, FontLUT_DGray
+    jr      .stash
+.fgLgray:
+    ld      hl, FontLUT_LGray
+.stash:
+    ld      [CurrentFontLUT], hl
     ret
 
 ; ============================================================================
@@ -1428,6 +3466,10 @@ FontLUT_BlackOnLgray:                   ; fg = BLACK (pair 11), bg = LGRAY (pair
     db  0x55, 0x57, 0x5D, 0x5F, 0x75, 0x77, 0x7D, 0x7F
     db  0xD5, 0xD7, 0xDD, 0xDF, 0xF5, 0xF7, 0xFD, 0xFF
 
+FontLUT_DGrayOnLgray:                   ; fg = DGRAY (pair 00), bg = LGRAY (pair 01)
+    db  0x55, 0x54, 0x51, 0x50, 0x45, 0x44, 0x41, 0x40
+    db  0x15, 0x14, 0x11, 0x10, 0x05, 0x04, 0x01, 0x00
+
 ; ExtractFont: copy the 2 KB font into FontBuf using the live CGPNT pointer.
 ; CGPNT[0]   = slot specifier holding the font
 ; CGPNT[1..2] = address of the font within that slot (little-endian)
@@ -1443,7 +3485,7 @@ ExtractFont:
     push    de
     push    hl
     ld      a, [FastCgSlot]
-    .CALLBIOS RDSLT
+    CALLBIOS BIOS_RDSLT
     pop     hl
     pop     de
     ld      [de], a
@@ -1455,6 +3497,127 @@ ExtractFont:
     or      c
     jr      nz, .loop
     ret
+
+; BuildFastLut: populate the page-aligned bifurcated glyph LUT from
+; the existing 16-entry nibble->byte FontLUT (BLACK fg variant).
+; FastLutHi[byte] = expansion of high nibble (left 4 px, 1 VRAM byte).
+; FastLutLo[byte] = expansion of low  nibble (right 4 px, 1 VRAM byte).
+; Inner emit can then collapse to: ld l,fontByte / ld h,page /
+; ld a,(hl) / out (c),a / inc h / ld a,(hl) / out (c),a -- 71 T per
+; row vs ~135 T for EmitStyledByte (-47%).
+;
+; Called once at startup. Output lives in RAM; rebuilding on every
+; <font color> change is overkill (the slow EmitStyledByte path stays
+; the source of truth for non-default colours; bifurcated LUT only
+; serves the BLACK fg + style==0 fast lane).
+BuildFastLut:
+    ld      hl, FastLutHi
+    ld      b, 0                         ; 256-entry counter (B=0 -> djnz × 256)
+.bflLoop:
+    ld      a, l                         ; A = font byte (0..255 mod 256)
+    ; --- High nibble -> FastLutHi[A] ---
+    push    af
+    and     0xF0
+    rrca
+    rrca
+    rrca
+    rrca
+    ld      de, FontLUT
+    add     a, e
+    ld      e, a                         ; FontLUT base is byte-aligned;
+                                         ; high byte unchanged for our
+                                         ; nibble add (0..15 added)
+    ld      a, [de]
+    ld      [hl], a
+    ; --- Low nibble -> FastLutLo[A] ---
+    pop     af
+    and     0x0F
+    ld      de, FontLUT
+    add     a, e
+    ld      e, a
+    ld      a, [de]
+    inc     h                            ; FastLutLo = FastLutHi + 0x100
+    ld      [hl], a
+    dec     h                            ; back to FastLutHi
+    inc     l                            ; next index (wraps 255->0)
+    djnz    .bflLoop                     ; B counts 256 iterations
+    ret
+
+; BuildTransposedFont: convert FontBuf (256 chars × 8 rows, char-major)
+; into TransposedFontBuf (8 rows × 256 chars, row-major). Indexed at
+; runtime by `H = HIGH(TransposedFontBuf) + row, L = char_code`,
+; which collapses the per-row glyph fetch to `ld a,(hl)` -- 7 T, no
+; multiplication. Called once at startup right after ExtractFont +
+; BuildFastLut.
+BuildTransposedFont:
+    ld      a, 0                         ; outer loop: char_code 0..255
+.btfChar:
+    ld      h, 0
+    ld      l, a
+    add     hl, hl
+    add     hl, hl
+    add     hl, hl                       ; HL = char_code * 8
+    ld      de, FontBuf
+    add     hl, de                       ; HL = &FontBuf[char_code][0]
+    ; DE = &TransposedFontBuf[row 0][char_code] = base + 0*256 + char
+    ld      e, a                         ; E = char_code
+    ld      d, HIGH(TransposedFontBuf)   ; row 0 page
+    ld      b, 8                         ; 8 rows per char
+.btfRow:
+    ld      a, [hl]                      ; font byte for (char, row)
+    ld      [de], a
+    inc     hl                           ; next row in linear buf
+    inc     d                            ; next row's page in transposed buf
+    djnz    .btfRow
+    ld      a, e                         ; A still = char_code (E preserved)
+    inc     a
+    jp      nz, .btfChar                 ; loop until char_code wraps 255->0
+    ret
+
+; DrawCharFastPlain: bifurcated-LUT fast lane used when no styling /
+; scaling / colour swap is active. Pre-condition: FastFontPtr points
+; at the 8 font bytes for the current glyph; B = byte column;
+; C = y pixel.
+;
+; Per row: SetVramWritePos (~52 T overhead unchanged) + 71 T inner
+; emit vs ~135 T for EmitStyledByte. ~64 T saved per row, 8 rows per
+; glyph = ~500 T saved per text glyph rendered through this path.
+DrawCharFastPlain:
+    ld      a, 8
+    ld      [DcfpRowsLeft], a
+    ld      hl, [FastFontPtr]
+.dcfpRow:
+    push    bc
+    push    hl
+    call    SetVramWritePos             ; clobbers HL/DE; preserves BC via push
+    pop     hl
+    pop     bc
+    ld      a, [hl]                     ; font byte
+    inc     hl
+    ; Bifurcated LUT lookup: H = page (FastLutHi), L = font byte.
+    ; Stash row pointer in DE so we can reuse HL for the LUT walk.
+    ld      d, h
+    ld      e, l
+    ld      l, a
+    ld      h, HIGH(FastLutHi)
+    ld      a, [hl]
+    out     (VDP_DATA), a
+    inc     h                           ; H = HIGH(FastLutLo)
+    ld      a, [hl]
+    out     (VDP_DATA), a
+    ld      h, d
+    ld      l, e
+    inc     c                           ; advance VRAM Y
+    ; Loop 8 times. Use a small inline counter so we don't have to
+    ; touch FastRowsLeft (the slow path's state byte) -- keeps the
+    ; two paths fully independent.
+    ld      a, [DcfpRowsLeft]
+    dec     a
+    ld      [DcfpRowsLeft], a
+    jp      nz, .dcfpRow
+    ret
+
+DcfpRowsLeft:   db 0                    ; ephemeral counter for the fast lane
 
 ; DrawCharFast: blit an 8x8 glyph to Screen-6 VRAM.
 ;   A = character code (0..255)
@@ -1471,6 +3634,29 @@ DrawCharFast:
     add     hl, de
     ld      [FastFontPtr], hl
 
+    ; quick_screen_draw fast lane: when no styling flags are active,
+    ; no Y-scaling, and the active fg LUT is the default FontLUT, the
+    ; bifurcated 256-byte FastLutHi/FastLutLo lets the inner emit
+    ; collapse to two `out (c),a` per row -- no nibble math, no
+    ; per-row style branches. Falls through to the slow EmitStyledByte
+    ; path on any of:  bold/italic/strike/underline/focused, scale=2,
+    ; or an inline <font color> swap pointing CurrentFontLUT
+    ; somewhere other than FontLUT.
+    ld      a, [HtmlStyleFlags]
+    or      a
+    jr      nz, .slowSetup
+    ld      a, [HtmlScaleY]
+    cp      2
+    jr      z, .slowSetup
+    ld      a, [CurrentFontLUT]
+    cp      LOW(FontLUT)
+    jr      nz, .slowSetup
+    ld      a, [CurrentFontLUT + 1]
+    cp      HIGH(FontLUT)
+    jr      nz, .slowSetup
+    jp      DrawCharFastPlain
+
+.slowSetup:
     ld      a, 8
     ld      [FastRowsLeft], a
 
@@ -1598,7 +3784,7 @@ EmitStyledByte:
     ld      e, a
     add     hl, de
     ld      a, [hl]
-    out     [VDP_DATA], a
+    out     (VDP_DATA), a
     pop     af
     and     0x0F
     ld      hl, [CurrentFontLUT]
@@ -1606,7 +3792,7 @@ EmitStyledByte:
     ld      e, a
     add     hl, de
     ld      a, [hl]
-    out     [VDP_DATA], a
+    out     (VDP_DATA), a
     ret
 
 ; ============================================================================
@@ -1679,7 +3865,7 @@ BuildFcbFromHL:
 .skipExtra:
     ld      a, [hl]
     or      a
-    jr      z, .fillExt
+    jr      z, FillExtField
     cp      '.'
     jr      z, .afterDot
     inc     hl
@@ -1694,9 +3880,9 @@ BuildFcbFromHL:
     jr      nz, .pn
     ld      a, [hl]
     or      a
-    jr      z, .fillExt
+    jr      z, FillExtField
     cp      '.'
-    jr      nz, .fillExt
+    jr      nz, FillExtField
 
 .afterDot:
     inc     hl
@@ -1721,13 +3907,13 @@ BuildFcbFromHL:
     jr      nz, .pe
     ret
 
-; DetectArabicInBuf: walk the first FileLen bytes of FileBuf and return
+; DetectArabicInBuf: walk the first WindowLen bytes of FileBuf and return
 ; A = 1 as soon as any byte's IsoJoin entry carries the IS_ARABIC flag;
 ; A = 0 if the whole buffer is ASCII-only. Used by PrintFileContent to
 ; auto-switch .txt files to RTL when they contain Arabic text.
 DetectArabicInBuf:
     ld      hl, FileBuf
-    ld      bc, [FileLen]
+    ld      bc, [WindowLen]
 .daLoop:
     ld      a, b
     or      c
@@ -1749,7 +3935,7 @@ DetectArabicInBuf:
     pop     hl
     and     IS_ARABIC
     jr      z, .daLoop
-    ld      a, 1
+    ld      a, 2
     ret
 .daNone:
     xor     a
@@ -1770,11 +3956,11 @@ DetectPlainText:
     ld      a, [Fcb + 11]
     cp      'T'
     ret     nz
-    ld      a, 1
+    ld      a, 2
     ld      [PlainTextMode], a
     ret
 
-.fillExt:
+FillExtField:
     ld      a, ' '
     ld      b, 3
 .fe:
@@ -1794,13 +3980,18 @@ UpperCaseA:
     ret
 
 ; LoadFile: open via Fcb, read up to FILE_BUF_SIZE bytes into FileBuf, close.
-;   On success A=0, FileLen = bytes actually read (capped at buffer size).
+;   On success A=0, WindowLen = bytes actually read (capped at buffer size).
 ;   On failure A!=0 (file not found etc.).
-; ResetFcbTail: zero Fcb bytes 12..35 (the record-number / random-read
-; fields BDOS keeps internal). Called before every DOS_OPEN so a
-; previous file's state never leaks into the new session.
+; ResetFcbTail / ResetSaveDestFcbTail: zero FCB bytes 12..35 (the
+; record-number / random-read fields BDOS keeps internal). Called
+; before every DOS_OPEN / DOS_CREATE so a previous file's state
+; never leaks into the new session.
 ResetFcbTail:
     ld      hl, Fcb + 12
+    jr      DoResetFcbTail
+ResetSaveDestFcbTail:
+    ld      hl, SaveDestFcb + 12
+DoResetFcbTail:
     ld      b, 24
     xor     a
 .rftLoop:
@@ -1810,6 +4001,55 @@ ResetFcbTail:
     ret
 
 LoadFile:
+    ; New file -> the previous "HtmlLineCount is exact" knowledge is
+    ; stale; clear the lock so the upcoming initial render's
+    ; ExtrapolateHtmlLineCountIfShort can fire normally. Also reset
+    ; TotalLines (the high-water-mark for the thumb denominator)
+    ; so the new doc starts from a clean estimate.
+    xor     a
+    ld      [HtmlLineCountAccurate], a
+    ld      [TotalLines], a
+    ld      [TotalLines + 1], a
+    ld      [HtmlLineCountSaved], a
+    ld      [HtmlLineCountSaved + 1], a
+    ; URL shape routes the load:
+    ;   "view:<path>"   -> hybrid bitmap pipeline (RemoteLoadView).
+    ;                      The bridge renders the page as a Screen-6
+    ;                      bitmap and streams pixels straight to VRAM.
+    ;   "X:..." (1 letter, ":")
+    ;                   -> MSX-DOS local file (LoadFileChunk path).
+    ;   anything else   -> remote HTML fetch (RemoteLoadFile +
+    ;                      pagination + parser).
+    ; IsRemoteSession stays set on remote paths so <img src="imNN.pcx">
+    ; also lands on the UART.
+    ld      hl, UrlBuf
+    call    IsViewUrl
+    jr      nz, .lfNotView
+    ; "view:" stripped from HL by IsViewUrl already (HL now points at
+    ; the post-prefix URL). Shift UrlBuf left by 5 bytes so the bridge
+    ; sees just the URL after the prefix.
+    call    UrlStripViewPrefix
+    jp      RemoteLoadView
+.lfNotView:
+    ; Direct image URL (a:pg02.pcx, http://x/y.bmp, ...) -- synthesize a
+    ; minimal HTML wrapper so the existing PrintFileContent + TagImg
+    ; path handles the decode, scrollbar, and 404/alt-fallback uniformly.
+    ; Works for both local-disk (FCB) and remote (RemoteImgOpen via
+    ; bridge PCX/BMP wire kind) paths because TagImg dispatches by
+    ; IsRemoteSession internally.
+    call    LocalUrlIsImage
+    jp      z, LoadFileLocalImg
+
+    ld      hl, UrlBuf
+    call    IsLocalUrl
+    jr      z, .lfLocal
+    ld      a, 2
+    ld      [IsRemoteSession], a
+    jp      RemoteLoadFile
+.lfLocal:
+    xor     a
+    ld      [IsRemoteSession], a
+
     call    ResetFcbTail
 
     ld      c, DOS_OPEN
@@ -1818,21 +4058,399 @@ LoadFile:
     or      a
     ret     nz
 
-    ; FileLen = min(file size from FCB+16, FILE_BUF_SIZE).
+    ; Latch the file's full size from FCB+16..18 before we start
+    ; reading. MSX-DOS stores file size as 4 bytes at FCB+16 (CP/M
+    ; legacy, max 16 MB); we keep 24 bits so docs past 64 KB
+    ; (Wikipedia articles, blog posts) navigate end-to-end. The top
+    ; byte at FCB+19 is silently dropped -- 24-bit DocOffset can
+    ; only address up to 16 MB anyway, and any real .htm we'd open
+    ; on an MSX-DOS 1 floppy is well under that.
     ld      hl, [Fcb + 16]
-    ld      [FileLen], hl
+    ld      [DocSize], hl
+    ld      a, [Fcb + 18]
+    ld      [DocSize + 2], a
+
+    ; A fresh document invalidates every previously cached
+    ; (line_no, doc_offset) entry. Reset before the read so the
+    ; subsequent render's EmitNewlines start from an empty cache.
+    call    LineCacheReset
+
+    ; LoadFile is the "open whole document at byte 0" call: hand off
+    ; to LoadFileChunk(doc_offset=0, byte_count=FILE_BUF_SIZE).
+    ; EnsureWindowLocal handles non-zero offsets when scroll dispatch
+    ; slides the window past the initial chunk.
+    xor     a                            ; high byte of 24-bit doc_offset
+    ld      de, 0                        ; low word
+    ld      hl, FILE_BUF_SIZE            ; byte_count
+    call    LoadFileChunk
+    push    af
+    ld      c, DOS_CLOSE
+    ld      de, Fcb
+    call    BDOS_ENTRY
+    pop     af
+    ret
+
+; Direct image URL path: build "<center><img src=\"UrlBuf\"></center>"
+; into FileBuf and return success. PlainTextMode stays 0 (HTML); the
+; parser then dispatches TagImg, which copies the src attribute into
+; ImgNameBuf and calls RenderSc6File / RenderPcxFile / RenderBmpFile.
+; DocSize = WindowLen (single-window doc; no slide). The existing
+; "image too tall / decoder failed" fallback handles 404 cases inside
+; TagImg, so a missing pcx renders the [alt] placeholder.
+LocalImgPrefix:  db '<center><img src="', 0
+LocalImgSuffix:  db '"></center>', 0
+
+LoadFileLocalImg:
+    ; TagImg dispatches by IsRemoteSession; set it now so remote
+    ; .pcx URLs reach RemoteImgOpen instead of the local FCB path.
+    ld      hl, UrlBuf
+    call    IsLocalUrl
+    ld      a, 0
+    jr      z, .lflSetSession
+    ld      a, 2
+.lflSetSession:
+    ld      [IsRemoteSession], a
+
+    ld      hl, LocalImgPrefix
+    ld      de, FileBuf
+    call    LfImgCopyZ
+    ld      hl, UrlBuf
+    call    LfImgCopyZ
+    ld      hl, LocalImgSuffix
+    call    LfImgCopyZ
+    ; WindowLen = DE - FileBuf.
+    ld      hl, FileBuf
+    ex      de, hl
+    or      a
+    sbc     hl, de
+    ld      [WindowLen], hl
+    ld      [DocSize], hl
+    xor     a
+    ld      [DocSize + 2], a
+    ld      [PlainTextMode], a
+    ld      [DocOffset], a
+    ld      [DocOffset + 1], a
+    ld      [DocOffset + 2], a
+    call    LineCacheReset
+    xor     a
+    ret
+LfImgCopyZ:
+    ld      a, [hl]
+    or      a
+    ret     z
+    ld      [de], a
+    inc     hl
+    inc     de
+    jr      LfImgCopyZ
+
+; LocalUrlIsImage: returns Z when UrlBuf ends in ".pcx"/".bmp"/".sc6"
+; (case-insensitive). Scans UrlBuf directly instead of the FCB so it
+; works for remote URLs (where BuildFcbFromUrl's ext field can hold a
+; substring of the host part, e.g. ".0.1" from 127.0.0.1).
+LocalImgExts:    db "PCXBMPSC6"
+LocalUrlIsImage:
+    ; Find UrlBuf length (E = strlen).
+    ld      hl, UrlBuf
+    ld      e, 0
+.luiLen:
+    ld      a, [hl]
+    or      a
+    jr      z, .luiHaveLen
+    inc     hl
+    inc     e
+    jr      .luiLen
+.luiHaveLen:
+    ; Need at least 4 chars (".pcx" etc.) and a '.' at position E-4.
+    ld      a, e
+    cp      4
+    jr      c, .luiNo
+    sub     4
+    ld      e, a
+    ld      d, 0
+    ld      hl, UrlBuf
+    add     hl, de                          ; HL = UrlBuf + E - 4 (the '.')
+    ld      a, [hl]
+    cp      '.'
+    jr      nz, .luiNo
+    inc     hl                              ; HL -> first ext char
+    ; Compare HL..HL+2 (uppercased) against each of the three 3-char
+    ; entries in LocalImgExts.
+    ld      a, 3
+    ld      [LuiTries], a
+    ld      de, LocalImgExts
+.luiNext:
+    push    hl
+    ld      b, 3                            ; chars per candidate
+.luiCmp:
+    ld      a, [hl]
+    call    UpperCaseA
+    ld      c, a                            ; uppercased URL char
+    ld      a, [de]
+    cp      c
+    jr      nz, .luiSkip
+    inc     hl
+    inc     de
+    djnz    .luiCmp
+    pop     hl
+    xor     a                               ; Z = match
+    ret
+.luiSkip:
+    pop     hl                              ; rewind to ext start
+    ; Advance DE past the rest of this 3-char entry (B = chars left,
+    ; including the mismatching one).
+    ld      a, b
+    add     a, e
+    ld      e, a
+    jr      nc, .luiNoCar
+    inc     d
+.luiNoCar:
+    ld      a, [LuiTries]
+    dec     a
+    ld      [LuiTries], a
+    jr      nz, .luiNext
+.luiNo:
+    or      1                               ; NZ
+    ret
+LuiTries: db 0
+
+; FindUrlBasename: HL on entry points at a NUL-terminated URL. Returns
+; HL pointing one char past the last '/' (or the original HL if there
+; is none). Used so OpenSaveFromTitlebar can FCB-parse just the file
+; component of a URL like "http://127.0.0.1/SERPOC.COM" instead of
+; the whole string (BuildFcbFromUrl stops at the first '.' in the
+; host, producing FCB ext from random URL bytes).
+FindUrlBasename:
+    push    hl
+    ld      d, h
+    ld      e, l                            ; DE = last "after /" so far
+.fubScan:
+    ld      a, [hl]
+    or      a
+    jr      z, .fubDone
+    cp      '/'
+    jr      nz, .fubNext
+    inc     hl
+    ld      d, h
+    ld      e, l
+    jr      .fubScan
+.fubNext:
+    inc     hl
+    jr      .fubScan
+.fubDone:
+    pop     hl
+    ; If we never saw a '/', DE still equals original HL -- fine.
+    ex      de, hl
+    ret
+
+; UrlIsBinary: Z when UrlBuf's extension is NOT in the displayable
+; whitelist {htm, html, txt, pcx, bmp, sc6} -- caller pops the Save
+; dialog instead of rendering. URLs with no '.' at all are treated
+; as displayable (e.g. bare directory links like "INDEX" served as
+; HTML by the bridge).
+;
+; Table format: <length:1> <chars:length>, terminated by length=0.
+; All entries are uppercase; the URL tail is uppercased per-char
+; during compare via UpperCaseA.
+DisplayableExts:
+    db  3, "HTM"
+    db  4, "HTML"
+    db  3, "TXT"
+    db  3, "PCX"
+    db  3, "BMP"
+    db  3, "SC6"
+    db  0
+
+UrlIsBinary:
+    ; Forward-scan UrlBuf: HL ends pointing at the NUL terminator,
+    ; DE captures the pointer to the last '.', BUT only counts dots
+    ; AFTER the final '/' (so the dots in "127.0.0.1" don't confuse
+    ; URLs like "http://127.0.0.1/" -- the trailing slash resets DE
+    ; and the classifier treats the URL as having no extension =
+    ; displayable directory listing).
+    ld      hl, UrlBuf
+    ld      de, 0
+.uibScan:
+    ld      a, [hl]
+    or      a
+    jr      z, .uibScanDone
+    cp      '/'
+    jr      z, .uibResetDot
+    cp      '.'
+    jr      nz, .uibNextChar
+    ld      d, h
+    ld      e, l
+    jr      .uibNextChar
+.uibResetDot:
+    ld      de, 0
+.uibNextChar:
+    inc     hl
+    jr      .uibScan
+.uibScanDone:
+    ld      a, d
+    or      e
+    jr      z, .uibNoDot                    ; no '.' anywhere -> displayable
+    ; ext_len = L - E - 1  (both pointers in same 256-byte page so
+    ; high bytes match; subtraction stays 8-bit).
+    ld      a, l
+    sub     e
+    dec     a                               ; subtract the '.' itself
+    jr      z, .uibBinary                   ; trailing dot ("foo.") -> binary
+    ld      [UibExtLen], a
+    inc     de                              ; DE -> first ext char
+    ld      hl, DisplayableExts
+.uibEntry:
+    ld      a, [hl]
+    or      a
+    jr      z, .uibBinary                   ; end of table
+    push    hl
+    ld      hl, UibExtLen
+    cp      [hl]
+    pop     hl
+    jr      nz, .uibAdv                     ; length mismatch
+    ; Lengths match -- byte-by-byte compare with case fold on URL side.
+    push    de
+    push    hl
+    inc     hl                              ; HL -> entry chars
+    ld      a, [UibExtLen]
+    ld      b, a
+.uibCmp:
+    ld      a, [de]
+    call    UpperCaseA
+    cp      [hl]
+    jr      nz, .uibCmpFail
+    inc     hl
+    inc     de
+    djnz    .uibCmp
+    pop     hl
+    pop     de
+    or      1                               ; match -> displayable, NZ
+    ret
+.uibCmpFail:
+    pop     hl
+    pop     de
+.uibAdv:
+    ; Advance HL past this entry: 1 (length byte) + entry_len.
+    ld      a, [hl]
+    inc     a
+    ld      c, a
+    ld      b, 0
+    add     hl, bc
+    jr      .uibEntry
+.uibNoDot:
+    or      1                               ; no '.' -> NZ (displayable)
+    ret
+.uibBinary:
+    xor     a                               ; Z = binary, fire save popup
+    ret
+UibExtLen: db 0
+
+; LoadFileChunk: fill FileBuf starting at the given document offset
+; with up to byte_count bytes from the FCB-open file. Sets DocOffset
+; and WindowLen to reflect the loaded range.
+;
+; Inputs:
+;   FCB pre-OPENed by the caller (file size at FCB+16 is valid)
+;   A:DE = doc_offset (A = high byte, DE = low word; must be a
+;          multiple of 128. The sub-record byte_remainder branch is
+;          deferred for the day sliding-window backward fetches
+;          actually need it.)
+;   HL  = byte_count (caller's requested window size, clamped to
+;        FILE_BUF_SIZE downstream)
+;
+; Outputs:
+;   DocOffset = doc_offset
+;   WindowLen = min(byte_count, FILE_BUF_SIZE)  (caller's clamp; the
+;               read loop trims further if a record returns short)
+;   A         = 0 on success, !=0 if a read failed mid-stream
+;
+; Strategy:
+;
+;   doc_offset == 0  -> sequential DOS_READ loop from a freshly
+;       opened FCB. CR starts at 0, increments per read; equivalent
+;       to the pre-Phase-2 LoadFile body.
+;
+;   doc_offset != 0  -> per-record DOS_RDRND loop, bumping the FCB's
+;       R0/R1/R2 random-record field after each read. We can't mix
+;       RDRND with DOS_READ for the tail because RDRND only syncs
+;       CR FROM R0/R1/R2; it does not advance them, and DOS_READ
+;       reads from the CR position they just landed on (so the next
+;       sequential read would re-read the record we just fetched
+;       rather than the one after it). Phase 5 is when the non-zero
+;       branch first sees real callers; today only the sequential
+;       branch runs.
+LoadFileChunk:
+    ; Save 24-bit doc_offset (A = hi, DE = lo word).
+    ld      [DocOffset], de
+    ld      [DocOffset + 2], a
+    ; Clamp HL to FILE_BUF_SIZE so the caller can pass a generous
+    ; byte_count without overrunning FileBuf.
+    push    hl
     ld      de, FILE_BUF_SIZE
     or      a
     sbc     hl, de
-    jr      c, .sizeOk
+    pop     hl
+    jr      c, .lfcSizeOk
     ld      hl, FILE_BUF_SIZE
-    ld      [FileLen], hl
-.sizeOk:
+.lfcSizeOk:
+    ; Clamp again to (DocSize - DocOffset) so WindowLen reflects the
+    ; ACTUAL bytes available in the file rather than the requested
+    ; window size. Without this clamp, a fresh LoadFile of a small
+    ; file (test4 ~1 KB) into a previously-used FileBuf left
+    ; WindowLen at FILE_BUF_SIZE, so the parser walked past the new
+    ; doc's last byte into stale content from the previous larger
+    ; doc (BENCHTX, BIGBENCH, ...).
+    ;
+    ; HL holds the requested-and-buffer-clamped window. Compute
+    ; remaining = DocSize - DocOffset as a 24-bit value; if it fits
+    ; in 16 bits AND is smaller than HL, use it.
+    push    hl                            ; save requested
+    ld      hl, [DocSize]
+    ld      de, [DocOffset]
+    or      a
+    sbc     hl, de                        ; HL = (DocSize - DocOffset) low 16
+    ld      a, [DocSize + 2]
+    ld      e, a
+    ld      a, [DocOffset + 2]
+    sbc     a, e
+    cpl
+    inc     a                             ; A = high byte of (DocSize-DocOffset)
+                                          ; (negated; now correct signed/unsigned)
+    or      a
+    jr      nz, .lfcRemainingBig          ; > 0xFFFF: requested wins
+    ; remaining (HL) fits in 16 bits; pop requested into DE and pick min.
+    pop     de                            ; DE = requested
+    or      a
+    push    hl                            ; preserve remaining
+    sbc     hl, de
+    pop     hl                            ; HL = remaining (untouched)
+    jr      nc, .lfcUseReqDE              ; remaining >= requested -> use requested
+    ; remaining < requested: HL is the smaller value, use it.
+    jr      .lfcStore
+.lfcUseReqDE:
+    ex      de, hl                        ; HL = requested
+    jr      .lfcStore
+.lfcRemainingBig:
+    pop     hl                            ; HL = requested (remaining > 64 KB ignored)
+.lfcStore:
+    ld      [WindowLen], hl
+    ld      a, h
+    or      l
+    jp      z, .lfcDone                 ; nothing to read (jp = past 7-shift loop)
 
+    ; Branch on DocOffset (24-bit zero-test).
+    ld      a, [DocOffset]
+    ld      b, a
+    ld      a, [DocOffset + 1]
+    or      b
+    ld      b, a
+    ld      a, [DocOffset + 2]
+    or      b
+    jr      nz, .lfcRandom
+
+    ; -- doc_offset == 0: plain sequential drain --
     ld      hl, FileBuf
-    ld      bc, FILE_BUF_SIZE / 128     ; 16-bit record counter: FILE_BUF_SIZE
-                                        ; up to 64 KB (8-bit B only reached 8 KB).
-.rl:
+    ld      bc, FILE_BUF_SIZE / 128     ; 16-bit record counter
+.lfcSeqLoop:
     push    bc
     push    hl
     ex      de, hl                      ; DE = DMA target
@@ -1844,18 +4462,97 @@ LoadFile:
     or      a
     pop     hl
     pop     bc
-    jr      nz, .done
+    jr      nz, .lfcDone                ; EOF / error -> stop reading
     ld      de, 128
     add     hl, de
+    ; Spinner heartbeat. BusyHeartbeat throttles its phase advance
+    ; to "every 256 calls" (per-byte parser cadence); on the disk
+    ; load path that's only ~40 records for a typical 5 KB file --
+    ; not enough to cross the threshold once. Pre-bump BusyTick by
+    ; 32 per record so the cumulative count crosses 256 every ~8
+    ; records, giving the user 5+ visible spinner phases during the
+    ; load.
+    push    bc
+    push    hl
+    ld      a, [BusyTick]
+    add     a, 32
+    ld      [BusyTick], a
+    call    BusyHeartbeat
+    pop     hl
+    pop     bc
     dec     bc
     ld      a, b
     or      c
-    jr      nz, .rl
+    jr      nz, .lfcSeqLoop
+    jr      .lfcDone
 
-.done:
-    ld      c, DOS_CLOSE
+    ; -- doc_offset != 0: RDRND-per-record, manually bumping R0..R2 --
+    ; (Phase 5 hooks here once EnsureWindow-driven backward fetches
+    ; arrive. Today no caller takes this path; the code is in place
+    ; so the primitive is complete and Phase 5 doesn't touch
+    ; LoadFileChunk at all.)
+.lfcRandom:
+    ; Load 24-bit DocOffset into A:HL (high byte in A, low word in HL),
+    ; then right-shift 7 to convert byte_offset to record_index. Result
+    ; is at most 17 bits so it fits in FCB+33..35's 3-byte field.
+    ld      a, [DocOffset]
+    ld      l, a
+    ld      a, [DocOffset + 1]
+    ld      h, a
+    ld      a, [DocOffset + 2]
+    ld      b, 7
+.lfcShr7:
+    srl     a
+    rr      h
+    rr      l
+    djnz    .lfcShr7
+    ; A:HL = record_index. Spill to FCB+33..35. The Z80's
+    ; `ld [imm16], r8` is only valid for A; for L/H we route through A.
+    push    af
+    ld      a, l
+    ld      [Fcb + 33], a
+    ld      a, h
+    ld      [Fcb + 34], a
+    pop     af
+    ld      [Fcb + 35], a
+
+    ld      hl, FileBuf
+    ld      bc, FILE_BUF_SIZE / 128
+.lfcRndLoop:
+    push    bc
+    push    hl
+    ex      de, hl
+    ld      c, DOS_SETDMA
+    call    BDOS_ENTRY
+    ld      c, DOS_RDRND
     ld      de, Fcb
     call    BDOS_ENTRY
+    or      a
+    pop     hl
+    pop     bc
+    jr      nz, .lfcDone                ; EOF / error -> stop
+    ld      de, 128
+    add     hl, de
+
+    ; Bump FCB+33..35 (24-bit random-record number).
+    push    hl
+    ld      hl, Fcb + 33
+    inc     [hl]
+    jr      nz, .lfcRndBumpDone
+    inc     hl
+    inc     [hl]
+    jr      nz, .lfcRndBumpDone
+    inc     hl
+    inc     [hl]
+.lfcRndBumpDone:
+    pop     hl
+
+    dec     bc
+    ld      a, b
+    or      c
+    jr      nz, .lfcRndLoop
+
+.lfcDone:
     xor     a
     ret
 
@@ -1865,12 +4562,121 @@ LoadFile:
 
 ; ClearContentArea: white fill of content region (x=0..495, y=29..211).
 ClearContentArea:
+    ; Wiping VRAM invalidates the "image bytes still there" assumption
+    ; TagImgBody makes on in-place re-renders. Drop the flag so the
+    ; next render path actually repaints images. Fresh loads, scroll,
+    ; and history nav all call here before PrintFileContent, so this
+    ; one place covers them all.
+    xor     a
+    ld      [InPlaceRender], a
     ld      b, 0
     ld      c, CONTENT_Y0
     ld      d, (CONTENT_X_END + 1) / 4
     ld      e, CONTENT_Y1 - CONTENT_Y0 + 1
     ld      a, COL_WHITE
     jp      FillRect
+
+; EnsureWindowLocal: slide FileBuf so it covers `target_doc_offset`.
+;
+; Inputs:
+;   HL = target_doc_offset (16-bit; today's docs cap at 64 KB)
+;   FCB+0..15 still carries the file's drive/name (LoadFile leaves
+;   those untouched; ResetFcbTail only zeros 12..35).
+;
+; Outputs:
+;   FileBuf populated with up to FILE_BUF_SIZE bytes starting at
+;   round_down(target_doc_offset, 128). DocOffset / WindowLen
+;   updated by LoadFileChunk. LineCacheCount reset to 0 (the prior
+;   slot offsets pointed into bytes that no longer live in FileBuf).
+;   A = 0 on success, !=0 on FCB reopen / read failure.
+;
+; No-op fast path: if target already lives in [DocOffset,
+; DocOffset + WindowLen), return success immediately. The caller
+; (PageDown's local-slide path) gates on DocOffset+WindowLen <
+; DocSize before calling, so target == DocOffset+WindowLen always
+; means "fetch the next chunk".
+;
+; Strategy: reopen the FCB (ResetFcbTail + DOS_OPEN), drive
+; LoadFileChunk with the aligned target offset, close. The
+; per-call open/close cost is ~one BDOS hop pair plus the seek
+; setup inside LoadFileChunk; on a real floppy this is dwarfed
+; by the actual record reads.
+; Caller convention: 24-bit target stashed in `SlideTarget` (3-byte
+; RAM scratch) before the call. Keeping it in RAM avoids the stack
+; juggling that A:HL register-pair conventions would force across
+; all the BDOS calls below; the slide path is rare enough that the
+; ~6-byte cost (load/store) is invisible.
+EnsureWindowLocal:
+    push    bc
+    push    de
+    push    hl
+    push    af
+    ; Fast-path: is SlideTarget already inside [DocOffset,
+    ; DocOffset + WindowLen)? 24-bit subtract: target - DocOffset.
+    ; Sign-extend WindowLen to 24 bits (high byte = 0). We carry
+    ; the borrow into the high byte via `sbc a, c`.
+    ld      hl, [SlideTarget]            ; HL = target lo word
+    ld      bc, [DocOffset]              ; BC = DocOffset lo word
+    or      a
+    sbc     hl, bc                       ; HL = target_lo - DocOffset_lo
+    ld      a, [SlideTarget + 2]
+    ld      b, a                         ; B = target hi
+    ld      a, [DocOffset + 2]
+    ld      c, a                         ; C = DocOffset hi
+    ld      a, b
+    sbc     a, c                         ; A = target_hi - DocOffset_hi - borrow
+    jr      c, .ewlSlide                 ; target < DocOffset -> slide
+    ; A:HL = target - DocOffset (>= 0). Subtract WindowLen (16-bit).
+    ld      bc, [WindowLen]
+    or      a
+    sbc     hl, bc
+    sbc     a, 0
+    jr      c, .ewlAlreadyIn             ; (target - DocOffset) < WindowLen -> in-window
+.ewlSlide:
+    ; Align SlideTarget down to a 128-byte record boundary in place.
+    ld      a, [SlideTarget]
+    and     0x80
+    ld      [SlideTarget], a
+
+    ; Reopen FCB.
+    call    ResetFcbTail
+    ld      c, DOS_OPEN
+    ld      de, Fcb
+    call    BDOS_ENTRY
+    or      a
+    jp      nz, .ewlOpenFail
+
+    ; Slide invalidates LineCache.
+    call    LineCacheReset
+
+    ; LoadFileChunk(A:DE = SlideTarget, HL = byte_count).
+    ld      a, [SlideTarget]
+    ld      e, a
+    ld      a, [SlideTarget + 1]
+    ld      d, a
+    ld      a, [SlideTarget + 2]
+    ld      hl, FILE_BUF_SIZE
+    call    LoadFileChunk
+    push    af
+    ld      c, DOS_CLOSE
+    ld      de, Fcb
+    call    BDOS_ENTRY
+    pop     af
+
+.ewlExit:
+    pop     af
+    pop     hl
+    pop     de
+    pop     bc
+    ret
+
+.ewlAlreadyIn:
+    xor     a
+    jr      .ewlExit
+
+.ewlOpenFail:
+    or      1
+    jr      .ewlExit
 
 ; ============================================================================
 ; Step 3: HTML 2.0 parser + renderer
@@ -1892,28 +4698,58 @@ STYLE_STRIKE    equ 0x08
 STYLE_FOCUSED   equ 0x10                ; active link -> dotted underline
 
 TITLE_BUF_MAX   equ 31                  ; chars captured from <title>
-LINK_MAX        equ 8                   ; max <a> rects per rendered page
-LINK_URL_MAX    equ 32                  ; max chars per href (plus NUL)
+LINK_MAX        equ 40                  ; max <a> rects per rendered page.
+                                        ; Apache directory listings burn ~5
+                                        ; slots on column-sort headers + the
+                                        ; parent-dir link before the first
+                                        ; real entry, so a 25-row listing
+                                        ; (e.g. mirror.aratab.com/IBM SCAMP/)
+                                        ; would silently drop late rows past
+                                        ; the old cap of 24. Bumped to 40 for
+                                        ; breathing room. Each slot uses
+                                        ; (LINK_URL_MAX+1) = 256 bytes for the
+                                        ; URL plus 5 for rect data.
+LINK_URL_MAX    equ 255                 ; max chars per href (plus NUL); matches URL_MAX.
+                                        ; Stride 256 chosen so per-slot
+                                        ; offset is just (idx<<8) -- one
+                                        ; load instead of the chain of
+                                        ; add hl,hl that idx*96 needed.
 
 PrintFileContent:
-    ld      a, [FileLen]
+    ld      a, 4
+    ld      [LoadPhase], a              ; phase 4: parser entered
+  IFDEF BENCH
+    ; Bench sentinel: tools/bench_scroll.tcl watches write_io 0x2E and
+    ; logs the realtime stamp. Value 1 = render-start, 2 = render-end
+    ; (see .pfcEnd below). Watching the wall-clock delta between the
+    ; two stamps gives per-render latency without involving screen
+    ; sampling. Compiled out unless build.sh was invoked with BENCH=1.
+    ld      a, 1
+    out     (0x2E), a
+  ENDIF
+    ld      a, [WindowLen]
     ld      b, a
-    ld      a, [FileLen + 1]
+    ld      a, [WindowLen + 1]
     or      b
     ret     z
 
     ; --- Reset HTML parser state ---
+    call    FormBeginRender             ; reset parse cursor; preserve typed values when sticky
     xor     a
     ld      [HtmlInHead], a
     ld      [HtmlInTitle], a
+    ld      [HtmlSkipBody], a
+    ld      [HtmlInScript], a
     ld      [HtmlStyleFlags], a
     ld      [HtmlWsPending], a
-    ld      a, 1
+    ld      a, 2
     ld      [HtmlLineEmpty], a          ; trim leading whitespace
     xor     a
+    ld      [HtmlNoDraw], a             ; reset count-only mode
     ld      [HtmlTitleLen], a
     ld      [HtmlTitleSeen], a
-    ld      [HtmlLineCount], a
+    ld      [HtmlLineCount], a          ; 16-bit -- low byte
+    ld      [HtmlLineCount + 1], a      ; high byte
     ld      [HtmlInAnchor], a
     ld      [LinkCount], a
     ld      [LineLen], a                ; drop any cells left from previous render
@@ -1936,7 +4772,11 @@ PrintFileContent:
     call    DetectArabicInBuf
     or      a
     jr      z, .noAutoRtl
-    ld      a, 1
+    ld      a, 1                        ; HtmlDir RTL = 1 (CELL_RTL bit);
+                                         ; LineBidiReorder/Resolve mask
+                                         ; bit 0 to detect RTL, so 2
+                                         ; would silently fall through
+                                         ; to the LTR path.
     ld      [HtmlDir], a
     ld      [HtmlDefaultDir], a
     ld      [HtmlAlign], a
@@ -1958,8 +4798,8 @@ PrintFileContent:
     ld      [HtmlFgDepth], a
     ld      a, COL_BLACK
     ld      [HtmlFg], a
-    ld      a, [ScrollLine]             ; skip this many rendered lines
-    ld      [HtmlLineSkip], a
+    ld      hl, [ScrollLine]            ; skip this many rendered lines
+    ld      [HtmlLineSkip], hl
     ld      a, 1
     ld      [HtmlScaleY], a
 
@@ -1970,15 +4810,164 @@ PrintFileContent:
     ld      a, CONTENT_Y0
     ld      [TextY], a
 
-    ; HtmlEnd = FileBuf + FileLen
+    ; HtmlEnd = FileBuf + WindowLen
     ld      hl, FileBuf
-    ld      de, [FileLen]
+    ld      de, [WindowLen]
     add     hl, de
     ld      [HtmlEnd], hl
 
     ld      hl, FileBuf
 
+    ; Phase 7-fix: a slide may have aligned its target to a cached
+    ; safe boundary in the OLD window. The matching parser-state
+    ; snapshot lives at LineCacheState[slot * 8] -- LineCacheReset
+    ; only zeroed the count, the slot bytes survived. Apply the
+    ; snapshot now (after the reset block, before the parser walks
+    ; FileBuf) so persistent state -- HtmlListKind / HtmlIndent /
+    ; HtmlAlign / HtmlDir / HtmlOlCounter / HtmlFg / HtmlScaleY --
+    ; is correct at byte 0 of the new window. Without this hook the
+    ; first lines of a slid-into chunk render with the reset
+    ; defaults, breaking <ul> / <font> / <blockquote> scopes that
+    ; spanned the slide boundary.
+    ;
+    ; Consumed (cleared back to 0xFF) so a subsequent same-window
+    ; re-render (e.g. ScrollDown without slide) doesn't wrongly
+    ; restore again.
+    ld      a, [PendingRestoreSlot]
+    cp      0xFF
+    jr      z, .pfcNoRestore
+    push    hl
+    call    LineCacheRestore
+    pop     hl
+    ld      a, 0xFF
+    ld      [PendingRestoreSlot], a
+.pfcNoRestore:
+
+    ; quick_screen_draw: fast-forward via LineCache. On a scrolled
+    ; render (ScrollLine != 0), look up the cached entry whose
+    ; line_no is the largest <= ScrollLine. If found, restore
+    ; parser state from that snapshot, advance HL into FileBuf to
+    ; the cached doc_offset, charge the cached lines against
+    ; HtmlLineSkip + HtmlLineCount, and let the parser pick up from
+    ; there. Without this, every PageDown re-walks from byte 0 of
+    ; FileBuf so each subsequent page takes longer than the
+    ; previous (the "intermediate empty white view area gets
+    ; longer and longer" bug).
+    ld      a, [ScrollLine]
+    ld      b, a
+    ld      a, [ScrollLine + 1]
+    or      b
+    jr      z, .pfcNoFastFwd             ; ScrollLine == 0: nothing to skip
+    push    hl                           ; save HL = FileBuf
+    ld      hl, [ScrollLine]
+    call    LineCacheLookupLine          ; A = slot or 0xFF
+    pop     hl
+    cp      0xFF
+    jr      z, .pfcNoFastFwd
+    ; Restore parser state from the cached slot.
+    push    hl
+    call    LineCacheRestore             ; clobbers A/HL/DE
+    pop     hl
+    ; HL = FileBuf + (cached_doc_offset - DocOffset). The slot's
+    ; line_no + matching doc_offset live at LineCacheLineNo[slot] +
+    ; LineCacheDocOff[slot]; LcllBestLine + LcllBestIdx still hold
+    ; the chosen entry from LineCacheLookupLine.
+    ld      a, [LcllBestIdx]
+    ld      c, a
+    ; Read LineCacheDocOff[slot] (3 bytes) -> use only the low 16
+    ; bits relative to DocOffset's low 16 (FileBuf is < 0x10000 and
+    ; the chunk fits in WindowLen <= 0x2300, so a 16-bit subtract
+    ; covers the cache). The slide path's 24-bit case handled the
+    ; cross-chunk problem already.
+    add     a, c
+    add     a, c                         ; A = slot * 3
+    ld      e, a
+    ld      d, 0
+    ld      hl, LineCacheDocOff
+    add     hl, de
+    ld      e, [hl]                      ; E = doc_off low
+    inc     hl
+    ld      d, [hl]                      ; D = doc_off mid
+    ; HL = FileBuf + (doc_off - DocOffset)
+    ld      hl, [DocOffset]
+    push    hl
+    ex      de, hl                       ; HL = doc_off (low word)
+    pop     de                           ; DE = DocOffset (low word)
+    or      a
+    sbc     hl, de                       ; HL = doc_off - DocOffset
+    ld      de, FileBuf
+    add     hl, de                       ; HL = FileBuf + (doc_off - DocOffset)
+    ; Adjust HtmlLineSkip = ScrollLine - cached_line_no.
+    ; HtmlLineCount = cached_line_no (so the cache append on this
+    ; render's later EmitNewlines stays consistent).
+    push    hl
+    ld      hl, [LcllBestLine]
+    ld      [HtmlLineCount], hl
+    ld      de, [ScrollLine]
+    ex      de, hl                       ; HL = ScrollLine, DE = cached line
+    or      a
+    sbc     hl, de                       ; HL = ScrollLine - cached
+    ld      [HtmlLineSkip], hl
+    pop     hl
+.pfcNoFastFwd:
+
 .loop:
+    ; Mirror the parser cursor into ParserCursor so any handler that
+    ; needs to know "where am I in the document?" -- LineCache append,
+    ; TagTableTag's column-count prescan, future Phase 4 snapshots --
+    ; can read a global instead of fishing HL off the call stack.
+    ; Cost: one ld [nn], hl per byte parsed (~16 T-states), a ~5%
+    ; bump on top of the existing per-byte HtmlEnd compare.
+    ld      [ParserCursor], hl
+
+    ; Spinner heartbeat: keeps the toolbar's Refresh/X glyph rotating
+    ; (X / | / - / \) during long parses so the user can see the
+    ; program is working rather than hung. BusyHeartbeat preserves
+    ; all caller registers (so no push/pop wrap needed) and throttles
+    ; itself (acts every 256 calls, no-op the rest of the time). Cost
+    ; on the hot path is ~28 T per byte parsed (call/ret + push af /
+    ; pop af + the throttle counter); negligible compared to the
+    ; tag dispatch + glyph emit downstream.
+    call    BusyHeartbeat
+
+
+    ; Viewport-full handling. Two cases:
+    ;
+    ; * Initial pass (ScrollLine == 0): once the viewport is full we
+    ;   want HtmlLineCount to keep growing so the scroll thumb and
+    ;   PageDown clamp reflect the WHOLE rendered-line count of the
+    ;   window. Set HtmlNoDraw=1 so LineFlush stops emitting cells
+    ;   to VRAM (no off-screen TextY overdraws into the chrome) but
+    ;   the parser keeps walking + EmitNewline keeps incrementing
+    ;   the count. Drops natural-EOF cleanly.
+    ;
+    ; * Scrolled pass (ScrollLine != 0): jump to .eof immediately --
+    ;   skipping every trailing <img src=...> file-open which is
+    ;   the dominant cost on HTM pages that stack screenshots
+    ;   (WEBSITE.HTM emitted by tools/web_to_sc6.py).
+    ld      a, [HtmlLineSkip]
+    ld      b, a
+    ld      a, [HtmlLineSkip + 1]
+    or      b
+    jr      nz, .loopNotFull             ; still skipping
+    ; "Viewport full" trigger: HtmlNoDraw is set by EmitNewline as
+    ; soon as it can't advance TextY past the content area
+    ; (TEXT_LINE_H of pitch wouldn't fit). That's the actual signal
+    ; we want -- TextY is capped at CONTENT_Y1 - row_partial below
+    ; CONTENT_Y1+1, so a bare `cp CONTENT_Y1 + 1` check would never
+    ; fire for the typical 22-line viewport.
+    ld      a, [HtmlNoDraw]
+    or      a
+    jr      z, .loopNotFull              ; viewport not full yet
+    ; Viewport full -- on a scrolled render bail straight to .eof,
+    ; on the initial pass keep walking so HtmlLineCount finishes
+    ; tallying via image fast-account / EmitNewline counters.
+    ld      a, [ScrollLine]
+    ld      b, a
+    ld      a, [ScrollLine + 1]
+    or      b
+    jp      nz, .eof
+.loopNotFull:
     ; End-of-buffer check.
     push    hl
     ld      de, [HtmlEnd]
@@ -2013,11 +5002,43 @@ PrintFileContent:
 
 .eof:
     ; Drain any trailing Arabic word and pending line cells so content
-    ; that doesn't end with a block tag still reaches VRAM. Without this
-    ; the buffer would leak into the top of the next rendered page.
+    ; that doesn't end with a block tag still reaches VRAM. Always
+    ; unmask VBLANK so the keyboard ISR is back even if some Remote*
+    ; path exited with the mask on.
     call    ArFlush
     call    LineFlush
-    ret
+    call    FormEndRender               ; flip FormSticky on
+    ; If we hit .eof via the viewport-full short-circuit (parser
+    ; didn't consume the whole window), extrapolate HtmlLineCount so
+    ; the scroll thumb sizes against the full document and PageDown
+    ; isn't clamped to one viewport. Walks past the end refine the
+    ; count on subsequent renders.
+    call    ExtrapolateHtmlLineCountIfShort
+    ; quick_screen_draw: scrolled renders bail at .eof as soon as the
+    ; viewport fills (HtmlNoDraw=1 + ScrollLine != 0), leaving
+    ; HtmlLineCount at just the partial count for the visible page
+    ; (e.g. ~45 on a 484-line BENCHIM after PD1 lands). PageDown's
+    ; clamp then jams the user at "stuck at page 2". When the
+    ; document-wide accurate count is already known, restore
+    ; HtmlLineCount from the saved snapshot so PageDown sees the real
+    ; ceiling.
+    ld      a, [HtmlLineCountAccurate]
+    or      a
+    jr      z, .eofNoRestore
+    ld      hl, [HtmlLineCountSaved]
+    ld      a, h
+    or      l
+    jr      z, .eofNoRestore             ; nothing saved yet
+    ld      [HtmlLineCount], hl
+.eofNoRestore:
+    ld      a, 5
+    ld      [LoadPhase], a              ; phase 5: parser hit EOF (render done)
+  IFDEF BENCH
+    ; Bench sentinel pair: see PrintFileContent entry above.
+    ld      a, 2
+    out     (0x2E), a
+  ENDIF
+    jp      SerialUnmaskVblank
 
 .tag:
     ; Flush any pending Arabic word BEFORE the tag handler runs so that
@@ -2025,6 +5046,17 @@ PrintFileContent:
     ; and emit its trailing letters at the post-tag scale.
     push    hl
     call    ArFlush
+    pop     hl
+    ; Flush a pending whitespace BEFORE the tag handler runs. EmitText
+    ; collapses runs of whitespace into a single ' ' that gets emitted
+    ; on the next non-WS text char -- but inline-widget tags (<input>,
+    ; <select>, ...) emit cells directly via EmitSink, bypassing that
+    ; flush. Without this, "A <input checkbox>" rendered with the
+    ; trailing space silently dropped, so the label kissed the next
+    ; widget. Run the flush here so every tag boundary inherits the
+    ; same flow as a normal text char.
+    push    hl
+    call    FlushPendingWs
     pop     hl
     call    ParseTag
     jr      .loop
@@ -2040,7 +5072,7 @@ PrintFileContent:
     call    EmitText
 .entityDone:
     pop     hl
-    jr      .loop
+    jp      .loop
 
 ; ----------------------------------------------------------------------------
 ; EmitText: consume one source character (or entity result) into the output
@@ -2109,9 +5141,24 @@ EmitText:
     ld      a, [HtmlLineEmpty]
     or      a
     ret     nz
-    ld      a, 1
+    ld      a, 2
     ld      [HtmlWsPending], a
     ret
+
+; FlushPendingWs: if HtmlWsPending is set, emit one ' ' through EmitSink
+; and clear the flag. Called at the parser's tag boundary so a trailing
+; space in front of an inline widget tag (e.g. "A <input>") still lands
+; before the widget cells -- otherwise the space would only be flushed
+; on the next plain-text char, which never arrives until the widget
+; emits are already in place. Preserves no registers.
+FlushPendingWs:
+    ld      a, [HtmlWsPending]
+    or      a
+    ret     z
+    xor     a
+    ld      [HtmlWsPending], a
+    ld      a, ' '
+    jp      EmitSink
 
 ; EmitListBullet: print "* " for <ul> / "N. " for <ol>, then the caller
 ; continues with the item's own text. Consumes HtmlOlCounter for ordered
@@ -2172,6 +5219,35 @@ EmitListBullet:
 ; (via the Arabic shaper). Must preserve nothing.
 EmitSink:
     ld      b, a
+    ; <select> and <textarea> bodies: their text is part of the
+    ; widget's *value* (the option label / initial textarea
+    ; content), not flowing document text. Drop it on the floor.
+    ld      a, [HtmlSkipBody]
+    or      a
+    ld      a, b
+    ret     nz
+    ; <script> and <style> bodies: source code, not document text.
+    ld      a, [HtmlInScript]
+    or      a
+    ld      a, b
+    ret     nz
+    ; If the currently-visible <option> is streaming its label, also
+    ; mirror the char into FormValue[HtmlSelectSlot] so submit sends
+    ; the user's pick. (Widget sentinel glyphs -- the L/M/R box cells
+    ; emitted around the label -- fall in the < 0x20 range; skip them
+    ; so the value doesn't include the box chrome.)
+    ld      a, [HtmlOptCapturing]
+    or      a
+    jr      z, .esNoCapture
+    ld      a, b
+    cp      ' '
+    jr      c, .esNoCapture
+    push    af
+    push    bc
+    call    FormOptCaptureByte
+    pop     bc
+    pop     af
+.esNoCapture:
     ld      a, [HtmlInTitle]
     or      a
     jr      nz, .toTitle
@@ -2500,6 +5576,36 @@ EmitRaw:
 
     ld      b, a                        ; B = glyph
 
+    ; Inside a <table> cell, clip text at the cell's right edge
+    ; instead of wrap-to-next-row. Wrapping while in a cell sent
+    ; the overflow to the next row at HtmlIndent (column 0),
+    ; visually displacing it outside the table -- the user-reported
+    ; "text outside table" bug on benchtx's Field/Value/Note table
+    ; where the long Note text bled past the cell into the next
+    ; row's first column. Truncating means the cell shows only as
+    ; much text as fits, but never bleeds outside the column.
+    ld      a, [HtmlInTable]
+    or      a
+    jr      z, .erCanvasWrap
+    ld      hl, [CellEndX]
+    ld      a, h
+    or      l
+    jr      z, .erCanvasWrap            ; CellEndX uninitialised -> defer to canvas
+    ld      de, 6                       ; mirror the 6-px slack used canvas-wide
+    or      a
+    sbc     hl, de
+    ld      de, [TextX]
+    or      a
+    sbc     hl, de
+    jr      c, .erDrop                  ; TextX >= CellEndX - 6 -> drop char
+    jr      .posOk
+
+.erDrop:
+    pop     bc
+    pop     hl
+    ret
+
+.erCanvasWrap:
     ; Wrap check runs in both render and skip-scroll phases so the line
     ; count that backs HtmlLineSkip includes wrap breaks, not only
     ; tag-driven EmitNewlines. Without this a scroll step skips past
@@ -2514,17 +5620,13 @@ EmitRaw:
     pop     bc
 .posOk:
 
-    ; Skip phase: wrap has already been handled above; skip the buffer
-    ; append and the TextY bottom check, but keep TextX advancing so the
-    ; next wrap fires at the same X as it would during a full render.
-    ld      a, [HtmlLineSkip]
-    or      a
-    jr      z, .doAppend
-    ld      hl, [TextX]
-    ld      de, 8
-    add     hl, de
-    ld      [TextX], hl
-    jr      .done
+    ; Fall through to .doAppend regardless of HtmlLineSkip -- during
+    ; scrolled passes we still populate LineBuf so SmartWrap can
+    ; break on spaces the same way it does in a full-render pass.
+    ; LineDrawCells checks HtmlLineSkip and suppresses the actual
+    ; VRAM paint when we're still skipping, so the cells we append
+    ; here never reach the screen; they only exist long enough for
+    ; the wrap logic to match the non-scrolled render's line breaks.
 
 .doAppend:
     ; Bottom check: past canvas bottom -> advance cursor silently (no append).
@@ -2636,10 +5738,28 @@ LineFlush:
     or      a
     ret     z
 
+    ; Suppress the actual VRAM paint when:
+    ; * HtmlLineSkip > 0 (scrolled pass: skip the first N rendered
+    ;   lines so they DON'T appear on screen but their wrap math
+    ;   still happens for cache consistency).
+    ; * HtmlNoDraw != 0 (initial pass past viewport-full: keep
+    ;   walking to count remaining lines, but stop drawing so we
+    ;   don't overdraw the last visible row or wrap into the
+    ;   chrome).
+    ld      a, [HtmlLineSkip]
+    ld      b, a
+    ld      a, [HtmlLineSkip + 1]
+    or      b
+    jr      nz, .lfSkipDraw
+    ld      a, [HtmlNoDraw]
+    or      a
+    jr      nz, .lfSkipDraw
+
     call    LineResolveNeutrals
     call    LineBidiReorder
     call    LineDrawCells
 
+.lfSkipDraw:
     xor     a
     ld      [LineLen], a
     ret
@@ -3059,6 +6179,15 @@ LineDrawCells:
 .alHave:
     ld      [LineStartCol], a
 
+    ; Form widgets captured their X at tag-parse time as the raw TextX
+    ; (which tracks HtmlIndent + cellIdx*8 assuming a left-aligned
+    ; line). For centered / right-aligned paragraphs the actual first-
+    ; cell pixel is LineStartCol*4, so the captured X is off by
+    ; (LineStartCol*4 - HtmlIndent). Push that delta into every slot
+    ; whose Y matches the line we're about to paint so click hit-test
+    ; + in-place typing paint land at the visible pixels.
+    call    FormApplyLineOffset
+
     ; For RTL paragraphs the BiDi reorder drew cells in reverse visual
     ; order, but any link rects captured at parse time still hold the
     ; logical X where TextX was pointing. Mirror them now so mouse
@@ -3067,6 +6196,20 @@ LineDrawCells:
     or      a
     call    nz, FixRtlLinkRectsOnLine
 
+    ; quick_screen_draw / lesson #3: row-major fast lane.
+    ; Pre-scan the line: when every cell is plain text (default fg,
+    ; no style, no widget) and HtmlScaleY != 2, dispatch to
+    ; DrawPlainLineRowMajor which does 1 SetVramWritePos per row
+    ; (8 total) instead of 1 per cell (8 * LineLen). The slow
+    ; per-cell path below handles styled cells, widgets, scaled
+    ; glyphs, <font color> overrides, and any line that fails the
+    ; pre-scan.
+    call    IsLinePlain
+    jr      nz, .dcSlowSetup
+    call    DrawPlainLineRowMajor
+    jp      .ldcEpilogue
+
+.dcSlowSetup:
     xor     a
     ld      [LineDrawI], a
 .dLoop:
@@ -3075,8 +6218,15 @@ LineDrawCells:
     ld      a, [LineLen]
     cp      b
     jr      nz, .dDraw
-    ; Loop finished: restore HtmlStyleFlags for the parser (EmitRaw etc.)
-    ; and repoint the LUT at whatever colour HtmlFg currently names.
+    ; Loop finished. Fall through to the shared epilogue.
+.ldcEpilogue:
+    ; Run the box-connector post-pass before restoring state so any
+    ; glyphs sitting between WG_BOX_L .. WG_BOX_R cells (e.g. a
+    ; submit button's label "Search") get a continuous black top +
+    ; bottom border painted on top of them. Per-cell drawing can't
+    ; do this because the label glyphs would overpaint the M-cells'
+    ; own border rows with the font's blank top/bottom.
+    call    PaintBoxConnectors
     ld      a, [SavedStyleFlags]
     ld      [HtmlStyleFlags], a
     ld      a, [HtmlFg]
@@ -3138,7 +6288,26 @@ LineDrawCells:
     call    LGet_Glyph                  ; A = glyph
 
     push    bc
+    ; Widget sentinel cells (WG_BOX_L .. WG_RAD_ON, codes 1..7) bypass
+    ; the font lookup and paint a fixed 8x8 bitmap instead. That keeps
+    ; form widgets sharing the line-buffer slot with normal text so
+    ; wrap, alignment, and BiDi all "just work" on lines that mix both.
+    cp      WG_LAST + 1
+    jr      nc, .ldcText
+    or      a
+    jr      z, .ldcText                 ; NUL never reaches here, paranoia
+    ; Flag the line as tall so the next EmitNewline advances 16 px instead
+    ; of 8 -- widgets are 14 px and would otherwise overlap the head of
+    ; the next line's widgets by 6 px.
+    push    af
+    ld      a, 2
+    ld      [HtmlLineHasWidget], a
+    pop     af
+    call    DrawWidgetGlyph
+    jr      .ldcDrawn
+.ldcText:
     call    DrawCharFast
+.ldcDrawn:
     pop     bc
 
     ld      a, [LineDrawI]
@@ -3150,6 +6319,240 @@ LineStartCol:   db 0
 LineDrawI:      db 0
 SavedStyleFlags: db 0
 LineRightPx:    dw 0                ; pixel past the right edge of current line
+PbcI:           db 0                ; PaintBoxConnectors loop cursor
+PbcL:           db 0                ; PaintBoxConnectors L-cell index
+
+; quick_screen_draw / lesson #3.
+; IsLinePlain: returns Z (and A=0) when the current line is
+; eligible for the row-major fast lane, NZ otherwise.
+;
+; "Plain" means every cell satisfies all of:
+;   * glyph code >= WG_LAST + 1   (not a widget)
+;   * attr & ~CELL_RTL == 0       (no fg-other-than-default,
+;                                  no bold/italic/UL/focused)
+;   * the line's overall context is non-styled:
+;     - HtmlStyleFlags == 0
+;     - HtmlScaleY != 2
+;
+; The CELL_RTL bit is allowed because BiDi already reordered the
+; cells before LineDrawCells runs -- the visual byte stream is the
+; same regardless of the source dir flag, so the row-major lane
+; renders RTL lines correctly.
+;
+; Side-effect-free: preserves BC/DE/HL.
+IsLinePlain:
+    ; HtmlStyleFlags must be zero.
+    ld      a, [HtmlStyleFlags]
+    or      a
+    ret     nz
+    ; HtmlScaleY must be 1.
+    ld      a, [HtmlScaleY]
+    cp      2
+    jr      nz, .ilpScaleOk
+    or      a                            ; force NZ
+    ret
+.ilpScaleOk:
+    ; Walk LineGlyph + LineAttr in lock-step.
+    push    bc
+    push    de
+    push    hl
+    ld      a, [LineLen]
+    ld      b, a                         ; B = remaining cells
+    ld      hl, LineGlyph
+    ld      de, LineAttr
+.ilpLoop:
+    ld      a, b
+    or      a
+    jr      z, .ilpYes
+    ld      a, [hl]                      ; glyph
+    cp      WG_LAST + 1
+    jr      c, .ilpNo                    ; widget cell -> not plain
+    ld      a, [de]                      ; attr
+    and     ~CELL_RTL & 0xFF             ; mask off CELL_RTL (allowed)
+    jr      nz, .ilpNo                   ; any other bit set -> styled
+    inc     hl
+    inc     de
+    dec     b
+    jr      .ilpLoop
+.ilpYes:
+    pop     hl
+    pop     de
+    pop     bc
+    xor     a                            ; Z=1, plain line
+    ret
+.ilpNo:
+    pop     hl
+    pop     de
+    pop     bc
+    or      1                            ; Z=0, not plain
+    ret
+
+; DrawPlainLineRowMajor: emit the visible glyphs for the current
+; line using the row-major + transposed-font + bifurcated-LUT path.
+; Pre-condition: IsLinePlain returned plain. LineStartCol holds the
+; first byte-col; TextY holds the top scanline; LineLen > 0.
+;
+; Inner loop per row: 1 SetVramWritePos call, then for each cell
+; emit 2 VRAM bytes (high + low half via FastLutHi/Lo). 8 outer
+; iterations -> total VRAM addr setups = 8 vs ~8 * LineLen for the
+; per-cell path. On a 64-cell line that's 8 vs 512 SetVramWritePos
+; calls, a 64x reduction.
+DrawPlainLineRowMajor:
+    xor     a
+    ld      [DplrmRow], a
+.dplrmRowLoop:
+    ld      a, [DplrmRow]
+    cp      8
+    ret     z
+    ; Position VDP at (LineStartCol, TextY + row).
+    ld      a, [LineStartCol]
+    ld      b, a
+    ld      a, [TextY]
+    ld      c, a
+    ld      a, [DplrmRow]
+    add     a, c
+    ld      c, a
+    push    bc
+    call    SetVramWritePos
+    pop     bc
+    ; D = TransposedFontBuf row page = HIGH(TransposedFontBuf) + row.
+    ld      a, HIGH(TransposedFontBuf)
+    ld      b, a
+    ld      a, [DplrmRow]
+    add     a, b
+    ld      d, a                         ; D = row's font page
+    ; HL = LineGlyph; B = cells remaining.
+    ld      hl, LineGlyph
+    ld      a, [LineLen]
+    ld      b, a
+.dplrmCellLoop:
+    ld      a, [hl]                      ; A = glyph code
+    inc     hl
+    ld      e, a                         ; E = char_code (low byte of font ptr)
+    ld      a, [de]                      ; A = font byte for (row, char)
+    ; Bifurcated LUT lookup: H' = page, L' = font byte.
+    ; HL is the cell pointer; stash it through the alternate bank
+    ; so the LUT lookup can reuse HL with no save/restore overhead
+    ; on each iteration.
+    exx
+    ld      l, a
+    ld      h, HIGH(FastLutHi)
+    ld      a, [hl]
+    out     (VDP_DATA), a
+    inc     h                            ; H = HIGH(FastLutLo)
+    ld      a, [hl]
+    out     (VDP_DATA), a
+    exx
+    djnz    .dplrmCellLoop
+    ld      a, [DplrmRow]
+    inc     a
+    ld      [DplrmRow], a
+    jr      .dplrmRowLoop
+
+DplrmRow:       db 0                     ; row counter for the fast lane
+
+; PaintBoxConnectors: scan the just-drawn line for WG_BOX_L .. WG_BOX_R
+; pairs and paint a continuous black 1-px row at TextY (top) and TextY+7
+; (bottom) spanning the full L..R cell range. Runs after the per-cell
+; render loop so the connector pixels sit on top of any text glyphs that
+; live inside the box (a submit button's label, a select's option text,
+; etc) -- which would otherwise punch white holes through the M cells'
+; built-in border rows because MSX font glyphs leave row 0 / row 7 blank.
+PaintBoxConnectors:
+    xor     a
+    ld      [PbcI], a
+.pbcLoop:
+    ld      a, [LineLen]
+    ld      c, a
+    ld      a, [PbcI]
+    cp      c
+    ret     z
+    call    LGet_Glyph
+    cp      WG_BOX_L
+    jr      z, .pbcSawL
+    cp      WG_BOX_LF
+    jr      z, .pbcSawLF
+    ld      a, [PbcI]
+    inc     a
+    ld      [PbcI], a
+    jr      .pbcLoop
+.pbcSawLF:
+    ld      a, COL_BLACK
+    ld      [PbcColor], a
+    jr      .pbcAnchor
+.pbcSawL:
+    ld      a, COL_DGRAY
+    ld      [PbcColor], a
+.pbcAnchor:
+    ld      a, [PbcI]
+    ld      [PbcL], a
+    inc     a
+    ld      [PbcI], a
+.pbcFindR:
+    ld      a, [LineLen]
+    ld      c, a
+    ld      a, [PbcI]
+    cp      c
+    ret     z                                ; ran off the end -> stop
+    call    LGet_Glyph
+    cp      WG_BOX_R
+    jr      z, .pbcDraw
+    cp      WG_BOX_RF
+    jr      z, .pbcDraw
+    cp      WG_BOX_L
+    jr      z, .pbcSawL                      ; nested L: re-anchor
+    cp      WG_BOX_LF
+    jr      z, .pbcSawLF
+    ld      a, [PbcI]
+    inc     a
+    ld      [PbcI], a
+    jr      .pbcFindR
+.pbcDraw:
+    ; width in cells = PbcI - PbcL + 1; * 2 = byte-cols.
+    ld      a, [PbcI]
+    ld      c, a
+    ld      a, [PbcL]
+    sub     c
+    neg
+    inc     a
+    add     a, a
+    ld      d, a                             ; D = width in byte-cols
+    ld      a, [LineStartCol]
+    ld      c, a
+    ld      a, [PbcL]
+    add     a, a
+    add     a, c
+    ld      b, a                             ; B = start byte-col
+    ; Top connector: WG_Y_RAISE px above TextY. Clamp to CONTENT_Y0 so
+    ; a first-line widget doesn't paint into the chrome row.
+    ld      a, [TextY]
+    sub     WG_Y_RAISE
+    jr      nc, .pbcTopOk
+    xor     a
+.pbcTopOk:
+    cp      CONTENT_Y0
+    jr      nc, .pbcTopStore
+    ld      a, CONTENT_Y0
+.pbcTopStore:
+    ld      c, a                             ; C = top row
+    push    bc
+    push    de
+    ld      a, [PbcColor]
+    call    DrawHLine
+    pop     de
+    pop     bc
+    ; Bottom connector: matches widget bitmap row 13 -> TextY + (WG_HEIGHT
+    ; - 1 - WG_Y_RAISE) = TextY + 10.
+    ld      a, [TextY]
+    add     a, WG_HEIGHT - 1 - WG_Y_RAISE
+    ld      c, a                             ; C = bottom row
+    ld      a, [PbcColor]
+    call    DrawHLine
+    ld      a, [PbcI]
+    inc     a
+    ld      [PbcI], a
+    jp      .pbcLoop
+PbcColor:       db 0
 FxLinkI:        db 0                ; link iteration index for FixRtlLinkRectsOnLine
 FxOrigStart:    dw 0
 FxOrigEnd:      dw 0
@@ -3393,17 +6796,23 @@ EmitNewline:
     ld      [LineLastSpace], a
     pop     af
     ; Count this rendered line in units of 8-pixel rows so H1/H2 (scale 2)
-    ; contribute 2. This keeps scroll-by-page math in sync with actual VRAM
-    ; pixels -- otherwise a page of scaled headings would scroll more than
-    ; one visual page worth of content.
+    ; contribute 2. A line that contained a form widget counts as 2 rows
+    ; too, because its pitch is bumped to 16 below. This keeps scroll-by-
+    ; page math in sync with actual VRAM pixels.
     ld      a, [HtmlScaleY]
-    ld      b, a                        ; B = rows to add (1 or 2)
-    ld      a, [HtmlLineCount]
-    add     a, b
+    ld      c, a                        ; C = rows to add (1 or 2)
+    ld      a, [HtmlLineHasWidget]
+    or      a
+    jr      z, .lcNoWidgetRow
+    inc     c                           ; widget line counts as +1 extra row
+.lcNoWidgetRow:
+    ld      b, 0
+    ld      hl, [HtmlLineCount]
+    add     hl, bc
     jr      nc, .lcStore
-    ld      a, 0xFF                     ; saturate
+    ld      hl, 0xFFFF                  ; saturate at 65535
 .lcStore:
-    ld      [HtmlLineCount], a
+    ld      [HtmlLineCount], hl
 
     ; Start of new line: reset TextX to the current indent.
     ld      a, [HtmlIndent]
@@ -3412,36 +6821,641 @@ EmitNewline:
     ld      [TextX + 1], a
 
     ; If we're still skipping, decrement by the line's row count and stay
-    ; pinned at the top-of-canvas.
-    ld      a, [HtmlLineSkip]
-    or      a
+    ; pinned at the top-of-canvas. BC is still (0, rows-to-add) from the
+    ; HtmlLineCount increment above.
+    ld      hl, [HtmlLineSkip]
+    ld      a, h
+    or      l
     jr      z, .advance
-    sub     b
+    and     a
+    sbc     hl, bc
     jr      nc, .skStore
-    xor     a                           ; don't underflow past 0
+    ld      hl, 0                       ; don't underflow past 0
 .skStore:
-    ld      [HtmlLineSkip], a
+    ld      [HtmlLineSkip], hl
     jr      .flagsDone
 
 .advance:
-    ; Row pitch depends on current HtmlScaleY (1 or 2).
+    ; Row pitch depends on current HtmlScaleY (1 or 2). A line that
+    ; carried a widget bumps pitch by an extra 8 px so the widget's
+    ; 3-px footroom clears the next line's 3-px headroom.
     ld      a, [HtmlScaleY]
     add     a, a                        ; A = scale*2
     add     a, a                        ; A = scale*4
     add     a, a                        ; A = scale*8 = pitch
     ld      b, a
+    ld      a, [HtmlLineHasWidget]
+    or      a
+    jr      z, .advNoWidget
+    ld      a, b
+    add     a, 8
+    ld      b, a
+.advNoWidget:
     ld      a, [TextY]
     add     a, b                        ; A = proposed new TextY
-    jr      c, .flagsDone               ; wrapped past 255 -> page full
+    jr      c, .flagsCantFit            ; wrapped past 255 -> page full
     cp      CONTENT_Y1 + 1
-    jr      nc, .flagsDone              ; new line wouldn't fit -> stop
+    jr      nc, .flagsCantFit           ; new line wouldn't fit -> stop
     ld      [TextY], a
+    jr      .flagsDone
+
+.flagsCantFit:
+    ; quick_screen_draw / lesson #4: the proposed new TextY would
+    ; overflow the content area, so we couldn't advance. Set
+    ; HtmlNoDraw so subsequent renders (LineFlush, image fast-
+    ; account in RenderSc6File / RenderPcxFile) know to stop
+    ; emitting pixels but keep counting lines for HtmlLineCount.
+    ld      a, 1
+    ld      [HtmlNoDraw], a
 
 .flagsDone:
-    ld      a, 1
+    ld      a, 2
     ld      [HtmlLineEmpty], a
     xor     a
     ld      [HtmlWsPending], a
+    ld      [HtmlLineHasWidget], a      ; consume: next line starts clean
+    call    LineCacheMaybeAppend
+    ret
+
+; LineCacheMaybeAppend: append (HtmlLineCount, current_doc_offset) to
+; LineCache if the conditions are right:
+;   - HtmlLineSkip == 0 (we're on the initial-render pass, not a
+;     scrolled re-render that would corrupt the cache with offsets
+;     into a partial window).
+;   - LineCacheCount < LineCacheMax (cache has a free slot).
+;
+; Phase 3 keeps the predicate this loose -- one entry per rendered
+; line until the cache is full. Phase 4 will tighten it into a real
+; "safe state" predicate (no open Arabic word, no in-table mid-row,
+; no in-pre, etc.) and snapshot the parser state alongside the
+; offset so Phase 5's EnsureWindow can resume rendering from the
+; cached point without replay artefacts.
+;
+; current_doc_offset = DocOffset + (ParserCursor - FileBuf), where
+; ParserCursor is the parser's read pointer kept fresh by
+; PrintFileContent's main loop. With DocOffset == 0 today the offset
+; is just (ParserCursor - FileBuf), but the addition is wired so
+; Phase 5's slide doesn't need to revisit this site.
+LineCacheMaybeAppend:
+    ld      a, [HtmlLineSkip]
+    ld      b, a
+    ld      a, [HtmlLineSkip + 1]
+    or      b
+    ret     nz                          ; scrolled render -> skip
+    ; Even when HtmlLineSkip drained to 0 mid-render (e.g. after a
+    ; fast-forward cache hit on a PageDown), don't append more
+    ; entries -- the cache snapshot from the initial pass is what
+    ; subsequent PageUp/PageDown queries against, and ring-evicting
+    ; old entries here would slowly delete the entries needed to
+    ; PageUp back into earlier parts of the doc. ScrollLine != 0 at
+    ; render entry is the test for "this is a scrolled render".
+    ld      a, [ScrollLine]
+    ld      b, a
+    ld      a, [ScrollLine + 1]
+    or      b
+    ret     nz                          ; scrolled render -> don't pollute cache
+    call    IsLineCacheStateSafe
+    ret     nz                          ; unsafe scope open -> skip
+    ; Stride sampling. We don't want to cache EVERY safe line --
+    ; for a 100-line doc that would ring-evict the early entries
+    ; before the user PageDowns to them, leaving the cache full of
+    ; only the latest lines. Instead, only append when HtmlLineCount
+    ; has advanced by AT LEAST LineCacheStride lines since the last
+    ; append. When the cache fills, double the stride and decimate
+    ; (drop every other entry, compacting). Net effect: cache stays
+    ; evenly spread across the full doc with ~LineCacheMax entries,
+    ; regardless of doc length.
+    ld      hl, [HtmlLineCount]
+    ld      de, [LineCacheLastLine]
+    or      a
+    sbc     hl, de                       ; HL = HtmlLineCount - LastLine
+    ld      a, [LineCacheStride]
+    ld      e, a
+    ld      d, 0                         ; DE = stride
+    or      a
+    sbc     hl, de                       ; HL = (HtmlLineCount - LastLine) - stride
+    ret     c                            ; gap < stride -> skip
+    push    hl
+    push    de
+    push    bc
+    ld      a, [LineCacheCount]
+    cp      LineCacheMax
+    jr      c, .lcmaPartial
+    ; Cache full: double stride, decimate (compact every other slot
+    ; into the lower half), then proceed to append at the freed
+    ; slot.
+    ld      a, [LineCacheStride]
+    add     a, a
+    ld      [LineCacheStride], a
+    call    LineCacheDecimate
+.lcmaPartial:
+    ld      a, [LineCacheCount]
+    ld      c, a                         ; C = slot index = current count
+    inc     a
+    ld      [LineCacheCount], a
+.lcmaWrite:
+    ; Save slot index for snapshot + doc_offset index recomputation.
+    ld      a, c
+    ld      [LineCacheWriteSlot], a
+    ; ── Slot 1: line_no -> LineCacheLineNo[slot] (16-bit / 2-byte stride) ──
+    sla     c                            ; C = slot * 2
+    ld      b, 0
+    ld      hl, LineCacheLineNo
+    add     hl, bc
+    ld      de, [HtmlLineCount]
+    ld      [hl], e
+    inc     hl
+    ld      [hl], d
+    ; ── Slot 2: doc_offset (24-bit / 3-byte stride) ──
+    ; doc_offset = (ParserCursor - FileBuf) + DocOffset
+    ld      hl, [ParserCursor]
+    ld      de, FileBuf
+    or      a
+    sbc     hl, de                       ; HL = window-relative offset (16-bit)
+    ; Add DocOffset (24-bit): low word into HL with carry, high byte
+    ; into A.
+    ld      de, [DocOffset]
+    add     hl, de
+    ld      a, [DocOffset + 2]
+    adc     a, 0                         ; A = doc_offset high byte
+    ; Compute slot*3 byte index, point HL at slot's 3-byte cell.
+    push    af                           ; preserve high byte
+    ld      a, [LineCacheWriteSlot]
+    ld      c, a
+    add     a, c
+    add     a, c                         ; A = slot * 3
+    ld      e, a
+    ld      d, 0
+    ; Save the just-computed lo word before we trash HL.
+    ld      b, h
+    ld      c, l                         ; BC = doc_offset low word
+    ld      hl, LineCacheDocOff
+    add     hl, de                       ; HL = &slot.doc_offset
+    ld      [hl], c                      ; lo
+    inc     hl
+    ld      [hl], b                      ; mid
+    inc     hl
+    pop     af
+    ld      [hl], a                      ; hi
+    ; Record the line_no of this append so the next stride check
+    ; knows where to start counting from.
+    ld      hl, [HtmlLineCount]
+    ld      [LineCacheLastLine], hl
+    ; ── Slot 3: parser state snapshot ──
+    pop     bc
+    pop     de
+    pop     hl
+    jp      LineCacheSnapshot            ; tail-call
+
+; LineCacheDecimate: keep slots at even indices (0, 2, 4, ..., 30),
+; compacting them into slots 0..15. Halves LineCacheCount. Called by
+; LineCacheMaybeAppend just after stride doubles, so the cache stays
+; evenly spread across the doc as more lines arrive.
+LineCacheDecimate:
+    push    af
+    push    bc
+    push    de
+    push    hl
+    ; ── LineCacheLineNo: 2 bytes/slot. Compact slots 1..15 from
+    ;     even-indexed source slots (slot 2, 4, ..., 30). Slot 0
+    ;     stays put.
+    ld      hl, LineCacheLineNo + 4      ; src = slot 2 byte 0
+    ld      de, LineCacheLineNo + 2      ; dst = slot 1 byte 0
+    ld      b, LineCacheMax / 2 - 1      ; 15 dst slots
+.lcdLine:
+    ld      a, [hl]
+    ld      [de], a
+    inc     hl
+    inc     de
+    ld      a, [hl]
+    ld      [de], a
+    inc     hl
+    inc     de
+    ; HL now points to the odd slot's byte 0. Skip 2 bytes to land
+    ; on the next even slot. DE is correct (next dst slot byte 0).
+    inc     hl
+    inc     hl
+    djnz    .lcdLine
+    ; ── LineCacheDocOff: 3 bytes/slot.
+    ld      hl, LineCacheDocOff + 6      ; src = slot 2 byte 0
+    ld      de, LineCacheDocOff + 3      ; dst = slot 1 byte 0
+    ld      b, LineCacheMax / 2 - 1
+.lcdOff:
+    ld      a, [hl]
+    ld      [de], a
+    inc     hl
+    inc     de
+    ld      a, [hl]
+    ld      [de], a
+    inc     hl
+    inc     de
+    ld      a, [hl]
+    ld      [de], a
+    inc     hl
+    inc     de
+    ; Skip the odd slot's 3 bytes.
+    inc     hl
+    inc     hl
+    inc     hl
+    djnz    .lcdOff
+    ; ── LineCacheState: LineCacheStateSz bytes/slot.
+    ld      hl, LineCacheState + 2 * LineCacheStateSz
+    ld      de, LineCacheState + LineCacheStateSz
+    ld      b, LineCacheMax / 2 - 1
+.lcdState:
+    push    bc
+    ld      bc, LineCacheStateSz
+    ldir                                  ; copy stateSz bytes; HL+=sz, DE+=sz
+    ld      bc, LineCacheStateSz
+    add     hl, bc                        ; skip the odd slot
+    pop     bc
+    djnz    .lcdState
+    ; New count = LineCacheMax / 2 = 16.
+    ld      a, LineCacheMax / 2
+    ld      [LineCacheCount], a
+    pop     hl
+    pop     de
+    pop     bc
+    pop     af
+    ret
+
+; IsLineCacheStateSafe: returns Z (with A=0) when the parser's "open
+; scopes" are all at default values, NZ otherwise. Safe scope means
+; LineCacheRestore can rebuild every parser variable from the 8-byte
+; snapshot alone -- without any line-buffer replay or attribute fix-up.
+;
+; The cheap-out test sequence collapses 8 byte-equality checks into a
+; single OR pile. We OR the deltas together; A == 0 at the end means
+; every variable matched its default. Two of the variables don't have
+; "0" as default: HtmlScaleY default is 1 (subtract 1 first) and
+; HtmlFormFocus default is 0xFF (invert first). Other variables
+; default to zero / closed.
+;
+; Clobbers A, B; preserves HL/DE/BC/IX/IY.
+IsLineCacheStateSafe:
+    push    bc
+    ld      a, [HtmlInTable]
+    ld      b, a
+    ld      a, [HtmlInScript]
+    or      b
+    ld      b, a
+    ld      a, [HtmlFgDepth]
+    or      b
+    ld      b, a
+    ld      a, [HtmlCurHrefLen]
+    or      b
+    ld      b, a
+    ld      a, [HtmlStyleFlags]
+    or      b
+    ld      b, a
+    ld      a, [HtmlLiPending]
+    or      b
+    ld      b, a
+    ld      a, [PlainTextMode]
+    or      b
+    ld      b, a
+    ld      a, [HtmlScaleY]
+    dec     a                           ; default 1 -> 0
+    or      b
+    ld      b, a
+    ld      a, [HtmlFormFocus]
+    cpl                                  ; default 0xFF -> 0
+    or      b
+    pop     bc
+    ret
+
+; LineCacheSnapshot: pack the live parser state into LineCacheState +
+; LineCacheCount * 8. Caller must have ensured the slot index is in
+; range and IsLineCacheStateSafe just returned Z. Bumping the count
+; is the caller's job (LineCacheMaybeAppend).
+;
+; Slot bytes (must match LineCacheRestore):
+;   +0 HtmlScaleY  +1 HtmlListKind   +2 HtmlOlCounter +3 HtmlIndent
+;   +4 HtmlAlign   +5 HtmlDir        +6 HtmlFg
+;   +7 packed: bits 0..1 = HtmlDefaultAlign, bit 2 = HtmlDefaultDir
+;
+; Clobbers A, HL, DE.
+LineCacheSnapshot:
+    push    bc
+    ld      a, [LineCacheWriteSlot]
+    ; index = slot * 8 = slot << 3
+    add     a, a
+    add     a, a
+    add     a, a
+    ld      e, a
+    ld      d, 0
+    ld      hl, LineCacheState
+    add     hl, de                      ; HL -> slot base
+    ld      a, [HtmlScaleY]
+    ld      [hl], a
+    inc     hl
+    ld      a, [HtmlListKind]
+    ld      [hl], a
+    inc     hl
+    ld      a, [HtmlOlCounter]
+    ld      [hl], a
+    inc     hl
+    ld      a, [HtmlIndent]
+    ld      [hl], a
+    inc     hl
+    ld      a, [HtmlAlign]
+    ld      [hl], a
+    inc     hl
+    ld      a, [HtmlDir]
+    ld      [hl], a
+    inc     hl
+    ld      a, [HtmlFg]
+    ld      [hl], a
+    inc     hl
+    ; Byte 7: pack HtmlDefaultAlign (low 2 bits) + HtmlDefaultDir
+    ; (bit 2) so ResetBlockAttrs after a LineCacheRestore-driven
+    ; fast-forward gets back to the right document-level alignment
+    ; instead of falling back to 0 (LTR/left). Without this, every
+    ; PageDown into a doc whose <html dir="rtl"> sits before the
+    ; cached entry loses RTL alignment as soon as the parser hits
+    ; the next block close.
+    ld      a, [HtmlDefaultDir]
+    add     a, a
+    add     a, a                        ; bit 2 = DefaultDir
+    ld      c, a
+    ld      a, [HtmlDefaultAlign]
+    and     0x03
+    or      c
+    ld      [hl], a
+    pop     bc
+    ret
+
+; LineCacheRestore: read slot A's snapshot back into the parser
+; globals. A = slot index (0..LineCacheCount-1); caller must
+; range-check. Phase 5's EnsureWindow is the first caller; today this
+; routine is reachable only from a future patch, so it has no live
+; site yet but is built and assembled to pin down the layout
+; alongside Snapshot.
+;
+; Clobbers A, HL, DE.
+LineCacheRestore:
+    push    bc
+    add     a, a
+    add     a, a
+    add     a, a
+    ld      e, a
+    ld      d, 0
+    ld      hl, LineCacheState
+    add     hl, de                      ; HL -> slot base
+    ld      a, [hl]
+    ld      [HtmlScaleY], a
+    inc     hl
+    ld      a, [hl]
+    ld      [HtmlListKind], a
+    inc     hl
+    ld      a, [hl]
+    ld      [HtmlOlCounter], a
+    inc     hl
+    ld      a, [hl]
+    ld      [HtmlIndent], a
+    inc     hl
+    ld      a, [hl]
+    ld      [HtmlAlign], a
+    inc     hl
+    ld      a, [hl]
+    ld      [HtmlDir], a
+    inc     hl
+    ld      a, [hl]
+    ld      [HtmlFg], a
+    inc     hl
+    ; Byte 7: unpack HtmlDefaultAlign (low 2 bits) + HtmlDefaultDir
+    ; (bit 2). Pair with the packing logic in LineCacheSnapshot.
+    ld      a, [hl]
+    ld      b, a
+    and     0x03
+    ld      [HtmlDefaultAlign], a
+    ld      a, b
+    rrca
+    rrca                                ; bit 2 -> bit 0
+    and     0x01
+    ld      [HtmlDefaultDir], a
+    pop     bc
+    ret
+
+; LineCacheReset: empty the cache. Called by LoadFile / RemoteLoadFile
+; on every fresh document load -- prior offsets refer to bytes that
+; have been overwritten in FileBuf and would point into the wrong
+; document if we tried to use them post-load. We leave the byte
+; arrays uncleared (LineCacheCount gates reads) so the reset is two
+; instructions: zero count and head together.
+LineCacheReset:
+    xor     a
+    ld      [LineCacheCount], a
+    ld      [LineCacheHead], a
+    ld      [LineCacheLastLine], a
+    ld      [LineCacheLastLine + 1], a
+    ld      [PrerenderValid], a          ; new doc -> back-page prerender stale
+    ld      a, 1
+    ld      [LineCacheStride], a
+    ret
+
+; Cmp24: 24-bit unsigned compare of two values stored at [HL] and [DE]
+; (lo / mid / hi byte order). Returns CF=1 iff [HL] < [DE], CF=0
+; otherwise; Z=1 iff the values are equal. HL and DE are preserved.
+; Clobbers A, B.
+Cmp24:
+    push    hl
+    push    de
+    ld      a, [de]
+    ld      b, a
+    ld      a, [hl]
+    sub     b                            ; HL_lo - DE_lo
+    inc     hl
+    inc     de
+    ld      a, [de]
+    ld      b, a
+    ld      a, [hl]
+    sbc     a, b                         ; HL_mid - DE_mid - borrow
+    inc     hl
+    inc     de
+    ld      a, [de]
+    ld      b, a
+    ld      a, [hl]
+    sbc     a, b                         ; HL_hi - DE_hi - borrow
+    pop     de
+    pop     hl
+    ret
+
+; LineCacheLookupLine: find the cached slot whose stored line_no is
+; the largest one not exceeding the target line. Mirror of
+; LineCacheLookupOffset but indexed on LineCacheLineNo (2 bytes per
+; slot) instead of LineCacheDocOff (3 bytes per slot).
+;
+; Input:  HL = target line number (caller's ScrollLine).
+; Output: A = slot index (0..LineCacheCount-1) of the qualifying
+;             entry, or 0xFF if no slot has line_no <= target.
+;             LcllBestIdx + LcllBestLine left at the chosen values.
+;
+; Phase-3 LineCache populates one entry per rendered line on the
+; initial pass (until the ring fills, then evicts oldest), so on
+; a typical PageDown into a freshly-walked doc we land on either
+; an exact match or one line shy of the target. Either way the
+; subsequent parser walks at most ~1 cell rather than re-walking
+; the full prefix from byte 0.
+LineCacheLookupLine:
+    push    de
+    push    bc
+    push    hl                            ; preserve target
+    ld      [LcllTarget], hl              ; stash target for inner compares
+    ld      a, 0xFF
+    ld      [LcllBestIdx], a
+    ld      hl, 0
+    ld      [LcllBestLine], hl
+    ld      a, [LineCacheCount]
+    or      a
+    jr      z, .lcllDone
+    ld      b, a                          ; B = remaining slots
+    ld      c, 0                          ; C = current slot index
+.lcllIter:
+    ; HL = LineCacheLineNo + slot * 2
+    ld      a, c
+    add     a, c                          ; slot * 2 (LineCacheMax = 32, fits in A)
+    ld      e, a
+    ld      d, 0
+    ld      hl, LineCacheLineNo
+    add     hl, de
+    ; DE = slot.line_no
+    ld      a, [hl]
+    ld      e, a
+    inc     hl
+    ld      a, [hl]
+    ld      d, a
+    ; slot.line_no <= target ?
+    ld      hl, [LcllTarget]
+    or      a
+    sbc     hl, de                        ; HL = target - slot.line_no
+    jr      c, .lcllNext                  ; slot > target -> skip
+    ; slot <= target. Update best iff slot > best.
+    ld      hl, [LcllBestLine]
+    or      a
+    sbc     hl, de                        ; HL = best - slot
+    jr      nc, .lcllNext                 ; best >= slot -> skip
+    ; slot > best: record.
+    ld      a, c
+    ld      [LcllBestIdx], a
+    ld      [LcllBestLine], de
+.lcllNext:
+    inc     c
+    djnz    .lcllIter
+.lcllDone:
+    ld      a, [LcllBestIdx]
+    pop     hl
+    pop     bc
+    pop     de
+    ret
+
+; LineCacheLookupOffset: find the cached slot whose stored doc_offset
+; is the largest one not exceeding the target stashed in SlideTarget
+; (24-bit). Returns A = slot index (0..LineCacheCount-1), or 0xFF if
+; no slot qualifies.
+;
+; Uses LcloBestOff / LcloBestIdx as scratch. Caller saves HL/DE/BC.
+;
+; Walks every populated slot once -- LineCacheMax = 32 so the linear
+; scan finishes in <~1000 T-states (24-bit compare is more expensive
+; than 16-bit, but called rarely, once per slide).
+LineCacheLookupOffset:
+    push    hl
+    push    de
+    push    bc
+    ld      a, 0xFF
+    ld      [LcloBestIdx], a
+    xor     a
+    ld      [LcloBestOff], a
+    ld      [LcloBestOff + 1], a
+    ld      [LcloBestOff + 2], a
+    ld      a, [LineCacheCount]
+    or      a
+    jr      z, .lcloDone
+    ld      b, a                         ; B = remaining slots
+    ld      c, 0                         ; C = current slot index
+.lcloIter:
+    ; HL = LineCacheDocOff + slot * 3
+    ld      a, c
+    add     a, c
+    add     a, c                         ; A = slot * 3 (slots <= 32)
+    ld      e, a
+    ld      d, 0
+    ld      hl, LineCacheDocOff
+    add     hl, de                       ; HL = &slot.doc_offset
+    ; slot <= target ?
+    push    hl
+    ld      de, SlideTarget
+    call    Cmp24                        ; CF=1 -> slot<target; Z -> equal
+    pop     hl
+    jr      c, .lcloVsBest
+    jr      nz, .lcloNext                ; slot > target -> skip
+.lcloVsBest:
+    ; slot <= target. Update best iff slot > best.
+    push    hl
+    ld      de, LcloBestOff
+    call    Cmp24                        ; CF -> slot<best; Z -> equal
+    pop     hl
+    jr      c, .lcloNext                 ; slot < best -> skip
+    jr      z, .lcloNext                 ; slot == best -> skip
+    ; slot > best: copy slot's 3 bytes into LcloBestOff and remember
+    ; the slot index.
+    ld      a, c
+    ld      [LcloBestIdx], a
+    push    bc
+    ld      de, LcloBestOff
+    ld      bc, 3
+    ldir
+    pop     bc
+.lcloNext:
+    inc     c
+    djnz    .lcloIter
+.lcloDone:
+    ld      a, [LcloBestIdx]
+    pop     bc
+    pop     de
+    pop     hl
+    ret
+
+; SlideAlignTarget: cache-align the slide target stored in SlideTarget
+; to a cached safe boundary at or before it, so the post-slide render
+; can pick up parser state from the matching snapshot. If no cached
+; entry qualifies, SlideTarget is left unchanged and
+; PendingRestoreSlot becomes 0xFF (the pre-cache-aligned path:
+; default state at the boundary).
+;
+; In:  SlideTarget pre-set (24-bit).
+; Out: SlideTarget = entry.doc_offset on cache hit (else unchanged).
+;      PendingRestoreSlot = slot index or 0xFF.
+SlideAlignTarget:
+    push    de
+    push    bc
+    push    hl
+    call    LineCacheLookupOffset
+    cp      0xFF
+    jr      z, .satNoCache
+    ld      [PendingRestoreSlot], a
+    ; Copy LineCacheDocOff[slot] (3 bytes) into SlideTarget.
+    ld      c, a
+    add     a, c
+    add     a, c                         ; A = slot * 3
+    ld      e, a
+    ld      d, 0
+    ld      hl, LineCacheDocOff
+    add     hl, de
+    ld      de, SlideTarget
+    ld      bc, 3
+    ldir
+    pop     hl
+    pop     bc
+    pop     de
+    ret
+.satNoCache:
+    ld      a, 0xFF
+    ld      [PendingRestoreSlot], a
+    pop     hl
+    pop     bc
+    pop     de
     ret
 
 ; EmitBlankLine: ensure we're at start of a line and leave one blank line
@@ -3476,16 +7490,19 @@ EmitHalfLineGap:
     ; Bookkeeping: treat this gap as one 8-px row for scroll math. When
     ; a scrolled pass is still skipping, burn a skip count instead of
     ; advancing TextY (pin-to-top behaviour matches EmitNewline).
-    ld      a, [HtmlLineCount]
-    inc     a
+    ld      hl, [HtmlLineCount]
+    inc     hl
+    ld      a, h
+    or      l
     jr      z, .hgSat                   ; saturate at 0xFF
-    ld      [HtmlLineCount], a
+    ld      [HtmlLineCount], hl
 .hgSat:
-    ld      a, [HtmlLineSkip]
-    or      a
+    ld      hl, [HtmlLineSkip]
+    ld      a, h
+    or      l
     jr      z, .hgAdvance
-    dec     a
-    ld      [HtmlLineSkip], a
+    dec     hl
+    ld      [HtmlLineSkip], hl
     ret
 .hgAdvance:
     ld      a, [TextY]
@@ -3531,12 +7548,12 @@ ParseTag:
     cp      '/'
     jr      nz, .nameStart
     inc     hl
-    ld      a, 1
+    ld      a, 2
     ld      [HtmlIsClose], a
 
 .nameStart:
     ld      de, HtmlTagName
-    ld      b, 7
+    ld      b, 11                       ; HtmlTagName ds 12 -> 11 chars + NUL
 .copyName:
     ld      a, [hl]
     ; Stop at whitespace or '>'.
@@ -3592,14 +7609,20 @@ ParseTag:
 .attrsDone:
 
     ; DispatchTag clobbers HL to walk the tag table; preserve the source
-    ; pointer so PrintFileContent resumes at the right byte.
+    ; pointer so PrintFileContent resumes at the right byte. Also expose
+    ; the post-tag cursor via ParserCursor so handlers that need to
+    ; prescan FileBuf (TagTableTag's first-row column count) don't have
+    ; to fish HL off the stack.
+    ld      [ParserCursor], hl
     push    hl
     call    DispatchTag
     pop     hl
     ret
 
 ; TagNeedsAttrScan: returns A=1 if the current HtmlTagName is "A", "IMG",
-; or "FONT"; A=0 otherwise. Clobbers HL, DE, BC.
+; "FONT", "INPUT", or "ISINDEX" (the tags whose attribute values feed
+; HtmlCurHref / HtmlInputType / HtmlImg* and therefore need ScanHrefAttr
+; before the tag handler runs). A=0 otherwise. Clobbers HL, DE, BC.
 TagNeedsAttrScan:
     ld      hl, HtmlTagName
     ld      a, [hl]
@@ -3611,6 +7634,18 @@ TagNeedsAttrScan:
     ld      de, TnFONT
     call    TnCompare
     ret     nz
+    ld      de, TnINPUT
+    call    TnCompare
+    ret     nz
+    ld      de, TnISINDEX
+    call    TnCompare
+    ret     nz
+    ld      de, TnSELECT
+    call    TnCompare
+    ret     nz
+    ld      de, TnFORM
+    call    TnCompare
+    ret     nz
     xor     a
     ret
 
@@ -3619,7 +7654,7 @@ TagNeedsAttrScan:
     ld      a, [hl]
     or      a
     jr      nz, .tn_no                  ; "A<X>..." not lone "A"
-    ld      a, 1
+    ld      a, 2
     ret
 .tn_no:
     xor     a
@@ -3644,7 +7679,7 @@ TnCompare:
     ld      a, [de]
     or      a
     jr      nz, .tc_miss
-    ld      a, 1
+    ld      a, 2
     or      a
     ret
 .tc_miss:
@@ -3653,6 +7688,10 @@ TnCompare:
 
 TnIMG:  db "IMG", 0
 TnFONT: db "FONT", 0
+TnINPUT: db "INPUT", 0
+TnISINDEX: db "ISINDEX", 0
+TnSELECT: db "SELECT", 0
+TnFORM:  db "FORM", 0
 
 ; ScanBlockAttrs: walks HL from first char after the tag name through '>',
 ; looking for align=<value> and dir=<value> (case-insensitive). Parses
@@ -3663,6 +7702,8 @@ ScanBlockAttrs:
     ld      a, 0xFF
     ld      [HtmlNextAlign], a
     ld      [HtmlNextDir], a
+    xor     a
+    ld      [HtmlNextBorder], a         ; default: no <table> border
 .sba_loop:
     ld      a, [hl]
     cp      '>'
@@ -3674,6 +7715,8 @@ ScanBlockAttrs:
     jr      z, .sba_tryA
     cp      'D'
     jr      z, .sba_tryD
+    cp      'B'
+    jp      z, .sba_tryB
     inc     hl
     jp      .sba_loop
 
@@ -3723,7 +7766,7 @@ ScanBlockAttrs:
     xor     a
     jr      .sba_aStore
 .sba_aR:
-    ld      a, 1
+    ld      a, 2
     jr      .sba_aStore
 .sba_aC:
     ld      a, 2
@@ -3767,13 +7810,85 @@ ScanBlockAttrs:
     xor     a                           ; anything else -> LTR
     jr      .sba_dStore
 .sba_dR:
-    ld      a, 1
+    ld      a, 1                        ; HtmlDir RTL = 1 (CELL_RTL bit);
+                                         ; see comment in PrintFileContent
+                                         ; auto-RTL setter for the same
+                                         ; "1 not 2" rule.
 .sba_dStore:
     ld      [HtmlNextDir], a
     pop     af
     inc     hl
     jp      .sba_loop
 .sba_missD:
+    pop     hl
+    inc     hl
+    jp      .sba_loop
+
+.sba_tryB:
+    ; Match BORDER on <table> (HTML 2.0). Forms accepted:
+    ;   <table border>           -> on
+    ;   <table border=N>         -> on iff N!=0
+    ;   <table border="N">       -> on iff N!=0
+    push    hl
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'O'
+    jp      nz, .sba_missB
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'R'
+    jp      nz, .sba_missB
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'D'
+    jp      nz, .sba_missB
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'E'
+    jp      nz, .sba_missB
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'R'
+    jp      nz, .sba_missB
+    inc     hl
+    ld      a, [hl]
+    cp      '='
+    jr      z, .sba_bEq
+    ; Bare `border` attribute -> treat as border=1.
+    ld      a, 2
+    ld      [HtmlNextBorder], a
+    pop     af
+    jp      .sba_loop
+.sba_bEq:
+    inc     hl
+    ld      a, [hl]
+    cp      0x22                        ; "
+    jr      nz, .sba_bVal
+    inc     hl
+.sba_bVal:
+    ld      a, [hl]
+    cp      '0'
+    jr      z, .sba_bOff
+    ; First digit non-zero -> border on. Anything else (e.g. nothing, '"',
+    ; '>', whitespace) we also treat as on -- minor lie that matches
+    ; legacy browsers' "any value means yes" behaviour for this attr.
+    ld      a, 2
+    ld      [HtmlNextBorder], a
+    pop     af
+    inc     hl
+    jp      .sba_loop
+.sba_bOff:
+    xor     a
+    ld      [HtmlNextBorder], a
+    pop     af
+    inc     hl
+    jp      .sba_loop
+.sba_missB:
     pop     hl
     inc     hl
     jp      .sba_loop
@@ -3789,6 +7904,18 @@ ScanHrefAttr:
     ld      [HtmlCurHref], a            ; default = empty string
     ld      [HtmlCurSrcPtr], a
     ld      [HtmlCurSrcPtr + 1], a      ; SRC pointer starts NULL
+    ld      [HtmlImgWidth], a
+    ld      [HtmlImgWidth + 1], a       ; 0 = unset (no explicit size)
+    ld      [HtmlImgHeight], a
+    ld      [HtmlImgHeight + 1], a
+    ; <input> defaults to type=text when no TYPE= attribute is given.
+    ld      a, 'T'
+    ld      [HtmlInputType], a
+    ld      a, 'X'
+    ld      [HtmlInputType + 1], a
+    xor     a
+    ld      [HtmlChecked], a                ; CHECKED defaults to false
+    ld      [HtmlNameAttr], a               ; NAME defaults to empty
 .sh_scan:
     ld      a, [hl]
     cp      '>'
@@ -3812,6 +7939,22 @@ ScanHrefAttr:
     jp      z, .sh_trySrc
     cp      'S'
     jp      z, .sh_trySrc
+    cp      'w'
+    jp      z, .sh_tryWidth
+    cp      'W'
+    jp      z, .sh_tryWidth
+    cp      'v'
+    jp      z, .sh_tryValue
+    cp      'V'
+    jp      z, .sh_tryValue
+    cp      't'
+    jp      z, .sh_tryType
+    cp      'T'
+    jp      z, .sh_tryType
+    cp      'n'
+    jp      z, .sh_tryName
+    cp      'N'
+    jp      z, .sh_tryName
     inc     hl
     jp      .sh_scan
 
@@ -3870,84 +8013,680 @@ ScanHrefAttr:
     jp      .sh_scan
 
 .sh_tryHref:
+    ; H starts both HREF (<a>) and HEIGHT (<img>). Try HREF first;
+    ; on any mismatch roll HL back and retry as HEIGHT before giving up.
     push    hl
     inc     hl
     ld      a, [hl]
     and     0xDF
     cp      'R'
-    jr      nz, .sh_noMatch
+    jp      nz, .sh_tryHeight
     inc     hl
     ld      a, [hl]
     and     0xDF
     cp      'E'
-    jr      nz, .sh_noMatch
+    jp      nz, .sh_tryHeight
     inc     hl
     ld      a, [hl]
     and     0xDF
     cp      'F'
-    jr      nz, .sh_noMatch
+    jp      nz, .sh_tryHeight
     inc     hl
     ld      a, [hl]
     cp      '='
-    jr      nz, .sh_noMatch
+    jp      nz, .sh_tryHeight
     inc     hl
     pop     bc
-    jr      .sh_readValue
+    jp      .sh_readValue
 
-.sh_tryAlt:
+.sh_tryHeight:
+    ; HL was pushed at .sh_tryHref entry; restore it and rescan from
+    ; the H for an "EIGHT=" match. DE = HtmlImgHeight (the 16-bit
+    ; target for .sh_readNumber).
+    pop     hl
     push    hl
     inc     hl
     ld      a, [hl]
     and     0xDF
-    cp      'L'
-    jr      nz, .sh_noMatch
+    cp      'E'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'I'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'G'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'H'
+    jp      nz, .sh_noMatch
     inc     hl
     ld      a, [hl]
     and     0xDF
     cp      'T'
-    jr      nz, .sh_noMatch
+    jp      nz, .sh_noMatch
     inc     hl
     ld      a, [hl]
     cp      '='
-    jr      nz, .sh_noMatch
+    jp      nz, .sh_noMatch
     inc     hl
     pop     bc
-    jr      .sh_readValue
+    ld      de, HtmlImgHeight
+    jp      .sh_readNumber
+
+.sh_tryWidth:
+    push    hl
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'I'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'D'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'T'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'H'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    cp      '='
+    jp      nz, .sh_noMatch
+    inc     hl
+    pop     bc
+    ld      de, HtmlImgWidth
+    ; fall through to .sh_readNumber
+
+; .sh_readNumber: DE -> 16-bit target, HL at first char of value. Parses
+; a (optionally-quoted) decimal integer, stores it at [DE], then
+; rejoins the main scan so sibling attributes (e.g. ALT=) still get
+; captured. Stops at the first non-digit. Quoted values skip the
+; remaining chars up to the closing quote; bare values stop at
+; whitespace / '>' / '/'.
+.sh_readNumber:
+    ld      b, 0                        ; B = active delimiter (0 = bare)
+    ld      a, [hl]
+    cp      0x22
+    jr      z, .sh_rnQuot
+    cp      0x27
+    jr      z, .sh_rnQuot
+    jr      .sh_rnDigit
+.sh_rnQuot:
+    ld      b, a
+    inc     hl
+.sh_rnDigit:
+    ld      a, [hl]
+    sub     '0'
+    cp      10
+    jr      nc, .sh_rnDone              ; non-digit -> stop
+    ld      c, a                        ; C = digit
+    push    hl
+    push    bc                          ; preserve digit (C) + delim (B)
+    ld      a, [de]
+    ld      l, a
+    inc     de
+    ld      a, [de]
+    ld      h, a
+    dec     de                          ; HL = current value at [DE]
+    add     hl, hl                      ; *2
+    ld      b, h
+    ld      c, l                        ; BC = *2 (scratch, clobbers digit)
+    add     hl, hl                      ; *4
+    add     hl, hl                      ; *8
+    add     hl, bc                      ; *10
+    pop     bc                          ; restore digit in C
+    ld      a, l
+    add     a, c                        ; + digit
+    ld      l, a
+    ld      a, h
+    adc     a, 0
+    ld      h, a
+    ld      a, l
+    ld      [de], a
+    inc     de
+    ld      a, h
+    ld      [de], a
+    dec     de                          ; [DE] := new value
+    pop     hl
+    inc     hl
+    jr      .sh_rnDigit
+.sh_rnDone:
+    ; Skip to next attribute boundary: ws / quote / '>'. Then rejoin
+    ; .sh_scan so HREF= / ALT= / COLOR= on the same tag still get
+    ; captured (width/height don't replace those).
+    ld      a, [hl]
+    cp      '>'
+    jp      z, .sh_scan
+    or      a
+    jp      z, .sh_scan                 ; safety: end-of-buffer
+    ld      c, a
+    ld      a, b
+    or      a
+    jr      z, .sh_rnBareEnd
+    ld      a, c
+    cp      b
+    jr      nz, .sh_rnSkipOne
+    inc     hl                          ; consume closing quote
+    jp      .sh_scan
+.sh_rnBareEnd:
+    ld      a, c
+    cp      ' '
+    jp      z, .sh_scan
+    cp      0x09
+    jp      z, .sh_scan
+.sh_rnSkipOne:
+    inc     hl
+    jr      .sh_rnDone
+
+; VALUE= shares the HtmlCurHref slot with HREF/ALT/COLOR (no tag uses
+; more than one of these at a time -- forms use VALUE; <a> uses HREF;
+; <img> uses ALT; <font> uses COLOR).
+.sh_tryValue:
+    push    hl
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'A'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'L'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'U'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'E'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    cp      '='
+    jp      nz, .sh_noMatch
+    inc     hl
+    pop     bc
+    jp      .sh_readValue
+
+; TYPE= captures the first two letters of the value (uppercased) into
+; HtmlInputType so TagInput's dispatcher can branch on them. The full
+; value isn't kept -- HTML 2 input types are all distinguishable from
+; one or two leading letters ('TE'xt, 'PA'ssword, 'SU'bmit, 'CH'eckbox,
+; 'RA'dio, 'RE'set, 'HI'dden, 'IM'age, 'BU'tton).
+.sh_tryType:
+    push    hl
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'Y'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'P'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'E'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    cp      '='
+    jp      nz, .sh_noMatch
+    inc     hl
+    pop     bc
+
+    ; Optional opening quote.
+    ld      b, 0
+    ld      a, [hl]
+    cp      0x22
+    jr      z, .sh_typeQuoted
+    cp      0x27
+    jr      z, .sh_typeQuoted
+    jr      .sh_typeReadChars
+.sh_typeQuoted:
+    ld      b, a
+    inc     hl
+.sh_typeReadChars:
+    ld      a, [hl]
+    and     0xDF
+    ld      [HtmlInputType], a
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    ld      [HtmlInputType + 1], a
+    ; Skip remaining chars of the value up to the next attribute boundary.
+.sh_typeTail:
+    ld      a, [hl]
+    or      a
+    jp      z, .sh_scan
+    cp      '>'
+    jp      z, .sh_scan
+    ld      a, b
+    or      a
+    jr      z, .sh_typeBareEnd
+    ld      a, [hl]
+    cp      b
+    jr      nz, .sh_typeSkip
+    inc     hl
+    jp      .sh_scan
+.sh_typeBareEnd:
+    ld      a, [hl]
+    cp      ' '
+    jp      z, .sh_scan
+    cp      0x09
+    jp      z, .sh_scan
+.sh_typeSkip:
+    inc     hl
+    jr      .sh_typeTail
+
+; NAME= parser. Captures up to FORM_NAME_MAX bytes into HtmlNameAttr.
+; Used by TagInput to label a form slot for the eventual submit query
+; string ("name=value&...").
+.sh_tryName:
+    push    hl
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'A'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'M'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'E'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    cp      '='
+    jp      nz, .sh_noMatch
+    inc     hl
+    pop     bc
+    ; Optional opening quote.
+    ld      b, 0
+    ld      a, [hl]
+    cp      0x22
+    jr      z, .sh_nameQuoted
+    cp      0x27
+    jr      z, .sh_nameQuoted
+    jr      .sh_nameRead
+.sh_nameQuoted:
+    ld      b, a
+    inc     hl
+.sh_nameRead:
+    ld      de, HtmlNameAttr
+    ld      c, FORM_NAME_MAX
+.sh_nameLoop:
+    ld      a, [hl]
+    or      a
+    jr      z, .sh_nameDone
+    cp      '>'
+    jr      z, .sh_nameDone
+    ld      a, b
+    or      a
+    jr      z, .sh_nameBareEnd
+    ld      a, [hl]
+    cp      b
+    jr      z, .sh_nameAfterQuote
+    jr      .sh_nameStore
+.sh_nameBareEnd:
+    ld      a, [hl]
+    cp      ' '
+    jr      z, .sh_nameDone
+    cp      0x09
+    jr      z, .sh_nameDone
+    cp      '/'
+    jr      z, .sh_nameDone
+.sh_nameStore:
+    ld      a, c
+    or      a
+    jr      z, .sh_nameSkip                  ; buffer full -> drop char
+    ld      a, [hl]
+    ld      [de], a
+    inc     de
+    dec     c
+.sh_nameSkip:
+    inc     hl
+    jr      .sh_nameLoop
+.sh_nameAfterQuote:
+    inc     hl                               ; consume closing quote
+.sh_nameDone:
+    xor     a
+    ld      [de], a                          ; NUL-terminate
+    jp      .sh_scan
+
+.sh_tryAlt:
+    ; 'A' starts ALT (<img>) and ACTION (<form>). Dispatch on the second
+    ; letter: L -> ALT, C -> ACTION. Everything else misses.
+    push    hl
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'L'
+    jp      z, .sh_altRest
+    cp      'C'
+    jp      z, .sh_tryAction
+    jp      .sh_noMatch
+.sh_altRest:
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'T'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    cp      '='
+    jp      nz, .sh_noMatch
+    inc     hl
+    pop     bc
+    jp      .sh_readValue
+
+.sh_tryAction:
+    ; Already consumed 'A' + 'C'; need "TION=". ACTION values land in
+    ; HtmlCurHref (same slot as HREF/ALT/etc -- no tag uses both) and
+    ; TagForm copies from there into the persistent HtmlFormAction
+    ; buffer before the next tag's scan clobbers HtmlCurHref.
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'T'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'I'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'O'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'N'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    cp      '='
+    jp      nz, .sh_noMatch
+    inc     hl
+    pop     bc
+    jp      .sh_readValue
 
 .sh_tryColor:
+    ; C starts COLOR (<font>), COORDS (<area>), and CHECKED (<input>).
+    ; Branch on the second letter: 'O' -> COLOR / COORDS chain (third
+    ; letter disambiguates), 'H' -> CHECKED. Anything else -> miss.
+    push    hl
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'H'
+    jp      z, .sh_tryChecked
+    cp      'O'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'L'
+    jp      nz, .sh_tryCoords
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'O'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'R'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    cp      '='
+    jp      nz, .sh_noMatch
+    inc     hl
+    pop     bc
+    jp      .sh_readValue
+
+.sh_tryChecked:
+    ; CHECKED is a value-less HTML 2 attribute on <input type="checkbox">
+    ; and <input type="radio">. Match the literal "HECKED" continuation
+    ; (we already consumed C+H above). On match, set HtmlChecked = 1.
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'E'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'C'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'K'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'E'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'D'
+    jp      nz, .sh_noMatch
+    inc     hl
+    pop     bc
+    ld      a, 2
+    ld      [HtmlChecked], a
+    ; Skip an optional ="..." value -- HTML allows `checked`, `checked=""`,
+    ; `checked="checked"`, etc. The presence of the attribute is what
+    ; matters; we just walk forward to the next attribute boundary.
+    ld      a, [hl]
+    cp      '='
+    jp      nz, .sh_scan                    ; bare attribute -> next
+    inc     hl
+    ld      a, [hl]
+    cp      0x22
+    jr      z, .sh_chkQuoted
+    cp      0x27
+    jr      z, .sh_chkQuoted
+.sh_chkBare:
+    ld      a, [hl]
+    or      a
+    jp      z, .sh_scan
+    cp      '>'
+    jp      z, .sh_scan
+    cp      ' '
+    jp      z, .sh_scan
+    cp      0x09
+    jp      z, .sh_scan
+    inc     hl
+    jr      .sh_chkBare
+.sh_chkQuoted:
+    ld      b, a
+    inc     hl
+.sh_chkQuotedLoop:
+    ld      a, [hl]
+    or      a
+    jp      z, .sh_scan
+    cp      b
+    jr      nz, .sh_chkQuotedNext
+    inc     hl
+    jp      .sh_scan
+.sh_chkQuotedNext:
+    inc     hl
+    jr      .sh_chkQuotedLoop
+
+.sh_tryCoords:
+    ; HL was restored to start-of-attribute by the COLOR path's first
+    ; push, then advanced through 'C','O' before the 3rd-letter check
+    ; failed. Pop back to the original push, re-inc, and rescan for
+    ; "OORDS=" so the overall parse matches "COORDS=".
+    pop     hl
     push    hl
     inc     hl
     ld      a, [hl]
     and     0xDF
     cp      'O'
-    jr      nz, .sh_noMatch
-    inc     hl
-    ld      a, [hl]
-    and     0xDF
-    cp      'L'
-    jr      nz, .sh_noMatch
+    jp      nz, .sh_noMatch
     inc     hl
     ld      a, [hl]
     and     0xDF
     cp      'O'
-    jr      nz, .sh_noMatch
+    jp      nz, .sh_noMatch
     inc     hl
     ld      a, [hl]
     and     0xDF
     cp      'R'
-    jr      nz, .sh_noMatch
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'D'
+    jp      nz, .sh_noMatch
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'S'
+    jp      nz, .sh_noMatch
     inc     hl
     ld      a, [hl]
     cp      '='
-    jr      nz, .sh_noMatch
+    jp      nz, .sh_noMatch
     inc     hl
     pop     bc
-    jr      .sh_readValue
+    jp      .sh_readCoords
 
 .sh_noMatch:
     pop     hl
     inc     hl
     jp      .sh_scan
+
+; .sh_readCoords: HL at first char of a `coords="x1,y1,x2,y2"` value.
+; Parses four comma-separated decimal integers and stores them into
+; AreaCoords[0..3]. Rejoins .sh_scan when done.
+.sh_readCoords:
+    ld      a, [hl]
+    cp      0x22
+    jr      z, .sh_rcQuot
+    cp      0x27
+    jr      z, .sh_rcQuot
+    jr      .sh_rcPos0
+.sh_rcQuot:
+    inc     hl
+.sh_rcPos0:
+    ld      de, AreaCoords
+    call    .sh_rcOne
+    call    .sh_rcSkipComma
+    call    .sh_rcOne
+    call    .sh_rcSkipComma
+    call    .sh_rcOne
+    call    .sh_rcSkipComma
+    call    .sh_rcOne
+    ; Skip remaining junk (closing quote, whitespace) up to next attr.
+.sh_rcTail:
+    ld      a, [hl]
+    cp      '>'
+    jp      z, .sh_scan
+    or      a
+    jp      z, .sh_scan
+    cp      ' '
+    jp      z, .sh_scan
+    cp      0x09
+    jp      z, .sh_scan
+    inc     hl
+    jr      .sh_rcTail
+
+.sh_rcSkipComma:
+    ; Advance HL past the next ',' . Non-comma chars are skipped too so
+    ; "100 , 200" still parses.
+    ld      a, [hl]
+    cp      ','
+    jr      z, .sh_rcSkipOne
+    or      a
+    ret     z
+    cp      '>'
+    ret     z
+    inc     hl
+    jr      .sh_rcSkipComma
+.sh_rcSkipOne:
+    inc     hl
+    ret
+
+.sh_rcOne:
+    ; Read one decimal integer into [DE], advance DE by 2, HL at
+    ; first non-digit.
+    push    de
+    xor     a
+    ld      [de], a
+    inc     de
+    ld      [de], a
+    pop     de                          ; DE = target 16-bit slot
+.sh_rcDigit:
+    ld      a, [hl]
+    sub     '0'
+    cp      10
+    jr      nc, .sh_rcOneDone
+    ld      c, a
+    push    hl
+    push    bc
+    ld      a, [de]
+    ld      l, a
+    inc     de
+    ld      a, [de]
+    ld      h, a
+    dec     de
+    add     hl, hl
+    ld      b, h
+    ld      c, l
+    add     hl, hl
+    add     hl, hl
+    add     hl, bc
+    pop     bc
+    ld      a, l
+    add     a, c
+    ld      l, a
+    ld      a, h
+    adc     a, 0
+    ld      h, a
+    ld      a, l
+    ld      [de], a
+    inc     de
+    ld      a, h
+    ld      [de], a
+    dec     de
+    pop     hl
+    inc     hl
+    jr      .sh_rcDigit
+.sh_rcOneDone:
+    inc     de
+    inc     de                          ; advance DE to next slot
+    ret
 
 .sh_readValue:
     ld      a, [hl]
@@ -4000,13 +8739,13 @@ ScanHrefAttr:
 .sh_doneValueNoInc:
     xor     a
     ld      [de], a                     ; NUL-terminate
-    ; Skip remaining attrs to '>'.
-.sh_tailSkip:
-    ld      a, [hl]
-    inc     hl
-    cp      '>'
-    jr      nz, .sh_tailSkip
-    ret
+    ; Hand control back to the main attribute scan so any sibling
+    ; attributes (CHECKED, ALT, COLOR, ...) on the same tag still get
+    ; processed. The previous "skip-to-'>'" behaviour was harmless for
+    ; <a href> / <font color> (those tags rarely carry meaningful
+    ; siblings) but caused <input value="..." checked> to silently
+    ; lose the CHECKED flag.
+    jp      .sh_scan
 
 .sh_consumeEnd:
     inc     hl                          ; skip '>'
@@ -4101,12 +8840,33 @@ TagHead:
     ld      a, [HtmlIsClose]
     or      a
     jr      nz, .close
-    ld      a, 1
+    ld      a, 2
     ld      [HtmlInHead], a
     ret
 .close:
     xor     a
     ld      [HtmlInHead], a
+    ret
+
+; <script> / <style>: the body is JS or CSS source, not flowing
+; document text. Toggle HtmlInScript so EmitSink drops every byte
+; until the matching close tag fires. The two share a handler -- the
+; behaviour is identical and neither carries renderable attributes.
+; Browsers normally treat <script> body as raw text (tag parsing is
+; suspended until </script>); we don't bother because JS/CSS rarely
+; contains literal '<' outside string literals, and the few that
+; appear get parsed as unknown tags and dropped harmlessly.
+TagScript:
+TagStyle:
+    ld      a, [HtmlIsClose]
+    or      a
+    jr      nz, .tssClose
+    ld      a, 2
+    ld      [HtmlInScript], a
+    ret
+.tssClose:
+    xor     a
+    ld      [HtmlInScript], a
     ret
 
 ; <body> and <html>: both carry a document-level dir/align that every
@@ -4139,7 +8899,7 @@ ApplyDocAttrs:
     ld      a, [HtmlNextAlign]
     cp      0xFF
     jr      nz, .dadAlign
-    ld      a, 1
+    ld      a, 2
     ld      [HtmlDefaultAlign], a
     ld      [HtmlAlign], a
 .dadAlign:
@@ -4154,13 +8914,13 @@ TagTitle:
     ld      a, [HtmlIsClose]
     or      a
     jr      nz, .close
-    ld      a, 1
+    ld      a, 2
     ld      [HtmlInTitle], a
     ret
 .close:
     xor     a
     ld      [HtmlInTitle], a
-    ; NUL-terminate captured title and repaint the titlebar.
+    ; NUL-terminate captured title.
     ld      a, [HtmlTitleLen]
     ld      e, a
     ld      d, 0
@@ -4168,8 +8928,15 @@ TagTitle:
     add     hl, de
     xor     a
     ld      [hl], a
-    ld      a, 1
+    ld      a, 2
     ld      [HtmlTitleSeen], a
+    ; Re-render of the same page (FormSticky=1) doesn't change the
+    ; title, so skip the chrome repaint -- the previous DrawTitleLabel
+    ; call's pixels are still on screen, and re-drawing them on every
+    ; keystroke produced a visible flash.
+    ld      a, [FormSticky]
+    or      a
+    ret     nz
     jp      DrawTitleLabel
 
 ; <ul>: bullet list. Open indents by 16 px and switches bullet style.
@@ -4179,7 +8946,7 @@ TagUl:
     or      a
     jr      nz, .close
     call    EmitBlankLine
-    ld      a, 1
+    ld      a, 2
     ld      [HtmlListKind], a
     ld      a, [HtmlIndent]
     add     a, 16
@@ -4222,9 +8989,47 @@ TagLi:
     or      a
     ret     nz
     call    EmitNewline
-    ld      a, 1
+    ld      a, 2
     ld      [HtmlLiPending], a
     ret
+
+; <dl>: definition-list block. HTML 2.0 (RFC 1866 11.5). Just a blank
+; line above and below; the inner <dt>/<dd> children do the actual
+; layout, similar to <ul>/<li>.
+TagDl:
+    ld      a, [HtmlIsClose]
+    or      a
+    jp      z, EmitBlankLine
+    jp      EmitBlankLine
+
+; <dt>: definition term. Renders flush-left on its own line, no extra
+; indent. </dt> is optional in HTML 2.0; we just close any pending
+; line so the next text starts cleanly.
+TagDt:
+    ld      a, [HtmlIsClose]
+    or      a
+    ret     nz
+    jp      EnsureLineStart
+
+; <dd>: definition description. Render on a new line indented one
+; tab-stop (16 px, same as <ul> child indent) for the body of the
+; definition. </dd> snaps the indent back. The indent has to be
+; bumped BEFORE EmitNewline -- EmitNewline snaps TextX to the
+; current HtmlIndent for the new line, so adding +16 afterwards
+; would only take effect on the line AFTER this one.
+TagDd:
+    ld      a, [HtmlIsClose]
+    or      a
+    jr      nz, .close
+    ld      a, [HtmlIndent]
+    add     a, 16
+    ld      [HtmlIndent], a
+    jp      EmitNewline
+.close:
+    ld      a, [HtmlIndent]
+    sub     16
+    ld      [HtmlIndent], a
+    jp      EnsureLineStart
 
 ; <pre>: preformatted block. Whitespace is preserved verbatim; LF drives a
 ; real newline in EmitText. Blank line above/below.
@@ -4233,7 +9038,7 @@ TagPre:
     or      a
     jr      nz, .close
     call    EmitBlankLine
-    ld      a, 1
+    ld      a, 2
     ld      [HtmlPre], a
     ret
 .close:
@@ -4262,7 +9067,62 @@ TagBlockquote:
 ;   data:msx;base64,...     -- inline 2 bpp Screen-6 payload (img_encode.py)
 ;   *.sc6                   -- native Screen-6 BSAVE file on disk
 ; Self-closing; no matching close tag needed.
+; TagImg is a thin wrapper: capture img-origin TextY (so <map>/<area>
+; rects for this image can be translated to screen coords on success),
+; run the dispatch body, then convert any pending area rects into
+; clickable LinkTable entries before returning.
 TagImg:
+    ld      a, [TextY]
+    ld      [HtmlImgOriginY], a
+    ; Global "Show images" toggle (Help popup checkbox). When OFF, skip
+    ; the fetch + render entirely and fall through to the alt-text /
+    ; placeholder path. This applies to BOTH local-disk images and
+    ; bridge-served imNN.pcx handles, since the user may have a slow
+    ; connection or just want a text-only view.
+    ld      a, [ShowImages]
+    or      a
+    jr      nz, .tiRender
+    call    TagImgAltOnly
+    jp      AttachPendingAreas
+.tiRender:
+    call    TagImgBody
+    jp      AttachPendingAreas          ; tail call -> RET
+
+; TagImgAltOnly: a thin wrapper that runs only the placeholder/alt-text
+; branch from TagImgBody. Centralises the entry so the ShowImages=0
+; gate above and any future "image render failed" path can share it.
+TagImgAltOnly:
+    ld      hl, [HtmlCurSrcPtr]
+    ; Force the .altFallback path inside TagImgBody by jumping past
+    ; the data-uri / extension dispatch. .altFallback already handles
+    ; both "missing image with declared dimensions" (RenderMissingImgBox)
+    ; and "fall through to [alt] text" cases.
+    jp      TagImgBody.altFallback
+
+TagImgBody:
+    ; In-place re-render (Tab focus change, keystroke widget repaint):
+    ; VRAM wasn't cleared, so the image bytes are still where the first
+    ; render left them. Skip the fetch/decode and just reserve the
+    ; same layout rectangle so TextY / HtmlLineCount / ScrollLine land
+    ; where they did before. RefreshAfterScroll clears InPlaceRender
+    ; first because ClearContentArea wipes the image -- we need a real
+    ; repaint in that case. Requires width+height on the tag, which the
+    ; bridge always rewrites into imNN.pcx handles for us.
+    ld      a, [InPlaceRender]
+    or      a
+    jr      z, .tibFresh
+    ld      a, [HtmlImgWidth]
+    ld      b, a
+    ld      a, [HtmlImgWidth + 1]
+    or      b
+    jr      z, .tibFresh
+    ld      a, [HtmlImgHeight]
+    ld      b, a
+    ld      a, [HtmlImgHeight + 1]
+    or      b
+    jr      z, .tibFresh
+    jp      ReserveImgLayout
+.tibFresh:
     ld      hl, [HtmlCurSrcPtr]
     ld      a, h
     or      l
@@ -4328,8 +9188,24 @@ TagImg:
     ret     c
 
     ; No supported format or file couldn't be opened -> placeholder.
+    ; If the tag carried both width=X and height=Y, reserve an empty
+    ; bordered rectangle of that size so the surrounding layout stays
+    ; stable. Otherwise fall through to the text "[alt]" placeholder.
 
 .altFallback:
+    ld      a, [HtmlImgWidth]
+    ld      b, a
+    ld      a, [HtmlImgWidth + 1]
+    or      b
+    jp      z, .altText
+    ld      a, [HtmlImgHeight]
+    ld      b, a
+    ld      a, [HtmlImgHeight + 1]
+    or      b
+    jp      z, .altText
+    jp      RenderMissingImgBox
+
+.altText:
     ld      a, '['
     call    EmitSink
     ld      a, [HtmlCurHref]
@@ -4355,6 +9231,105 @@ TagImg:
 TagImgWord:      db "img", 0
 DataMsxPrefix:   db "data:msx;base64,"
 ExtSc6:          db ".sc6", 0
+
+; <map>: groups <area> rects that belong to the <img usemap="#name">
+; that follows. We don't track the name -- our use case is the
+; web_to_sc6 capture pipeline which emits exactly one map block per
+; image and in the same order. <map> open just resets the pending
+; areas so we don't accumulate stale data across images.
+TagMap:
+    ld      a, [HtmlIsClose]
+    or      a
+    ret     nz                          ; </map> is a no-op
+    xor     a
+    ld      [PendingAreaCount], a
+    ret
+
+; <area shape="rect" coords="x1,y1,x2,y2" href="...">: pushes one
+; hotspot entry into the pending table. Coords are already in
+; AreaCoords after ScanHrefAttr, href is in HtmlCurHref.
+TagArea:
+    ld      a, [HtmlIsClose]
+    or      a
+    ret     nz
+    ld      a, [PendingAreaCount]
+    cp      MAP_AREA_MAX
+    ret     nc                          ; table full -> drop
+    ld      e, a
+    ld      d, 0
+
+    ; X1 (16-bit)
+    ld      hl, PendingAreaX1
+    add     hl, de
+    add     hl, de
+    ld      a, [AreaCoords]
+    ld      [hl], a
+    inc     hl
+    ld      a, [AreaCoords + 1]
+    ld      [hl], a
+
+    ; X2 (16-bit)
+    ld      hl, PendingAreaX2
+    add     hl, de
+    add     hl, de
+    ld      a, [AreaCoords + 4]
+    ld      [hl], a
+    inc     hl
+    ld      a, [AreaCoords + 5]
+    ld      [hl], a
+
+    ; Y1 / Y2 (8-bit each -- our viewport is 183 rows).
+    ld      hl, PendingAreaY1
+    add     hl, de
+    ld      a, [AreaCoords + 2]
+    ld      [hl], a
+    ld      hl, PendingAreaY2
+    add     hl, de
+    ld      a, [AreaCoords + 6]
+    ld      [hl], a
+
+    ; Copy href into the slot's url buffer. Offset = index * (L+1)
+    ; = idx * 256 (LINK_URL_MAX = 255). Matches .apSlotOff below.
+    ld      a, [PendingAreaCount]
+    ld      h, a
+    ld      l, 0                        ; HL = idx * 256
+    ld      de, PendingAreaUrl
+    add     hl, de
+    ex      de, hl                      ; DE = dest
+    ld      hl, HtmlCurHref
+    ld      b, low(LINK_URL_MAX + 1)
+.taCopy:
+    ld      a, [hl]
+    ld      [de], a
+    inc     hl
+    inc     de
+    or      a
+    jr      z, .taDone
+    djnz    .taCopy
+.taDone:
+    ld      a, [PendingAreaCount]
+    inc     a
+    ld      [PendingAreaCount], a
+    ret
+
+; AttachPendingAreas: turn every pending <area> into a LinkTable
+; entry, anchored at the image's on-screen origin (x = HtmlIndent,
+; y = HtmlImgOriginY captured at TagImg entry). Called unconditionally
+; from TagImg's tail: if PendingAreaCount = 0 it's a no-op, which is
+; the normal case for <img>s that aren't image-maps.
+;
+; Currently a stub: the <map> / <area> / <img usemap> PARSING works
+; end-to-end (verified via PendingAreaCount > 0 after an <area> tag),
+; but the attach step had a state-corruption bug that inflated
+; LinkCount across page loads. The conversion loop was removed
+; while we work on a clean rewrite; <area> rects are captured by
+; the parser and silently dropped here so pages still render
+; cleanly. Re-add when the LinkCount bug is diagnosed.
+AttachPendingAreas:
+    xor     a
+    ld      [PendingAreaCount], a
+    ret
+
 ExtPcx:          db ".pcx", 0
 ExtBmp:          db ".bmp", 0
 
@@ -4426,6 +9401,9 @@ MatchImgExt:
 ; ImgStreamOpen must have done the DOS_OPEN; ImgStreamClose must close.
 
 ImgStreamRefill:
+    ld      a, [IsRemoteSession]
+    or      a
+    jp      nz, RemoteImgRefill
     ; Nothing left to read?
     ld      a, [ImgBytesLeft]
     ld      b, a
@@ -4497,8 +9475,12 @@ ImgStreamRefill:
     scf
     ret
 
-; ImgStreamByte: returns A = next byte, CF=1 on EOF.
+; ImgStreamByte: returns A = next byte, CF=1 on EOF. Remote session
+; pulls from the UART instead of the FCB.
 ImgStreamByte:
+    ld      a, [IsRemoteSession]
+    or      a
+    jp      nz, RemoteImgByte
     ld      a, [ImgReadLen]
     or      a
     jr      z, .isbRefill
@@ -4515,8 +9497,12 @@ ImgStreamByte:
     ret     c
     jr      ImgStreamByte
 
-; ImgStreamClose: close the file that ImgStreamOpen opened.
+; ImgStreamClose: close the file that ImgStreamOpen opened. Remote
+; session just drains any leftover body bytes from the bridge.
 ImgStreamClose:
+    ld      a, [IsRemoteSession]
+    or      a
+    jp      nz, RemoteImgClose
     ld      c, DOS_CLOSE
     ld      de, Fcb
     jp      BDOS_ENTRY
@@ -4525,6 +9511,9 @@ ImgStreamClose:
 ; the FCB and opens. Returns CF=0 on success and leaves ImgReadLen=0 so
 ; the first ImgStreamByte call triggers an initial refill.
 ImgStreamOpenName:
+    ld      a, [IsRemoteSession]
+    or      a
+    jp      nz, RemoteImgOpen
     call    BuildFcbFromHL
     call    ResetFcbTail                ; record / position / random-read slots
     ld      c, DOS_OPEN
@@ -4565,9 +9554,99 @@ RenderSc6File:
     call    ImgStreamOpenName
     jp      c, .rsfOpenFail             ; file not found -> let caller fallback
 
-    ; File is open -- now it's safe to end the current text line.
+    ; Lesson #2: blank the display for the duration of the bulk
+    ; pixel transfer so the V9938 arbiter doesn't steal VRAM cycles.
+    ; All exit paths below jump to .rsfDone or .rsfNoTy -- both are
+    ; routed through the .rsfFinish epilogue that re-enables the
+    ; display. (.rsfOpenFail can't reach here.)
+    call    VdpBlank
+
+    ; Commit any pending text line now so both the fast-path and the
+    ; streaming decoder start at a clean Y cursor. LineFlush is also
+    ; what deducts the line's height from HtmlLineSkip on scrolled
+    ; pages, so the fast-path that follows sees a consistent count.
     call    ArFlush
     call    LineFlush
+
+    ; Measure the image's height from the FCB size snapshot so we can
+    ; decide whether to stream any pixel bytes at all. SC6 on disk is
+    ; a 7-byte BLOAD header plus pixel_rows * 128 bytes; every file we
+    ; accept sits well under 64 KB, so the low word of ImgBytesLeft
+    ; carries the full size.
+    ld      hl, [ImgBytesLeft]
+    ld      de, 7
+    and     a
+    sbc     hl, de                      ; HL = pixel-byte count
+    jr      c, .rsfHeader               ; truncated -> let the slow path bail
+    ld      b, 7                        ; HL >>= 7  (each row is 128 bytes)
+.rsfShr7:
+    srl     h
+    rr      l
+    djnz    .rsfShr7
+    ld      a, h
+    or      a
+    jr      nz, .rsfHeader              ; rows > 255 -> clamp via slow path
+    ld      a, l
+    or      a
+    jr      z, .rsfHeader               ; empty image -> slow path (alt fallback)
+    add     a, 7
+    jr      c, .rsfHeader               ; ceil((>248)/8) wraps -> slow path
+    srl     a
+    srl     a
+    srl     a                           ; A = ceil(pixel_rows / 8) = image lines
+    ld      c, a                        ; C = image lines (<= 255, fits a byte)
+
+    ; Case A: scrolled render, image entirely above the fold. Deduct
+    ; C lines from HtmlLineSkip and close -- no pixel bytes streamed.
+    ld      hl, [HtmlLineSkip]
+    ld      a, h
+    or      l
+    jr      z, .rsfCheckBelow           ; not scrolling -> try case B
+    ld      e, c
+    ld      d, 0
+    and     a
+    sbc     hl, de                      ; HL = HtmlLineSkip - image_lines
+    jr      c, .rsfHeader               ; straddles fold -> slow path
+    ld      [HtmlLineSkip], hl
+    jr      .rsfFastAccount
+
+    ; Case B: initial / already-scrolled render, image entirely below
+    ; the fold. The parser can't early-exit on the initial pass
+    ; (HtmlLineCount must still count this image for TotalLines), so
+    ; without this branch every off-screen <img> on page 1 would
+    ; drain its full file just to tally rows.
+.rsfCheckBelow:
+    ; quick_screen_draw / count-only mode: when HtmlNoDraw is set
+    ; the parser is past viewport-full and walking the doc just to
+    ; populate HtmlLineCount. Force fast-account in that mode --
+    ; otherwise each subsequent off-screen image falls into the slow
+    ; .rsfHeader path which streams ~5 KB of pixels from disk PER
+    ; IMAGE just to count its rows. On benchim with 7 images that's
+    ; 7 disk-bound seconds before PageDown becomes responsive.
+    ld      a, [HtmlNoDraw]
+    or      a
+    jr      nz, .rsfFastAccount
+    ld      a, [TextY]
+    cp      CONTENT_Y1 + 1
+    jr      c, .rsfHeader               ; viewport not full yet -> draw normally
+
+.rsfFastAccount:
+    ; Charge the height against the total line count so the scroll
+    ; thumb still reflects this image even when no pixels were drawn.
+    ld      hl, [HtmlLineCount]
+    ld      e, c                        ; C still holds image lines
+    ld      d, 0
+    add     hl, de
+    jr      nc, .rsfFastLC
+    ld      hl, 0xFFFF
+.rsfFastLC:
+    ld      [HtmlLineCount], hl
+    call    ImgStreamClose
+    call    VdpUnblank                  ; balance VdpBlank at entry
+    scf                                 ; image "handled"
+    ret
+
+.rsfHeader:
 
     ; Skip the 7-byte BSAVE header (magic 0xFE + start/end/exec addrs).
     ld      b, 7
@@ -4604,7 +9683,9 @@ RenderSc6File:
     cp      SC6_MAX_ROWS
     jr      nc, .rsfDone
     ld      a, [HtmlLineSkip]
-    or      a
+    ld      b, a
+    ld      a, [HtmlLineSkip + 1]
+    or      b
     jr      nz, .rsfConsume
     ld      a, [ImgCurY]
     cp      CONTENT_Y1 + 1
@@ -4624,7 +9705,7 @@ RenderSc6File:
     pop     bc
     jp      c, .rsfDone
     call    RemapByte
-    out     [VDP_DATA], a
+    out     (VDP_DATA), a
     djnz    .rsfDraw
 
     ld      b, SC6_WIDTH_B - SC6_VISIBLE_B
@@ -4667,7 +9748,9 @@ RenderSc6File:
     ; overdraw the image. If we hit the viewport bottom, push TextY
     ; past the content area to suppress further drawing on this page.
     ld      a, [HtmlLineSkip]
-    or      a
+    ld      b, a
+    ld      a, [HtmlLineSkip + 1]
+    or      b
     jr      nz, .rsfNoTy
     ld      a, [ImgCurY]
     cp      CONTENT_Y1 + 1
@@ -4676,6 +9759,7 @@ RenderSc6File:
 .rsfTyOk:
     ld      [TextY], a
 .rsfNoTy:
+    call    VdpUnblank                  ; balance VdpBlank at entry
     scf                                 ; CF=1 -> image was handled
     ret
 
@@ -4769,6 +9853,83 @@ RenderPcxFile:
     call    ArFlush
     call    LineFlush
 
+    ; Fast path -- same idea as RenderSc6File. We already have the full
+    ; 128-byte header in ImgBuf, so the image height comes from
+    ; Ymax - Ymin + 1 (offsets 6/10 = low bytes, 7/11 = high bytes).
+    ; If the image is entirely above the scrolled fold, or entirely
+    ; below the visible bottom on the initial pass, we skip the RLE
+    ; decoder, bump the scroll bookkeeping, and close the file. A
+    ; 23 KB PCX chunk that's off-screen then costs exactly one
+    ; OPEN + one 128 B READ instead of a full drain.
+    ld      a, [ImgBuf + 10]            ; Ymax low
+    ld      l, a
+    ld      a, [ImgBuf + 11]            ; Ymax high
+    ld      h, a
+    ld      a, [ImgBuf + 6]             ; Ymin low
+    ld      e, a
+    ld      a, [ImgBuf + 7]             ; Ymin high
+    ld      d, a
+    and     a
+    sbc     hl, de                      ; HL = Ymax - Ymin (pixel rows - 1)
+    jr      c, .pcxNoFast               ; negative/wrap -> bail
+    inc     hl                          ; HL = pixel rows
+    ld      a, h
+    or      a
+    jr      nz, .pcxNoFast              ; > 255 rows -> slow path
+    ld      a, l
+    or      a
+    jr      z, .pcxNoFast               ; 0 rows -> slow path
+    add     a, 7
+    jr      c, .pcxNoFast
+    srl     a
+    srl     a
+    srl     a                           ; A = ceil(rows / 8) = image lines
+    ld      c, a                        ; C = image lines
+
+    ; Case A: scrolled render, image entirely above the fold.
+    ld      hl, [HtmlLineSkip]
+    ld      a, h
+    or      l
+    jr      z, .pcxCheckBelow
+    ld      e, c
+    ld      d, 0
+    and     a
+    sbc     hl, de                      ; HL = HtmlLineSkip - image_lines
+    jr      c, .pcxNoFast               ; straddles fold
+    ld      [HtmlLineSkip], hl
+    jr      .pcxFastAccount
+
+.pcxCheckBelow:
+    ; quick_screen_draw / count-only mode: when HtmlNoDraw is set
+    ; (parser past viewport-full on the initial pass, just walking
+    ; to populate HtmlLineCount), force fast-account. Without this
+    ; every off-screen PCX on benchim.htm streamed its full RLE
+    ; body from disk just to tally rows -- ~5 seconds per image,
+    ; so the user's first PageDowns saw a stale (low) HtmlLineCount
+    ; until the parser finally caught up. Local-disk PCX bytes are
+    ; trustworthy in count-only mode (the "stale ImgBuf over serial"
+    ; concern that originally killed Case B applies to remote
+    ; sessions only).
+    ld      a, [HtmlNoDraw]
+    or      a
+    jr      nz, .pcxFastAccount
+    ; Case B otherwise still skipped for the reasons noted above.
+    jr      .pcxNoFast
+
+.pcxFastAccount:
+    ld      hl, [HtmlLineCount]
+    ld      e, c
+    ld      d, 0
+    add     hl, de
+    jr      nc, .pcxFastLC
+    ld      hl, 0xFFFF
+.pcxFastLC:
+    ld      [HtmlLineCount], hl
+    call    ImgStreamClose
+    scf
+    ret
+
+.pcxNoFast:
     ; Mark the header buffer consumed -- the next ImgStreamByte call
     ; will refill from byte 128 (first RLE byte).
     xor     a
@@ -4792,7 +9953,9 @@ RenderPcxFile:
     cp      SC6_MAX_ROWS
     jp      nc, .pcxDone
     ld      a, [HtmlLineSkip]
-    or      a
+    ld      b, a
+    ld      a, [HtmlLineSkip + 1]
+    or      b
     jr      nz, .pcxConsume
     ld      a, [ImgCurY]
     cp      CONTENT_Y1 + 1
@@ -4822,7 +9985,7 @@ RenderPcxFile:
     pop     bc
     jp      c, .pcxDone
     call    RemapByte
-    out     [VDP_DATA], a
+    out     (VDP_DATA), a
     djnz    .pcxDraw
     ld      a, c
     or      a
@@ -4871,7 +10034,9 @@ RenderPcxFile:
 .pcxDone:
     call    ImgStreamClose
     ld      a, [HtmlLineSkip]
-    or      a
+    ld      b, a
+    ld      a, [HtmlLineSkip + 1]
+    or      b
     jr      nz, .pcxNoTy
     ld      a, [ImgCurY]
     cp      CONTENT_Y1 + 1
@@ -5149,7 +10314,9 @@ RenderBmpFile:
     jp      z, .bmpDone
 
     ld      a, [HtmlLineSkip]
-    or      a
+    ld      b, a
+    ld      a, [HtmlLineSkip + 1]
+    or      b
     jp      nz, .bmpSkipRow
     ld      a, [BmpCurY]
     cp      CONTENT_Y0
@@ -5177,7 +10344,7 @@ RenderBmpFile:
     ld      b, a
     ld      a, [BmpPackIdx]
     ld      c, a
-    ld      a, 3
+    ld      a, 2
     sub     c
     add     a, a
     ld      c, a                        ; C = (3 - idx) * 2
@@ -5198,7 +10365,7 @@ RenderBmpFile:
     cp      4
     jr      nz, .bmpPxPack
     ld      a, [BmpPackByte]
-    out     [VDP_DATA], a
+    out     (VDP_DATA), a
     xor     a
     ld      [BmpPackByte], a
 .bmpPxPack:
@@ -5215,7 +10382,7 @@ RenderBmpFile:
     or      a
     jr      z, .bmpRowPadSkip
     ld      a, [BmpPackByte]
-    out     [VDP_DATA], a
+    out     (VDP_DATA), a
 .bmpRowPadSkip:
     ld      a, [BmpPad]
     or      a
@@ -5261,7 +10428,9 @@ RenderBmpFile:
     ; Park TextY below the drawn image (height advance was done upfront
     ; into BmpCurY, but TextY still points at the top -- move it down).
     ld      a, [HtmlLineSkip]
-    or      a
+    ld      b, a
+    ld      a, [HtmlLineSkip + 1]
+    or      b
     jr      nz, .bmpNoTy
     ld      a, [TextY]
     ld      b, a
@@ -5324,7 +10493,7 @@ BmpReadPxSlot:
     ret     c
     ld      [BmpNibBuf], a
     ld      b, a
-    ld      a, 1
+    ld      a, 2
     ld      [BmpNibLeft], a
     ld      a, b
     rrca
@@ -5393,13 +10562,13 @@ BmpLumaToPalette:
     ld      a, 2                        ; white
     ret
 .bltBlack:
-    ld      a, 3
+    ld      a, 2
     ret
 .bltDgray:
     xor     a                           ; dgray palette index 0
     ret
 .bltLgray:
-    ld      a, 1
+    ld      a, 2
     ret
 
 ; PcxGetDecodedByte: returns A = next decoded PCX byte (after RLE
@@ -5507,15 +10676,363 @@ RemapByte:
     ld      a, [hl]
     ret
 
-; Built-in page served when a requested URL can't be opened. Kept in ROM
-; as raw HTML and copied into FileBuf + rendered via the normal path so
-; the titlebar, scrollbar, and back-history all behave exactly like on a
-; loaded document.
-NotFoundHtml:
-    db  "<title>404 Not Found</title>"
-    db  "<h2>Error 404 - Not Found</h2>"
-    db  "<p>The requested file could not be opened.</p>"
-NotFoundHtmlLen equ $ - NotFoundHtml
+; RenderMissingImgBox: draw an empty reserved rectangle of HtmlImgWidth
+; x HtmlImgHeight pixels at the current cursor. Called from TagImg's
+; altFallback when both dimensions were given on the tag -- the goal
+; is to keep page layout stable when an <img> can't be fetched, so
+; the surrounding text doesn't reflow around the hole. Width is
+; clamped to the content area; height is clamped to the remaining
+; viewport so an oversize author value can't run into the scrollbar
+; or below-fold. Bookkeeping mirrors RenderSc6File's fast-path:
+;   - HtmlLineCount gains ceil(height / 8)
+;   - HtmlLineSkip burns image_lines on a scrolled above-fold pass
+;   - TextY advances past the box on a normal pass
+; Always returns CF=1 so TagImg treats the box as a handled image.
+RenderMissingImgBox:
+    ld      hl, [HtmlImgWidth]
+    ld      de, CONTENT_X_END + 1
+    and     a
+    sbc     hl, de
+    jr      c, .rmbWOk
+    ld      hl, CONTENT_X_END + 1
+    ld      [HtmlImgWidth], hl
+.rmbWOk:
+    ; Width px -> byte cols (/4, round up).
+    ld      hl, [HtmlImgWidth]
+    ld      a, l
+    and     3
+    jr      z, .rmbWByteA
+    ld      bc, 4
+    add     hl, bc
+.rmbWByteA:
+    srl     h
+    rr      l
+    srl     h
+    rr      l                           ; HL = width in byte-cols
+    ld      a, l
+    ld      [RmbWBytes], a
+
+    ; Clamp height to remaining viewport.
+    ld      hl, [HtmlImgHeight]
+    ld      a, h
+    or      a
+    jr      nz, .rmbHClamp
+    ld      a, l
+    or      a
+    jp      z, .rmbDone                 ; 0 px height -> nothing to draw
+    ld      c, a
+    jr      .rmbHMaybe
+.rmbHClamp:
+    ld      c, CONTENT_Y1 - CONTENT_Y0 + 1
+.rmbHMaybe:
+    ld      a, [TextY]
+    ld      b, a
+    ld      a, CONTENT_Y1 + 1
+    sub     b
+    jp      c, .rmbHZero
+    cp      c
+    jr      nc, .rmbHOk
+    ld      c, a
+.rmbHOk:
+    ld      a, c
+    ld      [RmbHPixels], a
+
+    ; image_lines = ceil(height / 8) for HtmlLineCount / Skip math.
+    add     a, 7
+    jr      c, .rmbLinesSat
+    srl     a
+    srl     a
+    srl     a
+    jr      .rmbLinesStore
+.rmbLinesSat:
+    ld      a, 255
+.rmbLinesStore:
+    or      a
+    jr      nz, .rmbLinesNonZero
+    ld      a, 2
+.rmbLinesNonZero:
+    ld      [RmbImgLines], a
+
+    call    ArFlush
+    call    LineFlush
+
+    ld      a, [RmbImgLines]
+    ld      c, a
+    ld      b, 0
+    ld      hl, [HtmlLineCount]
+    add     hl, bc
+    jr      nc, .rmbLCStore
+    ld      hl, 0xFFFF
+.rmbLCStore:
+    ld      [HtmlLineCount], hl
+
+    ; Case A: scrolled pass, box entirely above the fold -> skip draw.
+    ld      hl, [HtmlLineSkip]
+    ld      a, h
+    or      l
+    jr      z, .rmbDraw
+    ld      a, [RmbImgLines]
+    ld      c, a
+    ld      b, 0
+    and     a
+    sbc     hl, bc
+    jr      c, .rmbDraw                 ; straddles fold -> draw
+    ld      [HtmlLineSkip], hl
+    jr      .rmbDone
+
+.rmbDraw:
+    ; Light-gray border outline at (x=HtmlIndent/4, y=TextY, w, h).
+    ; DrawRectBorder paints INSIDE the declared w*h bounds (1-px top
+    ; and bottom, 1 byte-column = 4 px on the vertical edges since
+    ; Screen 6 is byte-addressable in X).
+    ld      a, [HtmlIndent]
+    srl     a
+    srl     a
+    ld      b, a
+    ld      a, [TextY]
+    ld      c, a
+    ld      a, [RmbWBytes]
+    ld      d, a
+    ld      a, [RmbHPixels]
+    ld      e, a
+    ld      a, COL_LGRAY
+    call    DrawRectBorder
+
+    ; Label the box with the alt text (falling back to the src
+    ; filename) when it's big enough for the label to be legible.
+    ; Skip quietly for small boxes so we don't smear over their
+    ; outline.
+    ld      a, [RmbWBytes]
+    cp      6                            ; need >= 24 px wide
+    jp      c, .rmbAdvance
+    ld      a, [RmbHPixels]
+    cp      12                           ; need >= 12 px tall
+    jp      c, .rmbAdvance
+    call    RmbDrawLabel
+
+.rmbAdvance:
+    ld      a, [RmbHPixels]
+    ld      b, a
+    ld      a, [TextY]
+    add     a, b
+    jr      c, .rmbTyCap
+    cp      CONTENT_Y1 + 1
+    jr      c, .rmbTyStore
+.rmbTyCap:
+    ld      a, CONTENT_Y1 + 1
+.rmbTyStore:
+    ld      [TextY], a
+
+.rmbDone:
+    scf
+    ret
+
+.rmbHZero:
+    xor     a
+    ld      [RmbHPixels], a
+    jr      .rmbDone
+
+; ReserveImgLayout: same layout math as RenderMissingImgBox but without
+; any VDP writes. Used on sticky re-renders where the image bytes are
+; already on screen from the first render -- we just need TextY and the
+; line counters to land where they did last time. Assumes HtmlImgWidth
+; and HtmlImgHeight are both non-zero (TagImgBody gates on that).
+; CF=1 on return so TagImgBody can `ret c` out as if the image rendered.
+ReserveImgLayout:
+    ld      hl, [HtmlImgWidth]
+    ld      de, CONTENT_X_END + 1
+    and     a
+    sbc     hl, de
+    jr      c, .rilWOk
+    ld      hl, CONTENT_X_END + 1
+    ld      [HtmlImgWidth], hl
+.rilWOk:
+    ; Clamp height to remaining viewport.
+    ld      hl, [HtmlImgHeight]
+    ld      a, h
+    or      a
+    jr      nz, .rilHClamp
+    ld      c, l
+    jr      .rilHMaybe
+.rilHClamp:
+    ld      c, CONTENT_Y1 - CONTENT_Y0 + 1
+.rilHMaybe:
+    ld      a, [TextY]
+    ld      b, a
+    ld      a, CONTENT_Y1 + 1
+    sub     b
+    jr      c, .rilHZero
+    cp      c
+    jr      nc, .rilHOk
+    ld      c, a
+.rilHOk:
+    ; image_lines = ceil(height / 8) for line-count / skip math.
+    ld      a, c
+    add     a, 7
+    jr      c, .rilLinesSat
+    srl     a
+    srl     a
+    srl     a
+    jr      .rilLinesStore
+.rilLinesSat:
+    ld      a, 255
+.rilLinesStore:
+    or      a
+    jr      nz, .rilLinesNonZero
+    ld      a, 2
+.rilLinesNonZero:
+    ld      b, a                        ; B = image_lines
+
+    call    ArFlush
+    call    LineFlush
+
+    ld      a, b
+    push    bc                          ; preserve (B=lines, C=height)
+    ld      c, a
+    ld      b, 0
+    ld      hl, [HtmlLineCount]
+    add     hl, bc
+    jr      nc, .rilLCStore
+    ld      hl, 0xFFFF
+.rilLCStore:
+    ld      [HtmlLineCount], hl
+
+    ; Honour HtmlLineSkip so scrolling past the image still lines up.
+    ld      hl, [HtmlLineSkip]
+    ld      a, h
+    or      l
+    jr      z, .rilAdvance
+    and     a
+    sbc     hl, bc
+    jr      c, .rilAdvance              ; straddles fold -> still advance TextY
+    ld      [HtmlLineSkip], hl
+    pop     bc
+    scf
+    ret
+
+.rilAdvance:
+    pop     bc                          ; B=lines, C=height
+    ld      a, [TextY]
+    add     a, c
+    jr      c, .rilTyCap
+    cp      CONTENT_Y1 + 1
+    jr      c, .rilTyStore
+.rilTyCap:
+    ld      a, CONTENT_Y1 + 1
+.rilTyStore:
+    ld      [TextY], a
+    scf
+    ret
+
+.rilHZero:
+    ; No vertical room left. Still advance line counters so scroll math
+    ; matches the non-sticky path.
+    scf
+    ret
+
+RmbWBytes:      db 0
+RmbHPixels:     db 0
+RmbImgLines:    db 0
+RmbLabelLen:    db 0
+; Scratch for the centred label -- we truncate HtmlCurHref/ImgNameBuf
+; into this buffer + NUL so GRPPRT's draw-until-NUL loop stops at the
+; fit width. Max 30 glyphs = 240 px (wider than our 492-px canvas
+; would ever host for a reasonable image).
+
+; RmbDrawLabel: draw alt (or src filename) centred inside the box at
+; (HtmlIndent, TextY, RmbWBytes*4, RmbHPixels). Called only when the
+; box is wide and tall enough to host at least a few glyphs. On
+; entry RmbWBytes / RmbHPixels / HtmlIndent / TextY are all current.
+RmbDrawLabel:
+    ; Pick the label source: HtmlCurHref (alt=) if non-empty, else
+    ; ImgNameBuf (src= filename).
+    ld      hl, HtmlCurHref
+    ld      a, [hl]
+    or      a
+    jr      nz, .rdlHaveSrc
+    ld      hl, ImgNameBuf
+    ld      a, [hl]
+    or      a
+    ret     z                           ; nothing to draw
+
+.rdlHaveSrc:
+    ; Compute max chars that fit: (RmbWBytes * 4 - 8) / 8 = RmbWBytes/2 - 1
+    ; (drop 8 px for visual padding inside the border).
+    ld      a, [RmbWBytes]
+    srl     a
+    dec     a
+    cp      30
+    jr      c, .rdlCapOk
+    ld      a, 30                       ; buffer ceiling
+.rdlCapOk:
+    ld      b, a                        ; B = max chars
+
+    ; Copy up to B chars from HL into RmbLabelBuf, stopping at NUL.
+    ld      de, RmbLabelBuf
+    ld      c, 0                        ; C = actual chars copied
+.rdlCopy:
+    ld      a, b
+    or      a
+    jr      z, .rdlCopyDone
+    ld      a, [hl]
+    or      a
+    jr      z, .rdlCopyDone
+    ld      [de], a
+    inc     hl
+    inc     de
+    inc     c
+    dec     b
+    jr      .rdlCopy
+.rdlCopyDone:
+    xor     a
+    ld      [de], a                     ; NUL terminate
+    ld      a, c
+    or      a
+    ret     z                           ; zero-length label
+    ld      [RmbLabelLen], a
+
+    ; X pixel = HtmlIndent + (RmbWBytes*4 - C*8) / 2.
+    ld      a, [RmbWBytes]
+    add     a, a
+    add     a, a                        ; A = box width in pixels
+    ld      b, a
+    ld      a, c
+    add     a, a
+    add     a, a
+    add     a, a                        ; A = label width in pixels
+    ld      c, a                        ; save label_w
+    ld      a, b
+    sub     c                           ; A = box_w - label_w (>= 0)
+    srl     a                           ; /2
+    ld      c, a                        ; C = left margin px
+    ld      a, [HtmlIndent]
+    add     a, c
+    ld      e, a
+    ld      d, 0                        ; DE = X pixel
+
+    ; Y pixel = TextY + (RmbHPixels - 8) / 2 (BIOS font is 8 px tall).
+    ld      a, [RmbHPixels]
+    sub     8
+    srl     a
+    ld      c, a
+    ld      a, [TextY]
+    add     a, c
+    ld      c, a                        ; C = Y pixel
+
+    ; Set black-on-white colours so the label pops against the white
+    ; content area, then paint via BIOS GRPPRT (through DrawString).
+    push    bc
+    push    de
+    ld      a, COL_BLACK
+    ld      l, COL_WHITE
+    call    SetTextColours
+    pop     de
+    pop     bc
+    ld      hl, RmbLabelBuf
+    jp      DrawString                  ; tail-call returns to caller
+; area when a local file fails to load. URL loads that fail come back
+; from the serial bridge as ERR and are handled the same way.
+NotFoundMsg:    db "404 File Not Found", 0
 DataMsxPrefixLen equ $ - DataMsxPrefix
 
 ; RenderImageDataUri: HL points at the first base64 char of a
@@ -5532,7 +11049,7 @@ RenderImageDataUri:
     pop     hl
 
     ; Fresh triplet state for B64DecodeByte.
-    ld      a, 3
+    ld      a, 2
     ld      [BTripletIdx], a
     ld      [BSrcPtr], hl
 
@@ -5571,7 +11088,9 @@ RenderImageDataUri:
     ;       so drawing would wrap through VDP's linear write-address
     ;       and reappear on the titlebar / toolbar.
     ld      a, [HtmlLineSkip]
-    or      a
+    ld      b, a
+    ld      a, [HtmlLineSkip + 1]
+    or      b
     jr      nz, .consumeRow
     ld      a, [ImgCurY]
     cp      CONTENT_Y1 + 1
@@ -5588,7 +11107,7 @@ RenderImageDataUri:
     push    bc
     call    B64DecodeByte
     pop     bc
-    out     [VDP_DATA], a
+    out     (VDP_DATA), a
     djnz    .colRender
     ld      a, [ImgCurY]
     inc     a
@@ -5626,7 +11145,9 @@ RenderImageDataUri:
     ; the image's last rows -- the user sees the image filling the
     ; viewport edge and the remainder continues on page 2.
     ld      a, [HtmlLineSkip]
-    or      a
+    ld      b, a
+    ld      a, [HtmlLineSkip + 1]
+    or      b
     jr      nz, .noTextYAdv
     ld      a, [ImgCurY]
     cp      CONTENT_Y1 + 1
@@ -5859,10 +11380,7 @@ BmpPackIdx:   db 0                     ; 0..3, position within packed byte
 BmpPackByte:  db 0
 BmpNibBuf:    db 0                     ; 4-bpp half-byte pixel buffer
 BmpNibLeft:   db 0                     ; 1 if the low nibble of BmpNibBuf is still pending
-BmpPal16:     ds 16                    ; slot 0..3 per BMP-4bpp palette entry
 IMG_NAME_MAX equ 32
-ImgNameBuf:   ds IMG_NAME_MAX + 1     ; scratch for <img src="..."> filenames
-ExtImgRemap:  ds 256                  ; palette fixup LUT built once at startup
 
 ; <font color="name">: push current fg, set new fg + CurrentFontLUT from
 ; the color name stored in HtmlCurHref (ScanHrefAttr captured it via the
@@ -6025,7 +11543,6 @@ ColorTable:
 ; pixel budget.
 ; ----------------------------------------------------------------------------
 
-TABLE_LEFT_PAD  equ 4
 TABLE_ROW_GAP   equ 2                   ; vertical pixels between rule and text
 
 TagTableTag:
@@ -6035,11 +11552,23 @@ TagTableTag:
 
     ; Leading blank line + top rule + row-gap before the first cell text.
     call    EmitBlankLine
-    ld      a, 1
+    ld      a, 2
     ld      [HtmlInTable], a
     ld      [HtmlTableFirst], a
     xor     a
     ld      [HtmlTableCol], a
+    ld      a, [HtmlNextBorder]
+    ld      [HtmlTableBorder], a        ; latch for the duration of the table
+
+    ; Pick a column layout from the cell count in the first <tr>. Without
+    ; this prescan, every table fell back to the static icon-layout (col 0
+    ; = 24 px) which clipped general 3-col data tables (test4 / BENCHTX).
+    ; MeasureTableCols snapshots ParserCursor / HtmlEnd, walks ahead, and
+    ; updates HtmlTableColCount; SetTableColLayout swings the layout
+    ; pointers so every TagTd / DrawTableVerticals call below sees the
+    ; matching geometry.
+    call    MeasureTableCols
+    call    SetTableColLayout
 
     call    DrawTableRuleHere
     ld      a, [TextY]
@@ -6060,7 +11589,9 @@ TagTableTag:
     call    FlushPendingCell
     call    CountTableRow
     ld      a, [HtmlLineSkip]
-    or      a
+    ld      b, a
+    ld      a, [HtmlLineSkip + 1]
+    or      b
     jr      nz, .ttSkipAdv
     ; Close the last row's bottom rule.
     ld      a, [HtmlRowTopY]
@@ -6085,6 +11616,9 @@ TagTableTag:
 ; frame the table (left edge, two inner column dividers, right edge).
 ; Each line runs from TableTopY down to the just-drawn bottom rule.
 DrawTableVerticals:
+    ld      a, [HtmlTableBorder]
+    or      a
+    ret     z                           ; border=0 -> no vertical edges either
     ; BorderHeight = bottom - top + 1
     ld      a, [TextY]
     ld      b, a
@@ -6095,12 +11629,45 @@ DrawTableVerticals:
     inc     a
     ld      [BorderHeight], a
 
+    ; Left edge.
     ld      b, (TABLE_LEFT_PX - 4) / 4
     call    .dtvBar
-    ld      b, (172 - 4) / 4
+
+    ; Inner dividers, one per column boundary (so a 3-col table draws
+    ; 2 inner verticals, 5-col draws 4, 1-col draws none). Walk
+    ; TableColStartXPtr starting at col 1's start word and convert each
+    ; (start - 4) into a byte column for FillRect.
+    ld      a, [HtmlTableColCount]
+    dec     a
+    jr      z, .dtvRight                ; N=1 -> only outer borders
+    ld      c, a                        ; C = inner divider count
+    ld      hl, [TableColStartXPtr]
+    inc     hl
+    inc     hl                          ; skip col 0; HL -> col 1's start word
+.dtvInner:
+    push    bc
+    push    hl
+    ld      e, [hl]
+    inc     hl
+    ld      d, [hl]                     ; DE = cell start X
+    dec     de
+    dec     de
+    dec     de
+    dec     de                          ; DE -= 4 (sit in the gap before the cell)
+    srl     d
+    rr      e
+    srl     d
+    rr      e                           ; DE /= 4 (X in 4-px byte cols)
+    ld      b, e                        ; X < 512 so D=0 already
     call    .dtvBar
-    ld      b, (332 - 4) / 4
-    call    .dtvBar
+    pop     hl
+    inc     hl
+    inc     hl                          ; advance to next col's start word
+    pop     bc
+    dec     c
+    jr      nz, .dtvInner
+
+.dtvRight:
     ld      b, TABLE_RIGHT_PX / 4
     ; fall through for the right border
 
@@ -6118,16 +11685,19 @@ DrawTableVerticals:
 ; a tag-driven EmitNewline would. Preserves all other state.
 CountTableRow:
     push    af
-    ld      a, [HtmlLineCount]
-    inc     a
+    ld      hl, [HtmlLineCount]
+    inc     hl
+    ld      a, h
+    or      l
     jr      z, .ctSat                   ; saturate at 0xFF
-    ld      [HtmlLineCount], a
+    ld      [HtmlLineCount], hl
 .ctSat:
-    ld      a, [HtmlLineSkip]
-    or      a
+    ld      hl, [HtmlLineSkip]
+    ld      a, h
+    or      l
     jr      z, .ctDone
-    dec     a
-    ld      [HtmlLineSkip], a
+    dec     hl
+    ld      [HtmlLineSkip], hl
 .ctDone:
     pop     af
     ret
@@ -6155,7 +11725,9 @@ TagTr:
 
     ; Close previous row: advance TextY past its text, draw rule, gap.
     ld      a, [HtmlLineSkip]
-    or      a
+    ld      b, a
+    ld      a, [HtmlLineSkip + 1]
+    or      b
     jr      nz, .trNoAdvance
     ld      a, [HtmlRowTopY]
     add     a, TEXT_LINE_H
@@ -6187,7 +11759,7 @@ TagTr:
     xor     a
     ld      [TextX], a
     ld      [TextX + 1], a
-    ld      a, 1
+    ld      a, 2
     ld      [HtmlLineEmpty], a
     xor     a
     ld      [HtmlWsPending], a
@@ -6207,36 +11779,50 @@ TagTd:
     ; remembered start X. Must happen before we overwrite CellStartX/TextX.
     call    FlushPendingCell
 
+    ; Reset TextY to the row's top. The previous cell may have advanced
+    ; TextY (e.g. an <img> in cell 0 pushed the pen down by the image
+    ; height), and without this reset the next cell would render its
+    ; text on a row below the row top -- that's why Apache directory
+    ; listings showed icons one line ABOVE their link text instead of
+    ; on the same row to the left of it.
+    ld      a, [HtmlRowTopY]
+    ld      [TextY], a
+
     ; Compute cell start X from TableColStartX[index]. Under RTL we
-    ; mirror the column so col 0 lands at the rightmost position. The
-    ; position table has three slots whose left-right order is flipped
-    ; for RTL -- columns past the third fall back to the extreme slot.
+    ; mirror inside the active column count so col 0 lands at the
+    ; rightmost populated slot (and trailing zeroed slots stay
+    ; unreachable). When MeasureTableCols set HtmlTableColCount=3, RTL
+    ; index = (3-1) - col = 2 - col, hitting the populated slots 0..2
+    ; rather than the zeroed slots 3..4 the old `4 - col` flip aimed at.
     ld      a, [HtmlTableCol]
-    cp      3
-    jr      c, .okCol
-    ld      a, 2
-.okCol:
     ld      b, a
+    ld      a, [HtmlTableColCount]
+    dec     a                           ; A = (count - 1) = max valid index
+    cp      b
+    jr      nc, .okCol
+    ld      b, a                        ; clamp HtmlTableCol > count-1 to last
+.okCol:
     ld      a, [HtmlDir]
     or      a
     jr      z, .ltrCol
-    ld      a, 2
-    sub     b                           ; RTL: index = 2 - HtmlTableCol
+    ld      a, [HtmlTableColCount]
+    dec     a
+    sub     b                           ; RTL: index = (count - 1) - HtmlTableCol
     ld      b, a
 .ltrCol:
     ld      e, b
     ld      d, 0
-    ld      hl, TableColStartX
+    ld      hl, [TableColStartXPtr]     ; layout chosen at <table> open
     add     hl, de
     add     hl, de                      ; *2 for word-sized entries
     ld      e, [hl]
     inc     hl
     ld      d, [hl]                     ; DE = cell start X (2 bytes)
-    ; Cell end X comes from TableColEndX at the same physical index.
+    ; Cell end X comes from TableColEndXPtr at the same physical index.
     push    de
     ld      e, b
     ld      d, 0
-    ld      hl, TableColEndX
+    ld      hl, [TableColEndXPtr]
     add     hl, de
     add     hl, de
     ld      a, [hl]
@@ -6340,21 +11926,185 @@ FlushPendingCell:
 ; forces small rounding, so the actual numbers are 12 / 11.
 TABLE_LEFT_PX  equ 12
 TABLE_RIGHT_PX equ 480
-TableColStartX:
-    dw  TABLE_LEFT_PX, 172, 332
-; Right edge (inclusive) for each column; used by RTL cell right-align
-; and by the full-height border draw below. The last column stretches
-; to TABLE_RIGHT_PX; the earlier columns stop 4 px before the next
-; column's content X so the vertical divider can land in the gap.
-TableColEndX:
-    dw  168, 328, TABLE_RIGHT_PX
+; Five fixed layouts indexed by HtmlTableColCount-1. Each layout is a
+; pair of word arrays: 5 column-start X values followed by 5 column-end
+; X values, all multiples of 4 so the inner divider strokes land on
+; byte boundaries. Slots past the live column count read as zeros (or
+; previous values) -- TagTd clamps the index at 4 anyway.
+;
+; The original single layout was sized for Apache directory listings
+; (icon | name | date | size | desc) with col 0 only 24 px wide. That
+; was wrong for general 3-column data tables: the first cell's text
+; (e.g. "Apples") spilled past col 0's 24 px slot and the second cell
+; landed at X=40 INSIDE the first cell's text. The bench/test4 pages
+; rendered as "Apl3s" / "Itendty" until this fix.
+;
+; Layout choice happens at <table> open after MeasureTableCols counts
+; cells in the first <tr>; SetTableColLayout copies pointers into
+; TableColStartXPtr / TableColEndXPtr so TagTd / DrawTableVerticals
+; can read column geometry through them.
+TblLayout1:
+    dw  TABLE_LEFT_PX,  0,    0,    0,    0
+    dw  TABLE_RIGHT_PX, 0,    0,    0,    0
+TblLayout2:
+    dw  TABLE_LEFT_PX,  244,  0,    0,    0
+    dw  240,            TABLE_RIGHT_PX, 0, 0, 0
+TblLayout3:
+    dw  TABLE_LEFT_PX,  168,  324,  0,    0
+    dw  164,            320,  TABLE_RIGHT_PX, 0, 0
+TblLayout4:
+    dw  TABLE_LEFT_PX,  132,  248,  364,  0
+    dw  128,            244,  360,  TABLE_RIGHT_PX, 0
+TblLayout5:
+    dw  TABLE_LEFT_PX,  108,  204,  300,  396
+    dw  104,            200,  296,  392,  TABLE_RIGHT_PX
+
+TableLayoutPtrs:
+    dw  TblLayout1, TblLayout2, TblLayout3, TblLayout4, TblLayout5
+
+; Live layout pointers, refreshed at every <table> open. Defaults point
+; at the 5-column layout so even if SetTableColLayout never fires (a
+; degenerate render path) the table still has a reasonable geometry.
+TableColStartXPtr: dw TblLayout5
+TableColEndXPtr:   dw TblLayout5 + 10     ; second half of the layout
+
+; SetTableColLayout: read HtmlTableColCount and steer
+; TableColStartXPtr / TableColEndXPtr at the matching ROM layout. Count
+; is clamped 1..5 by MeasureTableCols, so no extra range-check here.
+SetTableColLayout:
+    ld      a, [HtmlTableColCount]
+    dec     a                              ; 0..4
+    add     a, a                           ; *2 (word-sized pointer table)
+    ld      e, a
+    ld      d, 0
+    ld      hl, TableLayoutPtrs
+    add     hl, de
+    ld      a, [hl]
+    inc     hl
+    ld      h, [hl]
+    ld      l, a                           ; HL = layout base (start half)
+    ld      [TableColStartXPtr], hl
+    ld      de, 10                         ; end half sits 10 bytes (5 words) later
+    add     hl, de
+    ld      [TableColEndXPtr], hl
+    ret
+
+; MeasureTableCols: walk forward from [ParserCursor] (the byte right
+; after the open <table...>'s '>') counting <td>/<th> opens until we
+; hit </tr>, </table>, or the end of FileBuf. Result is clamped to
+; 1..5 and stored in HtmlTableColCount. Lookahead never modifies the
+; parser's main HL -- it works off ParserCursor and HtmlEnd snapshots.
+;
+; Note: BC tracks remaining bytes in the buffer (HtmlEnd - cursor) so
+; we get one cheap underflow check per byte instead of a 16-bit
+; bound-compare. Tag matching is case-insensitive via `and 0xDF` (works
+; for ASCII letters; punctuation stays distinct enough that '/' and
+; whitespace don't masquerade as a 'T'/'D'/'H'/'R').
+MeasureTableCols:
+    push    hl
+    push    de
+    push    bc
+    ld      hl, [ParserCursor]
+    ld      de, [HtmlEnd]
+    ; BC = HtmlEnd - cursor (== bytes available to scan)
+    push    hl
+    ex      de, hl
+    or      a
+    sbc     hl, de
+    ld      b, h
+    ld      c, l
+    pop     hl
+    ld      d, 0                           ; D = cell count
+.mtcLoop:
+    ld      a, b
+    or      c
+    jr      z, .mtcDone
+    ld      a, [hl]
+    inc     hl
+    dec     bc
+    cp      '<'
+    jr      nz, .mtcLoop
+    ld      a, b
+    or      c
+    jr      z, .mtcDone
+    ld      a, [hl]
+    inc     hl
+    dec     bc
+    cp      '/'
+    jr      z, .mtcCloseTag
+    and     0xDF
+    cp      'T'
+    jr      nz, .mtcLoop
+    ld      a, b
+    or      c
+    jr      z, .mtcDone
+    ld      a, [hl]
+    inc     hl
+    dec     bc
+    and     0xDF
+    cp      'D'
+    jr      z, .mtcCount
+    cp      'H'
+    jr      nz, .mtcLoop
+.mtcCount:
+    inc     d
+    ld      a, d
+    cp      8
+    jr      c, .mtcLoop                    ; sanity cap; clamp below
+    jr      .mtcDone
+.mtcCloseTag:
+    ld      a, b
+    or      c
+    jr      z, .mtcDone
+    ld      a, [hl]
+    inc     hl
+    dec     bc
+    and     0xDF
+    cp      'T'
+    jr      nz, .mtcLoop
+    ld      a, b
+    or      c
+    jr      z, .mtcDone
+    ld      a, [hl]
+    inc     hl
+    dec     bc
+    and     0xDF
+    cp      'R'
+    jr      z, .mtcDone                    ; </tr -> end of first row
+    cp      'A'
+    jr      z, .mtcDone                    ; </ta(ble) -> end of table
+    jr      .mtcLoop
+.mtcDone:
+    ld      a, d
+    or      a
+    jr      nz, .mtcGotN
+    ld      a, 1                           ; degenerate: empty table -> 1 col
+    jr      .mtcSet
+.mtcGotN:
+    cp      6
+    jr      c, .mtcSet
+    ld      a, 5                           ; clamp 6+ down to 5 (last layout)
+.mtcSet:
+    ld      [HtmlTableColCount], a
+    pop     bc
+    pop     de
+    pop     hl
+    ret
 
 ; DrawTableRuleHere: horizontal DGRAY rule at the current TextY across
 ; the table's width (from TABLE_LEFT_PX to TABLE_RIGHT_PX). Skipped
 ; while LineSkip is non-zero.
 DrawTableRuleHere:
-    ld      a, [HtmlLineSkip]
+    ; HTML 2.0: <table> draws no borders unless border="<n>" with n>=1
+    ; (or a bare `border` attr). HtmlTableBorder gates every horizontal
+    ; rule + vertical edge so default <table>s render plain text grids.
+    ld      a, [HtmlTableBorder]
     or      a
+    ret     z
+    ld      a, [HtmlLineSkip]
+    ld      b, a
+    ld      a, [HtmlLineSkip + 1]
+    or      b
     ret     nz
     ld      a, [TextY]
     cp      CONTENT_Y1 - TEXT_LINE_H + 2
@@ -6369,9 +12119,14 @@ DrawTableRuleHere:
 ; 1-byte (4 px) DGRAY vertical line at that X across the current row
 ; (HtmlRowTopY for TEXT_LINE_H rows). Skipped while LineSkip is non-zero.
 DrawCellDividerAt_HL:
+    ld      a, [HtmlTableBorder]
+    or      a
+    ret     z                           ; border=0 -> no inner column dividers
     push    hl
     ld      a, [HtmlLineSkip]
-    or      a
+    ld      b, a
+    ld      a, [HtmlLineSkip + 1]
+    or      b
     pop     hl
     ret     nz
     srl     h
@@ -6440,7 +12195,7 @@ ApplyBlockAttrs:
     ld      a, [HtmlNextAlign]
     cp      0xFF
     jr      nz, .abaDirDone
-    ld      a, 1
+    ld      a, 2
     ld      [HtmlAlign], a
 .abaDirDone:
     ld      a, [HtmlNextAlign]
@@ -6482,6 +12237,29 @@ TagCenter:
     ret
 
 TagHr:
+    ; Inside a <table> (e.g. <tr><th colspan="5"><hr></th></tr> as a
+    ; spacer row between the header and data rows): draw the rule at
+    ; HtmlRowTopY -- the document-flow EmitBlankLine + TextY+3 path
+    ; would land on top of the NEXT <tr>'s text, since TextY tracks
+    ; per-cell layout in table context, not row spacing. The row
+    ; itself still advances normally on its </tr>.
+    ld      a, [HtmlInTable]
+    or      a
+    jr      z, .hrBlock
+    ld      a, [HtmlLineSkip]
+    ld      b, a
+    ld      a, [HtmlLineSkip + 1]
+    or      b
+    ret     nz
+    ld      a, [HtmlRowTopY]
+    add     a, 4                        ; middle of the 10-px row band
+    ld      c, a
+    ld      b, 0
+    ld      d, (CONTENT_X_END + 1) / 4
+    ld      a, COL_DGRAY
+    jp      DrawHLine
+
+.hrBlock:
     call    EmitBlankLine
     ; Only draw the rule when the current pen is actually inside the visible
     ; content band. When ScrollLine > 0 the first HR tags are above the top
@@ -6489,7 +12267,9 @@ TagHr:
     ; while LineSkip is non-zero. Drawing then would leave a stray rule at
     ; the top of the page after any scroll.
     ld      a, [HtmlLineSkip]
-    or      a
+    ld      b, a
+    ld      a, [HtmlLineSkip + 1]
+    or      b
     jp      nz, EmitBlankLine
     ld      a, [TextY]
     cp      CONTENT_Y1 - TEXT_LINE_H + 2
@@ -6566,8 +12346,10 @@ HxDispatch:
     ret
 .hxClose:
     ; Close: end the line (at the heading's scale), reset scale to 1
-    ; before the half-line gap so it uses text-line pitch, then clear
-    ; the style bits this heading enabled.
+    ; so the half-line gap and following paragraph use normal text
+    ; pitch -- otherwise EmitNewline keeps stamping 16-px rows for
+    ; the rest of the document and content gets pushed onto extra
+    ; pages with visibly stretched line spacing.
     push    bc
     call    EmitNewline
     ld      a, 1
@@ -6627,7 +12409,7 @@ TagA:
     ld      a, [HtmlStyleFlags]
     or      STYLE_UNDERLINE
     ld      [HtmlStyleFlags], a
-    ld      a, 1
+    ld      a, 2
     ld      [HtmlInAnchor], a
 
     ; If this link's index matches HtmlFocusLink, light up the dotted-
@@ -6648,11 +12430,24 @@ TagA:
     ret     nc
 
     ; Stash current pen position into slot [LinkCount]. X is 2 bytes, Y is 1.
+    ; If we're still in the scroll-skip phase, TextY is pinned at the top
+    ; of the content band -- recording it as-is would let off-screen
+    ; links steal clicks targeted at whatever real content lands at the
+    ; same Y on the visible page (e.g. a click on blank area near the
+    ; top of page 2 would dispatch to the page-1 sort link). Burn 0xFF
+    ; as a sentinel so CheckLinkHit's `mouseY < startY` early-out fires.
     ld      e, a
     ld      d, 0
     ld      hl, LinkStartY
     add     hl, de
+    ld      a, [HtmlLineSkip]
+    ld      b, a
+    ld      a, [HtmlLineSkip + 1]
+    or      b
+    ld      a, 0xFF
+    jr      nz, .stashY
     ld      a, [TextY]
+.stashY:
     ld      [hl], a
 
     ld      hl, LinkStartX
@@ -6666,22 +12461,15 @@ TagA:
 
     ; Copy HtmlCurHref into the slot's url buffer.
     ld      a, [LinkCount]
-    ; URL offset = LinkCount * (LINK_URL_MAX + 1). Multiply by 33 via adds.
-    ld      l, a
-    ld      h, 0
-    ld      d, h
-    ld      e, l
-    add     hl, hl                      ; *2
-    add     hl, hl                      ; *4
-    add     hl, hl                      ; *8
-    add     hl, hl                      ; *16
-    add     hl, hl                      ; *32
-    add     hl, de                      ; *33
+    ; URL offset = LinkCount * (LINK_URL_MAX + 1) = idx * 256.
+    ; LINK_MAX = 24 -> table is 24 * 256 = 6144 bytes total.
+    ld      h, a
+    ld      l, 0                        ; HL = idx * 256
     ld      de, LinkUrls
     add     hl, de
     ex      de, hl                      ; DE = dest
     ld      hl, HtmlCurHref
-    ld      b, LINK_URL_MAX + 1
+    ld      b, low(LINK_URL_MAX + 1)
 .copyUrl:
     ld      a, [hl]
     ld      [de], a
@@ -6726,12 +12514,1139 @@ TagA:
     ld      [LinkCount], a
     ret
 
+; ----------------------------------------------------------------------------
+; Form elements (HTML 2). Tags parse into the FormFields slot table
+; (see FormAllocCurrent); text / password / checkbox / radio render as
+; graphical widgets that can be focused, typed into, toggled, and
+; submitted. A submit click or Enter on a focused Send button builds a
+; GET query string in UrlBuf and hands off to NavigateAndFocusContent
+; -- the same pipeline a regular URL load uses.
+; ----------------------------------------------------------------------------
+
+; <form>: no visible chrome of its own; the inputs nested inside do
+; the rendering. On the open tag, copy action= (which ScanHrefAttr
+; dropped into HtmlCurHref) into HtmlFormAction so DoFormSubmit can
+; build the real target URL later -- ScanHrefAttr clobbers HtmlCurHref
+; on every subsequent tag, so we need a persistent stash.
+;
+; We do NOT clear HtmlFormAction on </form>: the user may press Enter
+; or click Submit long after the parser has moved past the closing
+; tag, so the action has to survive. Fresh page loads clear it via
+; FormReset (which runs before each PrintFileContent).
+FORM_ACTION_MAX equ 63
+TagForm:
+    ld      a, [HtmlIsClose]
+    or      a
+    ret     nz                          ; </form>: leave HtmlFormAction alone
+    ld      a, [HtmlCurHref]
+    or      a
+    ret     z                           ; <form> without action=: leave as-is
+    ld      hl, HtmlCurHref
+    ld      de, HtmlFormAction
+    ld      b, FORM_ACTION_MAX
+.tfCopy:
+    ld      a, [hl]
+    ld      [de], a
+    or      a
+    ret     z
+    inc     hl
+    inc     de
+    djnz    .tfCopy
+    xor     a
+    ld      [de], a                     ; NUL-terminate on overrun
+    ret
+
+; Default visible width (inner cells, exclusive of the L/R borders) for a
+; text or password input that didn't carry SIZE=. Must match
+; FORM_VALUE_MAX so the widget reserves exactly enough cells for the
+; value buffer's full capacity.
+TI_TEXT_DEFAULT_W equ FORM_VALUE_MAX
+
+; <input>: dispatch on HtmlInputType (first two letters of type=,
+; uppercased). Defaults to text when no TYPE was given. Widgets are
+; built from the WG_* sentinel cells (see WidgetBitmaps); the BiDi /
+; wrap pipeline treats them like any other 8-px-wide glyph cell.
+;
+; Every visible <input> gets a slot in the FormFields table (FormAlloc)
+; so typing, focus, and submit can find it later. The slot's value is
+; primed from the parsed VALUE= attribute and may be edited live.
+TagInput:
+    ld      a, [HtmlIsClose]
+    or      a
+    ret     nz                          ; <input> is empty; ignore '/'
+    ld      a, [HtmlInputType]
+    cp      'P'
+    jp      z, .inputText               ; password = same shape as text
+    cp      'S'
+    jp      z, .inputSubmit
+    cp      'B'
+    jp      z, .inputSubmit             ; <button> -> render like submit
+    cp      'C'
+    jp      z, .inputCheckbox
+    cp      'R'
+    jp      z, .inputR                  ; radio or reset?
+    cp      'H'
+    jp      z, .inputHidden
+    cp      'I'
+    jp      z, .inputImage
+    ; fall through: type=text (or anything we don't understand)
+.inputText:
+    ; Allocate a slot, copy in name + initial value. Render value chars
+    ; inside the box (left-aligned), then pad with empty M cells to fill
+    ; the remaining width. If this slot is the focused one (HtmlFormFocus),
+    ; switch the box edges to the BLACK-bordered LF/MF/RF variants so
+    ; the user can see which field will receive their typing.
+    call    FormAllocCurrent            ; A = slot, CF=1 if no room
+    push    af                          ; save CF for later
+    call    nc, FormStoreFromSlotA
+    pop     af
+    ; A still holds the slot index. Stash it in .tiSlot for the rest of
+    ; this routine; reading FormCount-1 later would be wrong on sticky
+    ; re-renders (FormCount stays at the total, not "slots so far").
+    ld      [.tiSlot], a
+    push    af
+    call    nc, FormCaptureRect
+    pop     af
+    ; Focus check: is this slot the focused one?
+    ld      b, a
+    ld      a, [HtmlFormFocus]
+    cp      b
+    jr      z, .tiFocused
+    xor     a
+    jr      .tiFocusStored
+.tiFocused:
+    ld      a, 2
+.tiFocusStored:
+    ld      [.tiFocusFlag], a
+    ; Emit left edge (focused or not).
+    ld      a, [.tiFocusFlag]
+    or      a
+    ld      a, WG_BOX_L
+    jr      z, .tiEmitL
+    ld      a, WG_BOX_LF
+.tiEmitL:
+    call    EmitSink
+    ; Walk value chars (or '*' for password).
+    ld      b, 0                        ; B = chars emitted
+    ld      a, [.tiSlot]
+    call    FormGetValuePtr             ; HL -> value buf
+.tiVLoop:
+    ld      a, [hl]
+    or      a
+    jr      z, .tiPad
+    push    bc
+    push    hl
+    ld      a, [HtmlInputType]
+    cp      'P'
+    jr      nz, .tiVPlain
+    ld      a, '*'
+    jr      .tiVEmit
+.tiVPlain:
+    ld      a, [hl]
+.tiVEmit:
+    call    EmitSink
+    pop     hl
+    pop     bc
+    inc     hl
+    inc     b
+    ld      a, b
+    cp      TI_TEXT_DEFAULT_W
+    jr      c, .tiVLoop
+.tiPad:
+    ; Pad remaining width with M (or MF when focused) cells.
+    ld      a, TI_TEXT_DEFAULT_W
+    sub     b
+    jr      z, .tiPadDone
+    ld      b, a
+.tiPadLoop:
+    push    bc
+    ld      a, [.tiFocusFlag]
+    or      a
+    ld      a, WG_BOX_M
+    jr      z, .tiPadEmit
+    ld      a, WG_BOX_MF
+.tiPadEmit:
+    call    EmitSink
+    pop     bc
+    djnz    .tiPadLoop
+.tiPadDone:
+    ld      a, [.tiFocusFlag]
+    or      a
+    ld      a, WG_BOX_R
+    jr      z, .tiEmitR
+    ld      a, WG_BOX_RF
+.tiEmitR:
+    call    EmitSink
+    ld      a, [.tiSlot]
+    jp      FormFinishRect
+
+.tiFocusFlag:    db 0
+.tiSlot:         db 0
+
+.inputSubmit:
+    call    FormAllocCurrent
+    push    af
+    call    nc, FormStoreFromSlotA
+    pop     af
+    ld      [.tisSlot], a
+    ; Only capture rect when a slot was actually allocated (CF=0). With
+    ; CF=1 (table full) A=0xFF and FormCaptureRect would write 510
+    ; bytes past FormScreenX, scribbling into code.
+    push    af
+    call    nc, FormCaptureRect
+    pop     af
+    ; Decide focused vs unfocused for L/M/R. Reload slot index from
+    ; .tisSlot because FormCaptureRect doesn't preserve A.
+    ld      a, [.tisSlot]
+    ld      b, a
+    ld      a, [HtmlFormFocus]
+    cp      b
+    ld      a, 0
+    jr      nz, .tisFlagStored
+    ld      a, 2
+.tisFlagStored:
+    ld      [.tisFocusFlag], a
+    ld      a, [.tisFocusFlag]
+    or      a
+    ld      a, WG_BOX_L
+    jr      z, .tisEmitL
+    ld      a, WG_BOX_LF
+.tisEmitL:
+    call    EmitSink
+    ld      a, [.tisFocusFlag]
+    or      a
+    ld      a, WG_BOX_M
+    jr      z, .tisEmitMl
+    ld      a, WG_BOX_MF
+.tisEmitMl:
+    call    EmitSink                    ; left-pad
+    ld      hl, HtmlCurHref
+    ld      a, [hl]
+    or      a
+    jr      nz, .tisHaveLabel
+    ld      hl, .tisDefault             ; "OK" if no value= given
+.tisHaveLabel:
+    call    EmitSinkZ
+    ld      a, [.tisFocusFlag]
+    or      a
+    ld      a, WG_BOX_M
+    jr      z, .tisEmitMr
+    ld      a, WG_BOX_MF
+.tisEmitMr:
+    call    EmitSink                    ; right-pad
+    ld      a, [.tisFocusFlag]
+    or      a
+    ld      a, WG_BOX_R
+    jr      z, .tisEmitR
+    ld      a, WG_BOX_RF
+.tisEmitR:
+    call    EmitSink
+    ld      a, [.tisSlot]
+    jp      FormFinishRect
+.tisDefault:    db "OK", 0
+.tisSlot:       db 0
+.tisFocusFlag:  db 0
+
+.inputCheckbox:
+    call    FormAllocCurrent
+    push    af
+    call    nc, FormStoreFromSlotA
+    pop     af
+    push    af
+    call    nc, FormCaptureRect
+    pop     af
+    push    af
+    jr      c, .icbOff
+    ; Decide ON vs OFF from the slot's value.
+    call    FormGetValuePtr
+    ld      a, [hl]
+    or      a
+    jr      z, .icbOff
+    ; ON; check focus to pick focused vs unfocused variant.
+    pop     af
+    push    af
+    ld      b, a                        ; B = slot
+    ld      a, [HtmlFormFocus]
+    cp      b
+    ld      a, WG_CHK_ON
+    jr      nz, .icbEmit
+    ld      a, WG_CHK_ONF
+    jr      .icbEmit
+.icbOff:
+    pop     af
+    push    af
+    ld      b, a
+    ld      a, [HtmlFormFocus]
+    cp      b
+    ld      a, WG_CHK_OFF
+    jr      nz, .icbEmit
+    ld      a, WG_CHK_OFFF
+.icbEmit:
+    call    EmitSink
+    pop     af
+    ret     c
+    jp      FormFinishRect
+
+.inputR:
+    ld      a, [HtmlInputType + 1]
+    cp      'A'
+    jr      z, .inputRadio
+    ; <input type="reset">: paints like a submit button but click /
+    ; Enter must restore initial values, not POST. Stash a distinct
+    ; FormType byte ('X', otherwise unused) so TryFormClick + OnContent
+    ; can route to DoFormReset instead of DoFormSubmit. Done in-place
+    ; so .inputSubmit's FormStoreFromSlotA picks up the new type.
+    ld      a, 'X'
+    ld      [HtmlInputType], a
+    jp      .inputSubmit                ; reset: same visual as submit
+.inputRadio:
+    call    FormAllocCurrent
+    push    af
+    call    nc, FormStoreFromSlotA
+    pop     af
+    push    af
+    call    nc, FormCaptureRect
+    pop     af
+    push    af
+    jr      c, .irOff
+    call    FormGetValuePtr
+    ld      a, [hl]
+    or      a
+    jr      z, .irOff
+    pop     af
+    push    af
+    ld      b, a
+    ld      a, [HtmlFormFocus]
+    cp      b
+    ld      a, WG_RAD_ON
+    jr      nz, .irEmit
+    ld      a, WG_RAD_ONF
+    jr      .irEmit
+.irOff:
+    pop     af
+    push    af
+    ld      b, a
+    ld      a, [HtmlFormFocus]
+    cp      b
+    ld      a, WG_RAD_OFF
+    jr      nz, .irEmit
+    ld      a, WG_RAD_OFFF
+.irEmit:
+    call    EmitSink
+    pop     af
+    ret     c
+    jp      FormFinishRect
+
+.inputHidden:
+    call    FormAllocCurrent
+    call    nc, FormStoreFromSlotA
+    ret                                 ; hidden inputs aren't drawn
+
+.inputImage:
+    jp      TagImg                      ; behaves like an inline <img>
+
+; ---------------------------------------------------------------------------
+; Form-field slot helpers. The slot table (FormType / FormName / FormValue
+; / FormWidth, see globals near HtmlFormFocus) is rebuilt at every
+; PrintFileContent pass via FormReset, then each visible <input> grows it
+; by one slot via FormAllocCurrent. Slot indices are stable across the
+; render so click hit-testing and re-render keep agreeing on which slot
+; is which.
+; ---------------------------------------------------------------------------
+
+; FormReset: zero FormCount and clear FormSticky so the next render
+; treats every <input> as fresh (initial value re-loaded from VALUE=).
+; Called when navigating to a NEW URL via NavigateToCurrentUrl. After
+; the first render the flag flips so re-renders triggered by typing /
+; scrolling preserve any user-edited values. Clobbers A.
+FormReset:
+    xor     a
+    ld      [FormCount], a
+    ld      [FormSticky], a
+    ld      [HtmlFormAction], a         ; new page: drop previous action URL
+    ld      a, 0xFF
+    ld      [HtmlFormFocus], a
+    ret
+
+; FormBeginRender: called by PrintFileContent at the start of each
+; render. If FormSticky is 0 (fresh page), zero FormCount so TagInput
+; rebuilds the table from scratch. If sticky, keep FormCount but reset
+; the per-render write cursor (FormParseCursor) so the parser visits
+; slots in the same logical order to update positions only.
+FormBeginRender:
+    ld      a, [FormSticky]
+    or      a
+    jr      nz, .fbrSticky
+    xor     a
+    ld      [FormCount], a
+.fbrSticky:
+    xor     a
+    ld      [FormParseCursor], a
+    ret
+
+; FormEndRender: flip FormSticky on so future RefreshAfterScroll passes
+; preserve typed values. Called at the end of PrintFileContent.
+FormEndRender:
+    ld      a, 2
+    ld      [FormSticky], a
+    ret
+
+FormSticky:     db 0
+FormParseCursor: db 0
+
+; Per-slot screen rectangle, captured by TagInput at render time. Used
+; by TryFormClick to map mouse coords to a slot. X is 16-bit pixel,
+; Y is 8-bit row, W is pixel width.
+
+; FormCaptureRect: A = slot. Stores (TextX, TextY, width=0) for the
+; current widget into FormScreen[X|Y|W][A]. Width is computed later by
+; FormFinishRect once the widget's cells have been emitted. Clobbers
+; A, BC, DE, HL.
+FormCaptureRect:
+    cp      FORM_MAX
+    ret     nc                              ; slot out of range (table full)
+    ld      e, a
+    ld      d, 0
+    push    de
+    ; X (16-bit)
+    pop     de
+    push    de
+    ld      hl, FormScreenX
+    add     hl, de
+    add     hl, de
+    ld      a, [TextX]
+    ld      [hl], a
+    inc     hl
+    ld      a, [TextX + 1]
+    ld      [hl], a
+    ; Y (8-bit)
+    pop     de
+    push    de
+    ld      hl, FormScreenY
+    add     hl, de
+    ld      a, [TextY]
+    ld      [hl], a
+    ; W = 0
+    pop     de
+    ld      hl, FormScreenW
+    add     hl, de
+    add     hl, de
+    xor     a
+    ld      [hl], a
+    inc     hl
+    ld      [hl], a
+    ret
+
+; FormFinishRect: A = slot. Compute width = TextX - FormScreenX[A].
+; Stores into FormScreenW[A] (16-bit). Clobbers A, BC, DE, HL.
+FormFinishRect:
+    cp      FORM_MAX
+    ret     nc                              ; slot out of range
+    ld      e, a
+    ld      d, 0
+    ld      hl, FormScreenX
+    add     hl, de
+    add     hl, de
+    ld      c, [hl]
+    inc     hl
+    ld      b, [hl]                         ; BC = startX
+    ld      hl, [TextX]
+    and     a
+    sbc     hl, bc                          ; HL = end - start
+    ; Store HL into FormScreenW[A].
+    ld      a, e
+    ld      e, a
+    ld      d, 0
+    push    hl
+    ld      hl, FormScreenW
+    add     hl, de
+    add     hl, de
+    pop     bc                              ; BC = width
+    ld      [hl], c
+    inc     hl
+    ld      [hl], b
+    ret
+
+; FormAllocCurrent: reserve the parse cursor's current slot and return
+; its index in A. CF=0 on success, CF=1 if FormParseCursor reached
+; FORM_MAX. On a fresh-page render this is the same as "next FormCount"
+; and it grows the table; on a sticky re-render it just walks existing
+; slots in the same parser order so values from previous render survive.
+FormAllocCurrent:
+    ld      a, [FormParseCursor]
+    cp      FORM_MAX
+    jr      nc, .faFull
+    ld      [FormSlotTmp], a
+    inc     a
+    ld      [FormParseCursor], a
+    ; If we're growing the table (cursor went past current count), bump
+    ; FormCount too. On sticky re-renders the cursor stays <= count so
+    ; we don't double-grow.
+    ld      b, a
+    ld      a, [FormCount]
+    cp      b
+    jr      nc, .faGrowSkip
+    ld      a, b
+    ld      [FormCount], a
+.faGrowSkip:
+    ld      a, [FormSlotTmp]
+    or      a                               ; CF=0
+    ret
+.faFull:
+    scf
+    ret
+
+FormSlotTmp:    db 0
+
+; FormStoreFromSlotA: A = slot index. On a fresh-page render (FormSticky
+; is 0) this writes type / width / name / value into the slot from the
+; current parser scratch state. On a sticky re-render it returns
+; immediately so the user's typed value isn't clobbered by the original
+; VALUE= attribute on every keystroke.
+FormStoreFromSlotA:
+    ; Stash slot once in FormSlotTmp; reload as needed. Avoids five
+    ; push af/pop af pairs (10 bytes, ~100 T saved) that previously
+    ; shuttled A across the internal calls.
+    ld      [FormSlotTmp], a
+    ld      a, [FormSticky]
+    or      a
+    ret     nz                          ; sticky re-render: keep user value
+    ; --- type byte ---
+    ld      a, [FormSlotTmp]
+    ld      e, a
+    ld      d, 0
+    ld      hl, FormType
+    add     hl, de
+    ld      a, [HtmlInputType]
+    ld      [hl], a
+    ; --- width ---
+    ld      a, [FormSlotTmp]
+    ld      e, a
+    ld      d, 0
+    ld      hl, FormWidth
+    add     hl, de
+    ld      a, TI_TEXT_DEFAULT_W
+    ld      [hl], a
+    ; --- name ---
+    ld      a, [FormSlotTmp]
+    call    FormGetNamePtr
+    ex      de, hl
+    ld      hl, HtmlNameAttr
+    ld      bc, FORM_NAME_MAX + 1
+    ldir
+    ; --- value ---
+    ld      a, [FormSlotTmp]
+    call    FormGetValuePtr             ; HL -> dest
+    ex      de, hl                      ; DE = dest
+    ; For checkbox / radio the value buffer holds toggle state
+    ; ("" = off, "1" = on); seed from HtmlChecked. For other types
+    ; (text/pass/submit/...), seed from HtmlCurHref like before.
+    ld      hl, HtmlInputType
+    ld      a, [hl]
+    cp      'C'
+    jr      z, .fsfTogState
+    cp      'R'
+    jr      z, .fsfTogState
+    ld      hl, HtmlCurHref
+    ld      bc, FORM_VALUE_MAX + 1
+    ldir
+    ret
+.fsfTogState:
+    ld      a, [HtmlChecked]
+    or      a
+    ld      a, '1'
+    jr      nz, .fsfWrite
+    xor     a
+.fsfWrite:
+    ld      [de], a
+    inc     de
+    xor     a
+    ld      [de], a
+    ret
+
+; FormGetNamePtr: A = slot. Returns HL -> FormName[A * (NAME_MAX + 1)].
+; Clobbers HL, DE. Preserves A.
+FormGetNamePtr:
+    ; A is read once into E and then never written again, so it survives
+    ; the HL/DE math naturally -- no push/pop needed to "preserve" it.
+    ld      e, a
+    ld      d, 0
+    ; offset = A * 13. Use a tiny shift+add chain.
+    ld      h, d
+    ld      l, e                            ; HL = A
+    add     hl, hl                          ; *2
+    add     hl, hl                          ; *4
+    add     hl, hl                          ; *8
+    add     hl, de                          ; *9
+    add     hl, de                          ; *10
+    add     hl, de                          ; *11
+    add     hl, de                          ; *12
+    add     hl, de                          ; *13
+    ld      de, FormName
+    add     hl, de
+    ret
+
+; FormFirstEditableSlot: scan FormFields for the first text or password
+; slot. Returns A = slot index (CF=0), or 0xFF (CF=1) if there's none.
+; Clobbers BC, HL.
+FormFirstEditableSlot:
+    ld      a, [FormCount]
+    or      a
+    jr      z, .ffeNone
+    ld      b, a
+    ld      hl, FormType
+    ld      c, 0
+.ffeLoop:
+    ld      a, [hl]
+    cp      'T'
+    jr      z, .ffeHit
+    cp      'P'
+    jr      z, .ffeHit
+    inc     hl
+    inc     c
+    dec     b
+    jr      nz, .ffeLoop
+.ffeNone:
+    ld      a, 0xFF
+    scf
+    ret
+.ffeHit:
+    ld      a, c
+    or      a                                ; CF=0
+    ret
+
+; FormNextEditableSlot: advance HtmlFormFocus to the next text/pass slot
+; after the current one. Returns A = next slot, or 0xFF if no more.
+; Clobbers BC, HL.
+FormNextEditableSlot:
+    ld      a, [HtmlFormFocus]
+    inc     a                                ; start from focus+1
+    ld      c, a                             ; C = candidate slot
+.fneCheck:
+    ld      a, [FormCount]
+    cp      c
+    jr      z, .fneNone
+    jr      c, .fneNone
+    ld      b, 0
+    ld      a, c
+    ld      e, a
+    ld      d, b
+    ld      hl, FormType
+    add     hl, de
+    ld      a, [hl]
+    cp      'T'
+    jr      z, .fneHit
+    cp      'P'
+    jr      z, .fneHit
+    inc     c
+    jr      .fneCheck
+.fneNone:
+    ld      a, 0xFF
+    scf
+    ret
+.fneHit:
+    ld      a, c
+    or      a
+    ret
+
+; FormFirstFocusableSlot: scan FormFields for the first slot whose type
+; is interactive (text, pass, checkbox, radio, submit, reset/button).
+; Hidden ('H') and image ('I') slots are skipped. Returns A = slot
+; index, or 0xFF if none. Clobbers BC, HL.
+FormFirstFocusableSlot:
+    ld      a, [FormCount]
+    or      a
+    jr      z, .ffsNone
+    ld      b, a
+    ld      hl, FormType
+    ld      c, 0
+.ffsLoop:
+    ld      a, [hl]
+    call    FormTypeIsFocusable
+    jr      nz, .ffsHit
+    inc     hl
+    inc     c
+    dec     b
+    jr      nz, .ffsLoop
+.ffsNone:
+    ld      a, 0xFF
+    ret
+.ffsHit:
+    ld      a, c
+    ret
+
+; FormNextFocusableSlot: advance HtmlFormFocus to the next focusable
+; slot after the current one. Returns A = next slot, or 0xFF.
+FormNextFocusableSlot:
+    ld      a, [HtmlFormFocus]
+    inc     a
+    ld      c, a
+.fnsCheck:
+    ld      a, [FormCount]
+    cp      c
+    jr      z, .fnsNone
+    jr      c, .fnsNone
+    ld      a, c
+    ld      e, a
+    ld      d, 0
+    ld      hl, FormType
+    add     hl, de
+    ld      a, [hl]
+    call    FormTypeIsFocusable
+    jr      nz, .fnsHit
+    inc     c
+    jr      .fnsCheck
+.fnsNone:
+    ld      a, 0xFF
+    ret
+.fnsHit:
+    ld      a, c
+    ret
+
+; FormTypeIsFocusable: A = type byte. Returns NZ if focusable
+; (text/pass/check/radio/submit/reset/button), Z otherwise. A is
+; clobbered.
+FormTypeIsFocusable:
+    cp      'T'
+    jr      z, .ftfYes
+    cp      'P'
+    jr      z, .ftfYes
+    cp      'C'
+    jr      z, .ftfYes
+    cp      'R'
+    jr      z, .ftfYes
+    cp      'S'
+    jr      z, .ftfYes
+    cp      'B'
+    jr      z, .ftfYes
+    cp      'X'                              ; reset (TagInput stores 'X'
+    jr      z, .ftfYes                       ; to disambiguate from radio)
+    cp      'L'                              ; <select>
+    jr      z, .ftfYes
+    xor     a                                ; not focusable: Z set
+    ret
+.ftfYes:
+    ld      a, 2
+    or      a                                ; focusable: NZ
+    ret
+
+; FormApplyLineOffset: for every slot whose FormScreenY matches the
+; current TextY, add (LineStartCol*4 - HtmlIndent) pixels to
+; FormScreenX. Called from LineDrawCells right after LineStartCol is
+; finalised so centered / right-aligned paragraphs still produce
+; correct hit-test + in-place-paint coordinates. Stores delta/line-Y
+; in scratch vars up-front so the inner loop can stay simple.
+FormApplyLineOffset:
+    push    bc
+    push    de
+    push    hl
+    ; delta = LineStartCol*4 - HtmlIndent; line-Y = TextY.
+    ld      a, [LineStartCol]
+    add     a, a
+    add     a, a
+    ld      b, a
+    ld      a, [HtmlIndent]
+    neg
+    add     a, b                         ; A = delta (signed 8-bit)
+    ld      [FaloDelta], a
+    or      a
+    jr      z, .faloDone                 ; no offset needed
+    ld      a, [TextY]
+    ld      [FaloLineY], a
+    ld      a, [FormCount]
+    or      a
+    jr      z, .faloDone
+    ld      [FaloCount], a
+    xor     a
+    ld      [FaloSlot], a
+.faloLoop:
+    ld      a, [FaloSlot]
+    ld      e, a
+    ld      d, 0
+    ld      hl, FormScreenY
+    add     hl, de
+    ld      a, [hl]
+    ld      hl, FaloLineY
+    cp      [hl]
+    jr      nz, .faloAdvance
+    ; Match: FormScreenX[slot] += FaloDelta. Delta = LineStartCol*4 -
+    ; HtmlIndent is always >= 0 (center/right alignment pushes the line
+    ; start further right than a bare indent); treating it as signed
+    ; 8-bit would sign-extend a legitimate 128..200 px offset into
+    ; 0xFFxx and corrupt the high byte. Add unsigned with carry.
+    ld      a, [FaloSlot]
+    ld      e, a
+    ld      d, 0
+    ld      hl, FormScreenX
+    add     hl, de
+    add     hl, de                       ; HL -> FormScreenX[slot] low byte
+    ld      a, [FaloDelta]
+    ld      b, a
+    ld      a, [hl]
+    add     a, b
+    ld      [hl], a
+    inc     hl
+    ld      a, [hl]
+    adc     a, 0                         ; propagate carry only
+    ld      [hl], a
+.faloAdvance:
+    ld      a, [FaloSlot]
+    inc     a
+    ld      [FaloSlot], a
+    ld      hl, FaloCount
+    cp      [hl]
+    jr      c, .faloLoop
+.faloDone:
+    pop     hl
+    pop     de
+    pop     bc
+    ret
+
+FaloDelta:      db 0
+FaloLineY:      db 0
+FaloSlot:       db 0
+FaloCount:      db 0
+
+; FormOptCaptureByte: called from EmitSink when HtmlOptCapturing is
+; set. Append the char in B to the end of FormValue[HtmlSelectSlot]
+; (capped at FORM_VALUE_MAX). Preserves no registers other than via
+; the caller's push/pop wrapping.
+FormOptCaptureByte:
+    ld      a, [HtmlSelectSlot]
+    call    FormGetValuePtr                 ; HL -> value buf
+    ; Walk to NUL.
+    ld      c, 0
+.focLen:
+    ld      a, [hl]
+    or      a
+    jr      z, .focAtEnd
+    inc     hl
+    inc     c
+    ld      a, c
+    cp      FORM_VALUE_MAX
+    jr      c, .focLen
+.focAtEnd:
+    ld      a, c
+    cp      FORM_VALUE_MAX
+    ret     nc                              ; full -> drop char
+    ld      a, b
+    ld      [hl], a
+    inc     hl
+    xor     a
+    ld      [hl], a
+    ret
+
+; FormPrevFocusableSlot: walk BACKWARD from HtmlFormFocus-1 looking
+; for the previous focusable slot. Returns A = slot index, or 0xFF if
+; no focusable slot exists at a lower index. Clobbers BC, HL, DE.
+FormPrevFocusableSlot:
+    ld      a, [HtmlFormFocus]
+    or      a
+    jr      z, .fpsNone                     ; focus already at slot 0
+    cp      0xFF
+    jr      z, .fpsFromEnd                  ; no current focus -> start at last slot
+    dec     a
+    ld      c, a
+    jr      .fpsCheck
+.fpsFromEnd:
+    ld      a, [FormCount]
+    or      a
+    jr      z, .fpsNone
+    dec     a
+    ld      c, a
+.fpsCheck:
+    ld      e, c
+    ld      d, 0
+    ld      hl, FormType
+    add     hl, de
+    ld      a, [hl]
+    call    FormTypeIsFocusable
+    jr      nz, .fpsHit
+    ld      a, c
+    or      a
+    jr      z, .fpsNone
+    dec     c
+    jr      .fpsCheck
+.fpsNone:
+    ld      a, 0xFF
+    ret
+.fpsHit:
+    ld      a, c
+    ret
+
+; FormFirstSubmitSlot: find the first slot with type 'S' or 'B' (submit
+; or button). Returns A = slot index, or 0xFF if none. Clobbers BC, HL.
+FormFirstSubmitSlot:
+    ld      a, [FormCount]
+    or      a
+    jr      z, .fssNone
+    ld      b, a
+    ld      hl, FormType
+    ld      c, 0
+.fssLoop:
+    ld      a, [hl]
+    cp      'S'
+    jr      z, .fssHit
+    cp      'B'
+    jr      z, .fssHit
+    inc     hl
+    inc     c
+    dec     b
+    jr      nz, .fssLoop
+.fssNone:
+    ld      a, 0xFF
+    ret
+.fssHit:
+    ld      a, c
+    ret
+
+; FormGetValuePtr: A = slot. Returns HL -> FormValue[A * (VALUE_MAX + 1)].
+; VALUE_MAX + 1 = 19. Clobbers HL, DE. Preserves A.
+FormGetValuePtr:
+    ; Same as FormGetNamePtr: A is never written during the math, so it's
+    ; naturally preserved for the caller.
+    ld      e, a
+    ld      d, 0
+    ld      h, d
+    ld      l, e                            ; HL = A
+    add     hl, hl                          ; *2
+    add     hl, hl                          ; *4
+    add     hl, hl                          ; *8
+    add     hl, hl                          ; *16
+    add     hl, de                          ; *17
+    add     hl, de                          ; *18
+    add     hl, de                          ; *19
+    ld      de, FormValue
+    add     hl, de
+    ret
+
+; Helper: walk a NUL-terminated string at HL, emitting each byte
+; through EmitSink. Returns when it hits the NUL.
+EmitSinkZ:
+    ld      a, [hl]
+    or      a
+    ret     z
+    push    hl
+    call    EmitSink
+    pop     hl
+    inc     hl
+    jr      EmitSinkZ
+
+; <select>...</select>: render as a text-input-shaped widget with a
+; dropdown arrow on the right. The *visible* option is the one whose
+; parse-order index matches FormSelectIdx[slot]. Space on a focused
+; select cycles FormSelectIdx modulo FormOptCount, so the user can
+; step through options without a real dropdown popup. While rendering
+; the matching option, EmitSink also appends each char to FormValue
+; so submit sends the user's pick.
+TagSelect:
+    ld      a, [HtmlIsClose]
+    or      a
+    jr      nz, .tsClose
+    ; Allocate + capture rect. On a sticky re-render FormAllocCurrent
+    ; just steps the parse cursor; the slot's FormSelectIdx / count
+    ; survive from the previous render.
+    call    FormAllocCurrent
+    push    af
+    call    nc, FormStoreFromSlotA
+    pop     af
+    ld      [HtmlSelectSlot], a
+    ; Fresh render only: stamp the slot's type byte as 'L' (seLect) so
+    ; OnContent's dispatch tells selects apart from text inputs, and
+    ; zero the per-slot FormSelectIdx / FormOptCount so the next Space
+    ; wraps from 0. Sticky re-renders keep whatever the user edited.
+    ld      a, [FormSticky]
+    or      a
+    jr      nz, .tsAfterInit
+    ld      a, [HtmlSelectSlot]
+    ld      e, a
+    ld      d, 0
+    ld      hl, FormType
+    add     hl, de
+    ld      a, 'L'
+    ld      [hl], a
+    ld      hl, FormSelectIdx
+    add     hl, de
+    xor     a
+    ld      [hl], a
+    ld      hl, FormOptCount
+    add     hl, de
+    ld      [hl], a
+.tsAfterInit:
+    ld      a, [HtmlSelectSlot]
+    call    FormCaptureRect
+    ; Decide focus visual for the L edge (re-use WG_BOX_LF / _MF / _RF
+    ; for the focused state, same as submit/text). Reload slot from
+    ; HtmlSelectSlot -- FormCaptureRect ends with `xor a; ld [hl], a`
+    ; so A is 0, not the slot index.
+    ld      a, [HtmlSelectSlot]
+    ld      b, a
+    ld      a, [HtmlFormFocus]
+    cp      b
+    ld      a, 0
+    jr      nz, .tsFlagStored
+    ld      a, 2
+.tsFlagStored:
+    ld      [HtmlSelectFocus], a
+    ld      a, [HtmlSelectFocus]
+    or      a
+    ld      a, WG_BOX_L
+    jr      z, .tsEmitL
+    ld      a, WG_BOX_LF
+.tsEmitL:
+    call    EmitSink
+    ld      a, [HtmlSelectFocus]
+    or      a
+    ld      a, WG_BOX_M
+    jr      z, .tsEmitMl
+    ld      a, WG_BOX_MF
+.tsEmitMl:
+    call    EmitSink
+    ; Reset per-render option state.
+    xor     a
+    ld      [HtmlOptCurIdx], a
+    ld      a, 2
+    ld      [HtmlSkipBody], a
+    ret
+.tsClose:
+    ; Record total option count for this slot so Space can wrap
+    ; FormSelectIdx modulo the count.
+    ld      a, [HtmlSelectSlot]
+    ld      e, a
+    ld      d, 0
+    ld      hl, FormOptCount
+    add     hl, de
+    ld      a, [HtmlOptCurIdx]
+    ld      [hl], a
+    ; Clear SkipBody so the closing cells actually render.
+    xor     a
+    ld      [HtmlSkipBody], a
+    ld      a, [HtmlSelectFocus]
+    or      a
+    ld      a, WG_BOX_M
+    jr      z, .tsEmitMr
+    ld      a, WG_BOX_MF
+.tsEmitMr:
+    call    EmitSink
+    ld      a, WG_SEL_ARROW
+    call    EmitSink
+    ld      a, [HtmlSelectFocus]
+    or      a
+    ld      a, WG_BOX_R
+    jr      z, .tsEmitR
+    ld      a, WG_BOX_RF
+.tsEmitR:
+    call    EmitSink
+    ld      a, [HtmlSelectSlot]
+    jp      FormFinishRect
+
+HtmlSelectSlot:  db 0
+HtmlSelectFocus: db 0
+
+; <option>...</option>: the Nth option (0-indexed) shows when
+; HtmlOptCurIdx reaches FormSelectIdx[select_slot]. While the matching
+; option is open we also enable HtmlOptCapturing so EmitSink mirrors
+; each char into FormValue[select_slot] for the eventual submit.
+TagOption:
+    ld      a, [HtmlIsClose]
+    or      a
+    jp      nz, .toClose
+    ; Is this the "visible" option? Compare HtmlOptCurIdx to
+    ; FormSelectIdx[HtmlSelectSlot].
+    ld      a, [HtmlSelectSlot]
+    ld      e, a
+    ld      d, 0
+    ld      hl, FormSelectIdx
+    add     hl, de
+    ld      a, [hl]                         ; target idx
+    ld      b, a
+    ld      a, [HtmlOptCurIdx]
+    cp      b
+    ret     nz                              ; not the visible one
+    ; Visible: unmask text and start capturing into FormValue.
+    xor     a
+    ld      [HtmlSkipBody], a
+    ld      a, 2
+    ld      [HtmlOptCapturing], a
+    ; Zero FormValue[select_slot] so we capture fresh text.
+    ld      a, [HtmlSelectSlot]
+    call    FormGetValuePtr
+    xor     a
+    ld      [hl], a
+    ret
+.toClose:
+    ; Always bump the option counter on close, matched-or-not.
+    ld      a, [HtmlOptCurIdx]
+    inc     a
+    ld      [HtmlOptCurIdx], a
+    ; Stop capturing + re-suppress body text.
+    xor     a
+    ld      [HtmlOptCapturing], a
+    ld      a, 2
+    ld      [HtmlSkipBody], a
+    ret
+
+; <textarea>...</textarea>: render as a single-row text-box widget for
+; now. ROWS / COLS parsing + multi-row visual is a follow-up; the
+; existing single-cell-tall renderer keeps it inline with surrounding
+; text. Body text (the initial value) is suppressed via HtmlSkipBody.
+TagTextarea:
+    ld      a, [HtmlIsClose]
+    or      a
+    jr      nz, .ttaClose
+    ld      a, WG_BOX_L
+    call    EmitSink
+    ld      b, TI_TEXT_DEFAULT_W
+.ttaBoxLoop:
+    push    bc
+    ld      a, WG_BOX_M
+    call    EmitSink
+    pop     bc
+    djnz    .ttaBoxLoop
+    ld      a, WG_BOX_R
+    call    EmitSink
+    ld      a, 2
+    ld      [HtmlSkipBody], a
+    ret
+.ttaClose:
+    xor     a
+    ld      [HtmlSkipBody], a
+    ret
+
+; <isindex prompt="..."> renders as the prompt text + a text-input
+; placeholder. HTML 2's standalone search prompt; rare in modern
+; pages but cheap to support.
+TagIsIndex:
+    ld      hl, HtmlCurHref             ; prompt= captured here
+    ld      a, [hl]
+    or      a
+    jr      z, .tisxNoPrompt
+    call    EmitSinkZ
+    ld      a, ' '
+    call    EmitSink
+.tisxNoPrompt:
+    ld      a, WG_BOX_L
+    call    EmitSink
+    ld      b, TI_TEXT_DEFAULT_W
+.tisxBoxLoop:
+    push    bc
+    ld      a, WG_BOX_M
+    call    EmitSink
+    pop     bc
+    djnz    .tisxBoxLoop
+    ld      a, WG_BOX_R
+    jp      EmitSink
+
 ; Tag dispatch table. Names are already uppercased. Aliases share a handler.
 TagTbl:
     db  "HEAD", 0
     dw  TagHead
     db  "BODY", 0
     dw  TagBody
+    db  "SCRIPT", 0
+    dw  TagScript
+    db  "STYLE", 0
+    dw  TagStyle
     db  "TITLE", 0
     dw  TagTitle
     db  "HTML", 0
@@ -6780,12 +13695,22 @@ TagTbl:
     dw  TagOl
     db  "LI", 0
     dw  TagLi
+    db  "DL", 0
+    dw  TagDl
+    db  "DT", 0
+    dw  TagDt
+    db  "DD", 0
+    dw  TagDd
     db  "PRE", 0
     dw  TagPre
     db  "BLOCKQUOTE", 0
     dw  TagBlockquote
     db  "IMG", 0
     dw  TagImg
+    db  "MAP", 0
+    dw  TagMap
+    db  "AREA", 0
+    dw  TagArea
     db  "TABLE", 0
     dw  TagTableTag
     db  "TR", 0
@@ -6796,6 +13721,18 @@ TagTbl:
     dw  TagTh
     db  "FONT", 0
     dw  TagFont
+    db  "FORM", 0
+    dw  TagForm
+    db  "INPUT", 0
+    dw  TagInput
+    db  "SELECT", 0
+    dw  TagSelect
+    db  "OPTION", 0
+    dw  TagOption
+    db  "TEXTAREA", 0
+    dw  TagTextarea
+    db  "ISINDEX", 0
+    dw  TagIsIndex
     db  0                               ; end marker
 
 ; ----------------------------------------------------------------------------
@@ -6960,6 +13897,179 @@ EntityTable:
     db  "NBSP", 0, 0x20                 ; space
     db  0                               ; end marker
 
+; TryFormClick: walk FormFields looking for a submit/button slot whose
+; rect contains the current mouse position. On hit: flash the button
+; (paint its interior dgray briefly), trigger DoFormSubmit. Returns
+; normally on miss so the caller can fall through to TryLinkClick.
+; TryFormClick: walk all focusable form slots looking for a mouse hit.
+; On hit: set focus to the clicked slot, then dispatch by type:
+;   submit/button  -> flash + fire DoFormSubmit
+;   checkbox/radio -> refresh (to show new focus border) + DoFormToggle
+;   select         -> refresh + DoFormSelectCycle
+;   text/password  -> just refresh; the focus border shows the caret
+TryFormClick:
+    ld      a, [FormCount]
+    or      a
+    ret     z
+    ld      b, a
+    ld      c, 0
+.tfcLoop:
+    push    bc
+    ld      a, c
+    call    FormGetTypePtr
+    ld      a, [hl]
+    call    FormTypeIsFocusable             ; Z if not focusable
+    jr      z, .tfcSkip
+    pop     bc
+    push    bc
+    ld      a, c
+    call    FormHitTest                     ; CF=0 if hit
+    jr      c, .tfcSkip
+    ; Hit: set focus, dispatch by type.
+    pop     bc
+    push    bc
+    ld      a, c
+    ld      [HtmlFormFocus], a
+    call    FormGetTypePtr
+    ld      a, [hl]
+    pop     bc
+    cp      'S'
+    jp      z, .tfcFire
+    cp      'B'
+    jp      z, .tfcFire
+    cp      'X'
+    jp      z, .tfcReset
+    cp      'C'
+    jp      z, .tfcToggle
+    cp      'R'
+    jp      z, .tfcToggle
+    cp      'L'
+    jp      z, .tfcCycle
+    ; Text / password (or anything else focusable): refresh so the
+    ; focus border shows, then jp MainLoop -- must NOT return normally
+    ; into ClickContent's fall-through, which would immediately clear
+    ; HtmlFormFocus as an "empty area" click.
+    call    RefreshContentInPlace
+    jp      MainLoop
+.tfcFire:
+    ld      a, c
+    call    FormFlashSlot
+    jp      DoFormSubmit
+.tfcReset:
+    ld      a, c
+    call    FormFlashSlot
+    jp      DoFormReset
+.tfcToggle:
+    call    RefreshContentInPlace
+    jp      DoFormToggle
+.tfcCycle:
+    call    RefreshContentInPlace
+    jp      DoFormSelectCycle
+.tfcSkip:
+    pop     bc
+    inc     c
+    djnz    .tfcLoop
+    ret
+
+; FormHitTest: A = slot. CF=0 on hit, CF=1 on miss.
+FormHitTest:
+    ld      e, a
+    ld      d, 0
+    ; Y check
+    ld      hl, FormScreenY
+    add     hl, de
+    ld      a, [hl]
+    ld      b, a                            ; B = SY
+    ld      a, [MouseY]
+    ld      c, a                            ; C = mouseY
+    ld      a, b
+    sub     WG_Y_RAISE                      ; top row
+    cp      c
+    jr      z, .fhtYAtTop
+    jr      nc, .fhtMiss                    ; mouseY < top
+.fhtYAtTop:
+    ld      a, b
+    add     a, WG_HEIGHT - WG_Y_RAISE
+    cp      c
+    jr      c, .fhtMiss                     ; mouseY >= bot
+    ; X check
+    ld      hl, FormScreenX
+    add     hl, de
+    add     hl, de
+    ld      c, [hl]
+    inc     hl
+    ld      b, [hl]                         ; BC = SX
+    ld      hl, [MouseX]
+    and     a
+    sbc     hl, bc                          ; HL = mouseX - SX
+    jr      c, .fhtMiss
+    ; Compare HL against W.
+    push    hl
+    ld      hl, FormScreenW
+    add     hl, de
+    add     hl, de
+    ld      c, [hl]
+    inc     hl
+    ld      b, [hl]                         ; BC = W
+    pop     hl
+    and     a
+    sbc     hl, bc
+    jr      nc, .fhtMiss                    ; rel >= W
+    or      a                                ; CF=0
+    ret
+.fhtMiss:
+    scf
+    ret
+
+; FormFlashSlot: A = slot. Paint the slot's rect dgray briefly. The
+; subsequent DoFormSubmit -> bridge round-trip (and any later
+; RefreshAfterScroll) restores the box artwork.
+FormFlashSlot:
+    ld      e, a
+    ld      d, 0
+    push    de
+    ; B = byte-col = SX / 4
+    ld      hl, FormScreenX
+    add     hl, de
+    add     hl, de
+    ld      a, [hl]
+    inc     hl
+    ld      h, [hl]
+    ld      l, a
+    srl     h
+    rr      l
+    srl     h
+    rr      l
+    ld      b, l
+    pop     de
+    push    de
+    ; C = top row = SY - WG_Y_RAISE
+    ld      hl, FormScreenY
+    add     hl, de
+    ld      a, [hl]
+    sub     WG_Y_RAISE
+    ld      c, a
+    pop     de
+    ; D = width in byte cols = W / 4 (low byte)
+    ld      hl, FormScreenW
+    add     hl, de
+    add     hl, de
+    ld      a, [hl]
+    srl     a
+    srl     a
+    ld      d, a
+    ld      e, WG_HEIGHT
+    ld      a, COL_DGRAY
+    call    FillRect
+    ; Brief busy-wait so the flash is perceptible.
+    ld      hl, 0
+.flashWait:
+    inc     hl
+    ld      a, h
+    cp      0x20
+    jr      c, .flashWait
+    ret
+
 ; TryLinkClick: if MouseX/MouseY sits on any link rect recorded in
 ; LinkTable, copy its URL into UrlBuf and tail-jump into navigation
 ; (never returns). Otherwise returns normally so the caller can continue
@@ -7103,16 +14213,12 @@ CheckLinkHit:
 
 ; GetLinkUrlPtr: A = link index -> HL = pointer to url string in LinkUrls.
 GetLinkUrlPtr:
-    ld      l, a
-    ld      h, 0
-    ld      d, h
-    ld      e, l
-    add     hl, hl                      ; *2
-    add     hl, hl                      ; *4
-    add     hl, hl                      ; *8
-    add     hl, hl                      ; *16
-    add     hl, hl                      ; *32
-    add     hl, de                      ; *33 (LINK_URL_MAX + 1)
+    ; idx * (LINK_URL_MAX + 1) = idx * 256. Stride is a clean 256 so
+    ; the offset is just (idx << 8). Bumped from the old idx*96 when
+    ; LINK_URL_MAX rose 95 -> 255 to fit Apache mirror URLs that ran
+    ; 100+ chars long and were getting truncated mid-path.
+    ld      h, a
+    ld      l, 0
     ld      de, LinkUrls
     add     hl, de
     ret
@@ -7128,7 +14234,7 @@ CopyHrefToUrlBuf:
     ld      a, [hl]
     ld      [de], a
     or      a
-    ret     z
+    jr      z, .chb_done
     inc     hl
     inc     de
     ld      a, [UrlLen]
@@ -7137,6 +14243,11 @@ CopyHrefToUrlBuf:
     djnz    .chb_loop
     xor     a
     ld      [de], a                     ; ensure NUL terminator on overflow
+.chb_done:
+    ; Park the address-bar caret at the end of the URL so the user
+    ; can immediately edit (Backspace pops chars from the right).
+    ld      a, [UrlLen]
+    ld      [UrlCursor], a
     ret
 
 ; ============================================================================
@@ -7146,25 +14257,44 @@ CopyHrefToUrlBuf:
 ; NavigateAndFocusContent: load UrlBuf then shift focus to the content
 ; area so the user can scroll immediately. Used by Enter in the address
 ; bar, Refresh button, link clicks, and Enter on a Tab-focused link.
+;
+; Focus = FOC_CONTENT must be set BEFORE NavigateToCurrentUrl runs:
+; NavigateToCurrentUrl now paints the toolbar and prerenders the next
+; page (which mirrors current chrome onto the back page) before
+; returning. If Focus is still FOC_ADDRESS at those paint/mirror
+; moments, the back page captures an address-bar-focused chrome and
+; every PageDown fast-flip reveals that stale focus frame even though
+; Focus actually moved on.
 NavigateAndFocusContent:
-    call    NavigateToCurrentUrl
     ld      a, FOC_CONTENT
     ld      [Focus], a
-    jp      PaintToolbar
+    jp      NavigateToCurrentUrl
 
 ; NavigateToCurrentUrl: load whatever is in UrlBuf and, on success, push
 ; it onto the ring-buffered history. Uses Busy to flip the toolbar to
 ; "stop" while the file is streaming in.
 NavigateToCurrentUrl:
+    ld      a, 2
+    ld      [LoadPhase], a                  ; phase 1: navigate started
     ld      a, 0xFF
     ld      [HtmlFocusLink], a
+    call    FormReset                       ; new page -> rebuild form table fresh
 
-    ld      a, 1
+    ld      a, 2
     ld      [Busy], a
+    ; Reset the spinner so each load starts on the same glyph; otherwise
+    ; the X cell might re-paint mid-cycle and look stuttery.
+    xor     a
+    ld      [BusyTick], a
+    ld      [BusyPhase], a
+    ld      a, 'X'
+    ld      [BusyChar], a
     call    PaintToolbar
 
     call    BuildFcbFromUrl
     call    DetectPlainText
+    xor     a
+    ld      [IsViewMode], a                 ; default: HTML mode; set by RemoteLoadView
     call    LoadFile
     or      a
     jr      nz, .err
@@ -7177,17 +14307,57 @@ NavigateToCurrentUrl:
     call    HistoryPush
     call    HistoryUpdateFlags
 
-    xor     a
-    ld      [ScrollLine], a
+    ; Hybrid bitmap pipeline: if RemoteLoadView painted a Screen-6
+    ; bitmap straight to VRAM, skip ClearContentArea + PrintFileContent
+    ; (those would wipe the bitmap and try to parse FileBuf as HTML --
+    ; FileBuf is untouched in view mode so it still has whatever the
+    ; previous page left there). Just refresh the toolbar / busy
+    ; indicator and we're done.
+    ld      a, [IsViewMode]
+    or      a
+    jr      nz, .navViewDone
+
+    ; Binary URLs (any extension not on the displayable whitelist:
+    ; htm, html, txt, pcx, bmp, sc6) skip rendering and pop the Save
+    ; dialog directly. The user's already typed/clicked the URL --
+    ; the bridge cached the body in self.body -- and asking "Save?"
+    ; is more useful than scrolling through a wall of garbage bytes.
+    ; HTM/TXT/no-extension URLs still flow into PrintFileContent;
+    ; PCX/BMP/SC6 already rendered as images via the LoadFile image-
+    ; synthesis path so the displayable check passes them through.
+    call    UrlIsBinary
+    jp      z, .navAutoSave
+
+    ld      hl, 0
+    ld      [ScrollLine], hl
     call    ClearContentArea
     call    PrintFileContent
-    ld      a, [HtmlLineCount]
-    ld      [TotalLines], a
+    call    StoreTotalLinesWithPages
     call    ComputeThumb
     call    DrawScrollbar
+.navViewDone:
     xor     a
     ld      [Busy], a
-    jp      PaintToolbar
+    ld      a, 6
+    ld      [LoadPhase], a                  ; phase 6: navigate done
+    call    PaintToolbar
+    ; Warm the back page so the FIRST PageDown after a URL load also
+    ; benefits from the Phase-1 fast-flip. NavigateToCurrentUrl is the
+    ; only render path that doesn't reach PrerenderNext via
+    ; RefreshAfterScroll's tail, so we have to call it explicitly here.
+    jp      PrerenderNext
+
+.navAutoSave:
+    ; Clear Busy and repaint chrome, then open the Save popup. The
+    ; popup's "GET SIZE" query reads the bridge's cached self.body
+    ; size (which RemoteLoadFile already populated above). DoSave's
+    ; chunk-loop then streams the body to dest via GET CHUNK.
+    xor     a
+    ld      [Busy], a
+    ld      a, 6
+    ld      [LoadPhase], a
+    call    PaintToolbar
+    jp      OpenSaveFromTitlebar
 
 .err:
     ; Load failed. If the address bar is empty (Enter pressed with no
@@ -7197,32 +14367,40 @@ NavigateToCurrentUrl:
     or      a
     jr      z, .errSilent
 
-    ; Real typed URL that didn't resolve: swap in the built-in 404
-    ; document and render it via the normal pipeline. Do NOT push to
-    ; history -- the attempted URL stays only in UrlBuf and On404
-    ; marks the current view as synthetic, so Back re-loads the
-    ; previous real page and Forward skips the 404 entirely.
-    ld      a, 1
+    ; Typed URL that didn't resolve: paint a minimal one-line "404
+    ; File Not Found" message directly into the content area. On404
+    ; keeps Back pointing at the last real page so forward/back work.
+    ld      a, 2
     ld      [On404], a
-
-    ld      hl, NotFoundHtml
-    ld      de, FileBuf
-    ld      bc, NotFoundHtmlLen
-    ldir
-    ld      hl, NotFoundHtmlLen
-    ld      [FileLen], hl
-    xor     a
-    ld      [PlainTextMode], a
-
-    xor     a
-    ld      [ScrollLine], a
+    ld      hl, 0
+    ld      [ScrollLine], hl
+    ld      [TotalLines], hl
+    ld      [HtmlLineCount], hl
     call    ClearContentArea
-    call    PrintFileContent
-    ld      a, [HtmlLineCount]
-    ld      [TotalLines], a
+    ld      a, COL_BLACK
+    ld      l, COL_WHITE
+    call    SetTextColours
+    ld      de, 8
+    ld      c, CONTENT_Y0 + 8
+    ld      hl, NotFoundMsg
+    call    DrawString
     call    ComputeThumb
     call    DrawScrollbar
+    ; Enable Back when there's a history entry to return to. Without
+    ; this the toolbar's Back button stays dimmed after a 404, even
+    ; though GoBack's .backFrom404 path has the logic to reload the
+    ; last real page. (The successful-load path above already calls
+    ; HistoryUpdateFlags after HistoryPush; the err path was missing
+    ; the equivalent and HasPrev stayed at 0.)
+    ld      a, [HistoryCount]
+    or      a
+    ld      a, 0
+    jr      z, .errNoBack
+    ld      a, 2
+.errNoBack:
+    ld      [HasPrev], a
     xor     a
+    ld      [HasNext], a
     ld      [Busy], a
     jp      PaintToolbar
 
@@ -7286,18 +14464,18 @@ GoForward:
 ReloadCurrent:
     ld      a, 0xFF
     ld      [HtmlFocusLink], a
-    ld      a, 1
+    call    FormReset                       ; new-page render -> fresh form table
+    ld      a, 2
     ld      [Busy], a
     call    PaintToolbar
     call    BuildFcbFromUrl
     call    DetectPlainText
     call    LoadFile
-    xor     a
-    ld      [ScrollLine], a
+    ld      hl, 0
+    ld      [ScrollLine], hl
     call    ClearContentArea
     call    PrintFileContent
-    ld      a, [HtmlLineCount]
-    ld      [TotalLines], a
+    call    StoreTotalLinesWithPages
     call    ComputeThumb
     call    DrawScrollbar
     xor     a
@@ -7407,7 +14585,7 @@ HistoryUpdateFlags:
     or      a
     ld      a, 0
     jr      z, .noPrev
-    ld      a, 1
+    ld      a, 2
 .noPrev:
     ld      [HasPrev], a
 
@@ -7419,7 +14597,7 @@ HistoryUpdateFlags:
     ld      a, [HistoryCursor]
     cp      b
     jr      nc, .noNext                 ; cursor >= count-1
-    ld      a, 1
+    ld      a, 2
     ld      [HasNext], a
     ret
 .noNext:
@@ -7431,71 +14609,733 @@ HistoryUpdateFlags:
 ; Step 2: Scrolling
 ; ============================================================================
 
-; RefreshAfterScroll: recompute thumb, redraw content + scrollbar.
+; RefreshAfterScroll: refresh the scrollbar first (so the thumb jumps
+; ahead of the slower content repaint and the user sees their scroll
+; acknowledged immediately), then redraw the content area itself.
+;
+; Fast-path (added with Phase-1 prerender): if PrerenderNext ran at
+; the end of the previous RefreshAfterScroll and the back page now
+; holds a snapshot for THIS ScrollLine, just flip the display. No
+; clear, no content render, no thumb compute -- the back already has
+; all of that. The post-flip prerender of the next-next page still
+; runs so spam-PageDown keeps getting instant flips.
 RefreshAfterScroll:
+    ld      a, [PrerenderValid]
+    or      a
+    jr      z, .rasNoFastPath
+    ld      hl, [PrerenderScrollLine]
+    ld      de, [ScrollLine]
+    or      a
+    sbc     hl, de
+    jr      nz, .rasNoFastPath           ; prerender is for a different line
+
+    ; Match. Atomic flip + bookkeeping.
+    xor     a
+    ld      [PrerenderValid], a
+    ld      a, [DisplayedPage]
+    xor     1
+    call    VdpSetDisplayPage            ; preserves A; updates DisplayedPage
+    ld      [WritesToPage], a
+    ; The next-next page would be a useful prerender to have warm;
+    ; tail-call into it.
+    jp      PrerenderNext
+
+.rasNoFastPath:
+    ; Phase 1: paint the busy-tinted scrollbar thumb on the currently
+    ; displayed page so the user sees IMMEDIATE feedback ("page acked,
+    ; rendering...") before the multi-100ms content render. With the
+    ; page-flip flow below this is the LAST thing we paint to the
+    ; old displayed page -- everything from here on goes to the back.
+    ld      a, [DisplayedPage]
+    ld      [WritesToPage], a            ; force writes onto displayed
+    ld      a, 1
+    ld      [ThumbBusy], a
     call    ComputeThumb
+    call    DrawScrollbar
+
+    ; Phase 2: lesson #4 page-flip prep. Mirror the titlebar + toolbar
+    ; bands from the displayed page to the back page so the upcoming
+    ; flip lands on a back page that has the SAME chrome the user is
+    ; already looking at. The content area is wiped and rewritten by
+    ; ClearContentArea+PrintFileContent below so it doesn't need
+    ; copying.
+    call    CopyChromeToBack
+
+    ; Phase 3: redirect VRAM writes to the back page. From here until
+    ; the flip every SetVramWritePos call goes through R14=back via
+    ; VdpSetR14's WritesToPage offset, so the user keeps seeing the
+    ; old page (no white flash from ClearContentArea, no half-rendered
+    ; intermediate state).
+    ld      a, [DisplayedPage]
+    xor     1
+    ld      [WritesToPage], a
+
+    ; Phase 4: render content + scrollbar on the back page (off-screen).
+    call    ClearContentArea            ; also drops InPlaceRender
+    call    PrintFileContent
+    ; Settled draw: black thumb. Also re-runs ComputeThumb in case
+    ; the render updated TotalLines (the thumb denominator), so the
+    ; final position+size matches the now-fresh state.
+    xor     a
+    ld      [ThumbBusy], a
+    call    ComputeThumb
+    call    DrawScrollbar
+
+    ; Phase 5: flip. R2 swap is a single VDP register write so the
+    ; transition is atomic at the next vblank -- no tearing.
+    ld      a, [WritesToPage]
+    call    VdpSetDisplayPage            ; updates DisplayedPage = A
+
+    ; Phase 6: idle. Future chrome state changes (toolbar buttons,
+    ; busy spinner, dialog overlays) should land on the now-displayed
+    ; page so the user sees them right away. WritesToPage tracks
+    ; DisplayedPage between renders.
+    ld      [WritesToPage], a
+    ; Scroll-overshoot snap-back: when the extrapolated HtmlLineCount
+    ; let PageDown push ScrollLine past the actual document end,
+    ; PrintFileContent reaches natural EOF with HtmlLineSkip still
+    ; non-zero. actual_total = ScrollLine - HtmlLineSkip. Latch that
+    ; into HtmlLineCount, snap ScrollLine to the last full viewport,
+    ; and re-render once.
+    ld      hl, [HtmlLineSkip]
+    ld      a, h
+    or      l
+    jp      z, PrerenderNext            ; viewport filled -> kick prerender
+    ld      de, [ScrollLine]
+    ld      a, d
+    or      e
+    jp      z, PrerenderNext            ; ScrollLine 0, doc < viewport
+    ex      de, hl
+    or      a
+    sbc     hl, de
+    jr      nc, .rasNoUnderflow
+    ld      hl, 0
+.rasNoUnderflow:
+    ld      [HtmlLineCount], hl
+    ld      [TotalLines], hl
+    ld      [HtmlLineCountSaved], hl
+    ld      a, 1
+    ld      [HtmlLineCountAccurate], a
+    ld      de, TEXT_MAX_LINES
+    or      a
+    sbc     hl, de
+    jr      nc, .rasStore
+    ld      hl, 0
+.rasStore:
+    ld      [ScrollLine], hl
+    jp      RefreshAfterScroll          ; one-shot re-render with fixed ScrollLine
+
+; ============================================================================
+; Phase-1 prerender
+;
+; Run the render pipeline a SECOND time after a successful PageDown
+; with ScrollLine bumped by PAGE_SCROLL_STEP, writing to the back
+; page. The next PageDown's RefreshAfterScroll fast-path matches the
+; stashed ScrollLine and just flips R#2 -- one VDP register write,
+; atomic at the next vblank -- instead of ~200 ms of synchronous
+; render. So back-to-back PageDowns feel instant from #2 onward; #1
+; is unchanged.
+;
+; Cost: blocking ~200 ms before MainLoop returns to halt. User
+; doesn't see it because the foreground render already flipped to
+; the visible new page; they're reading it while we prerender.
+;
+; Safety: we snapshot the foreground's line-counter state (which
+; PrintFileContent overwrites) and restore it after prerender so
+; PageDown's clamp math doesn't get confused. The prerender's
+; LineCache entries are kept -- they're valid for the document at
+; those line numbers regardless of which render added them.
+;
+; Skipped when:
+;   - Remote session (IsRemoteSession != 0). TryFetchMore /
+;     SlideForwardRemote inside a prerender is risky for now.
+;   - Candidate ScrollLine is past the document tail.
+;   - PrintFileContent hit natural EOF (HtmlLineSkip != 0 after
+;     return). The back has a partial render that we shouldn't
+;     fast-flip to.
+;
+; ----------------------------------------------------------------------------
+; TODO Phase 2 -- make prerender interruptible.
+;
+; Today the ~200 ms prerender blocks MainLoop, so a PgUp / link
+; click / line scroll that arrives mid-prerender waits one full
+; prerender-worth of latency before it gets serviced. Add a
+; checkpoint hook every N emitted rows (in EmitNewline?) that
+; polls BDOS DOS_CONST and, if a key is queued, sets a "bail"
+; flag the parser / line-flush path checks at the top of each
+; cell. Bailing cleanly requires every intermediate state to be
+; safe to abandon: VDP write address must be either committed or
+; trivially re-set, WritesToPage must remain pointing where the
+; caller expects, partial LineCache entries shouldn't poison
+; future lookups. ~150-250 lines threaded through PrintFileContent,
+; the BiDi reorder, image streamers, and form-widget paints.
+;
+; ----------------------------------------------------------------------------
+; TODO Phase 3 -- prerender BOTH directions.
+;
+; V9938 on 128 KB-VRAM MSX2 machines has 4 x 32 KB Screen-6 pages;
+; we use 2 (display + back). Pages 2 and 3 are idle. With a
+; 4-slot rotation we can keep BOTH "next page" AND "previous page"
+; warm so PgUp is also instant. Implementation requires:
+;   - WritesToPage becomes a 2-bit slot index (0..3) instead of a
+;     single bit; VdpSetR14 adds slot * 2 (R14 base 0 / 2 / 4 / 6).
+;   - VdpSetDisplayPage learns to write the higher R#2 bits (R#2 =
+;     0x1F | (slot << 5)? -- check V9938 datasheet for the exact
+;     page-select encoding above page 1).
+;   - PrerenderNext gets a sibling PrerenderPrev that targets the
+;     PgUp candidate; both pre-renders run after each successful
+;     scroll.
+;   - Slot accounting: which slot holds current, next-cached,
+;     prev-cached, scratch-for-current-render-when-flipping. Four
+;     slots is tight but enough.
+; ============================================================================
+
+PrerenderNext:
+    ld      a, [IsRemoteSession]
+    or      a
+    ret     nz
+
+    ; Compute candidate using the SAME clamp logic as PageDown so
+    ; PrerenderScrollLine matches the ScrollLine value the next
+    ; PageDown will actually pick. Without this, an estimated /
+    ; pre-extrapolation HtmlLineCount clamps PageDown's target
+    ; below SL + PAGE_SCROLL_STEP, the fast-path's
+    ; PrerenderScrollLine != ScrollLine check fails, and PageDown
+    ; pays a full foreground render even though the next page is
+    ; ready on the back.
+    ld      hl, [HtmlLineCount]
+    ld      a, h
+    or      l
+    ret     z                            ; zero-line doc, nothing to prerender
+    ld      de, TEXT_MAX_LINES + 1
+    and     a
+    sbc     hl, de
+    ret     c                            ; doc fits in viewport, no next page
+    inc     hl
+    ex      de, hl                       ; DE = max ScrollLine
+    ld      hl, [ScrollLine]
+    and     a
+    sbc     hl, de
+    ret     nc                           ; SL already at or past max, no next page
+    ld      hl, [ScrollLine]
+    ld      bc, PAGE_SCROLL_STEP
+    add     hl, bc
+    and     a
+    push    hl
+    sbc     hl, de
+    pop     hl
+    jr      c, .pnHaveCandidate          ; SL+step < max -> use it
+    ex      de, hl                       ; clamp HL = max ScrollLine
+.pnHaveCandidate:
+    ld      [PrerenderCandidate], hl
+    ; Skip prerender when candidate == current ScrollLine (would
+    ; render the same page that's already on display).
+    ld      de, [ScrollLine]
+    and     a
+    sbc     hl, de
+    ret     z
+
+    ; --- Snapshot the foreground state PrintFileContent clobbers ---
+    ld      hl, [ScrollLine]
+    ld      [PrerenderSaved], hl
+    ld      hl, [HtmlLineCount]
+    ld      [PrerenderSaved + 2], hl
+    ld      hl, [TotalLines]
+    ld      [PrerenderSaved + 4], hl
+    ld      hl, [HtmlLineCountSaved]
+    ld      [PrerenderSaved + 6], hl
+    ld      a, [HtmlLineCountAccurate]
+    ld      [PrerenderSaved + 8], a
+
+    ; --- Mirror chrome (rows 0..28) from the currently displayed
+    ;     page to the back so a future fast-flip lands on a page
+    ;     whose titlebar/toolbar matches what the user is seeing
+    ;     right now. Without this, the back page's chrome stays
+    ;     stale (whatever was there from a previous render cycle or
+    ;     boot-time fill), and the fast-flip reveals it briefly.
+    call    CopyChromeToBack
+
+    ; --- Apply candidate; redirect writes to the back page ---
+    ld      hl, [PrerenderCandidate]
+    ld      [ScrollLine], hl
+    ld      a, [DisplayedPage]
+    xor     1
+    ld      [WritesToPage], a
+
+    ; --- Render the next page on the back ---
     call    ClearContentArea
     call    PrintFileContent
-    jp      DrawScrollbar
 
-; ScrollUp: decrement ScrollLine if > 0, refresh.
+    ; --- Settled scrollbar thumb at the candidate ScrollLine on the
+    ;     back so a future fast-flip doesn't reveal a stale busy
+    ;     (dark-gray) thumb left behind by a previous cycle's phase-1
+    ;     paint. ComputeThumb reads the current ScrollLine (which is
+    ;     set to candidate above), so the thumb lands at the right
+    ;     position for the next page. ---
+    xor     a
+    ld      [ThumbBusy], a
+    call    ComputeThumb
+    call    DrawScrollbar
+
+    ; --- Mark prerender valid only if PrintFileContent filled the
+    ;     viewport. If HtmlLineSkip is still non-zero, we hit EOF
+    ;     mid-render and the back has a partial page that would look
+    ;     broken if we ever flipped to it. Leave PrerenderValid 0
+    ;     so the next PageDown falls through to a full render. ---
+    ld      a, [HtmlLineSkip]
+    ld      b, a
+    ld      a, [HtmlLineSkip + 1]
+    or      b
+    jr      nz, .pnSkipMark
+    ld      hl, [PrerenderCandidate]
+    ld      [PrerenderScrollLine], hl
+    ld      a, 1
+    ld      [PrerenderValid], a
+.pnSkipMark:
+
+    ; --- Restore foreground state ---
+    ld      hl, [PrerenderSaved]
+    ld      [ScrollLine], hl
+    ld      hl, [PrerenderSaved + 2]
+    ld      [HtmlLineCount], hl
+    ld      hl, [PrerenderSaved + 4]
+    ld      [TotalLines], hl
+    ld      hl, [PrerenderSaved + 6]
+    ld      [HtmlLineCountSaved], hl
+    ld      a, [PrerenderSaved + 8]
+    ld      [HtmlLineCountAccurate], a
+
+    ; Restore WritesToPage = DisplayedPage so subsequent chrome/UI
+    ; paints (toolbar focus changes, About popup) land on the page
+    ; the user sees.
+    ld      a, [DisplayedPage]
+    ld      [WritesToPage], a
+    ret
+
+PrerenderCandidate: dw 0
+PrerenderSaved:     ds 9   ; ScrollLine 0..1, HtmlLineCount 2..3, TotalLines 4..5, HtmlLineCountSaved 6..7, HtmlLineCountAccurate 8
+
+; RefreshContentInPlace: re-paint the content area WITHOUT clearing it
+; first. Used by typing / form-state edits where the layout doesn't
+; change -- only a handful of cells flip (e.g. the just-typed char).
+; Skipping the clear avoids the full-screen flash that ClearContentArea
+; produces. The new render's own widget cells overpaint the old pixel
+; values, including erasing the trailing column when a backspace
+; shrinks a value (M-cell interior is white).
+;
+; Setting InPlaceRender=1 tells TagImgBody the image bytes are still on
+; VRAM from the previous render, so it can skip the bridge fetch and
+; just reserve layout. RefreshAfterScroll clears this again because the
+; ClearContentArea wipe erases the image.
+RefreshContentInPlace:
+    ld      a, 2
+    ld      [InPlaceRender], a
+    jp      PrintFileContent
+
+InPlaceRender:  db 0                    ; 1 = current render can skip redraws
+
+; Hybrid bitmap pipeline (BITMAP_PIPELINE_DESIGN.md). 1 when the most
+; recent navigation went through RemoteLoadView, i.e. the bridge sent
+; pre-rendered Screen-6 pixels and we blitted them straight to VRAM.
+; NavigateToCurrentUrl checks this and skips ClearContentArea +
+; PrintFileContent so the parser doesn't wipe / overwrite the bitmap
+; we just painted. Reset to 0 at the top of every navigation attempt
+; so a follow-up HTML fetch falls through the normal path.
+IsViewMode:     db 0
+                                        ; that the previous pass already left on
+                                        ; VRAM (e.g. image bitmaps).
+
+; ScrollUp: decrement ScrollLine if > 0; at ScrollLine == 0 with a
+; non-zero DocOffset (i.e. user is at the top of a window that was
+; slid forward through a long doc), slide the window backward by one
+; chunk so the user can reach earlier content without having to
+; Refresh from byte 0.
 ScrollUp:
-    ld      a, [ScrollLine]
-    or      a
-    ret     z
-    dec     a
-    ld      [ScrollLine], a
+    ld      hl, [ScrollLine]
+    ld      a, h
+    or      l
+    jr      z, .suMaybeBack
+    dec     hl
+    ld      [ScrollLine], hl
     jp      RefreshAfterScroll
+.suMaybeBack:
+    jp      MaybeSlideBackward
 
 ; PageUp: subtract PAGE_SCROLL_STEP from ScrollLine (clamping to 0), refresh.
+; ScrollLine == 0 path: if DocOffset > 0, slide backward (mirror of
+; PageDown's .pdMaybeFetch). Otherwise no-op.
 PageUp:
-    ld      a, [ScrollLine]
-    sub     PAGE_SCROLL_STEP
-    jr      nc, .store
-    xor     a
-.store:
-    ld      [ScrollLine], a
+    ld      hl, [ScrollLine]
+    ld      a, h
+    or      l
+    jr      z, .puMaybeBack
+    ld      de, PAGE_SCROLL_STEP
+    and     a
+    sbc     hl, de
+    jr      nc, .puStore
+    ld      hl, 0
+.puStore:
+    ld      [ScrollLine], hl
+    jp      RefreshAfterScroll
+.puMaybeBack:
+    jp      MaybeSlideBackward
+
+; MaybeSlideBackward: at ScrollLine == 0, attempt to load the chunk
+; immediately before the current window so the user lands on adjacent
+; content. Returns silently if DocOffset is already 0 (genuinely at
+; top of doc) or if the slide fetch fails.
+;
+; After a successful slide, runs a 2-pass render: pass 1 walks the new
+; window with HtmlLineSkip = 0xFFFE (all lines suppressed) just to
+; populate HtmlLineCount. Pass 2 sets ScrollLine = HtmlLineCount -
+; TEXT_MAX_LINES so the viewport lands at the BOTTOM of the new
+; window (continuity from where the user was looking). Without the
+; clamp, ScrollLine = 0 would reset to the top of the previous chunk
+; -- the user would have to PageDown several times to reach where
+; they were.
+;
+; Tail-jumps to RefreshAfterScroll on success; returns with CF
+; cleared on failure (caller treats as no-op).
+MaybeSlideBackward:
+    ld      hl, [DocOffset]
+    ld      a, h
+    or      l
+    ret     z                            ; already at byte 0 of doc
+    ld      a, [IsRemoteSession]
+    or      a
+    jr      z, .msbLocal
+    call    SlideBackwardRemote
+    jr      .msbCheck
+.msbLocal:
+    call    SlideBackwardLocal
+.msbCheck:
+    ret     c                            ; slide failed -> caller no-ops
+    ; SlideAlignTarget left PendingRestoreSlot pointing at the cached
+    ; safe boundary for this slide. Pass 1's PrintFileContent will
+    ; consume that pending slot (clear it back to 0xFF) -- but pass 2
+    ; needs the same restore to render correctly. Cache the slot
+    ; index across the two passes so pass 2 sees the same state hand-
+    ; off pass 1 saw.
+    ld      a, [PendingRestoreSlot]
+    push    af
+    ; Pass 1: count-only render. Set ScrollLine to a value the
+    ; parser treats as "skip every line" so VRAM stays as the old
+    ; window's content (no blank flash while we count) and
+    ; LineCacheMaybeAppend skips its append branch (HtmlLineSkip != 0
+    ; predicate). PrintFileContent still accumulates HtmlLineCount,
+    ; which is what we need.
+    ld      hl, 0xFFFE
+    ld      [ScrollLine], hl
+    call    PrintFileContent
+    ; Re-arm PendingRestoreSlot for pass 2.
+    pop     af
+    ld      [PendingRestoreSlot], a
+    ; Pass 2: clamp ScrollLine to the bottom of the new window and
+    ; do a normal RefreshAfterScroll (clear + render + thumb math).
+    ; The clamp lands the viewport on the LAST TEXT_MAX_LINES rows
+    ; of the new window, which corresponds (modulo wrap) to the
+    ; bytes immediately before the slide boundary -- i.e. the
+    ; content the user expected to find when they pressed Up.
+    ld      hl, [HtmlLineCount]
+    ld      de, TEXT_MAX_LINES
+    or      a
+    sbc     hl, de
+    jr      nc, .msbClampOk
+    ld      hl, 0                        ; tiny window -> just show all of it
+.msbClampOk:
+    ld      [ScrollLine], hl
     jp      RefreshAfterScroll
 
-; PageDown: advance ScrollLine by TEXT_MAX_LINES - 2 (so two lines of
-; overlap carry over) and clamp the target so the viewport stays full
-; -- the final page pins to max(0, TotalLines - TEXT_MAX_LINES) instead
-; of TotalLines-1, which would leave the content area mostly blank.
+; SlideBackwardLocal: shift the FileBuf window one chunk backward
+; through the open local file. target = max(0, DocOffset - FILE_BUF_SIZE).
+; Cache-aligns through SlideAlignTarget so the post-slide render
+; restores parser state at the boundary (same Phase 7-fix machinery
+; as the forward slide).
+;
+; Returns CF=0 on slide success, CF=1 on EnsureWindow failure.
+SlideBackwardLocal:
+    ; SlideTarget = max(0, DocOffset - FILE_BUF_SIZE). 24-bit subtract
+    ; (FILE_BUF_SIZE zero-extends). On underflow, clamp to 0.
+    ld      hl, [DocOffset]
+    ld      de, FILE_BUF_SIZE
+    or      a
+    sbc     hl, de
+    ld      [SlideTarget], hl
+    ld      a, [DocOffset + 2]
+    sbc     a, 0
+    ld      [SlideTarget + 2], a
+    jr      nc, .sbloAlign
+    ; Underflow (DocOffset < FILE_BUF_SIZE) -> clamp to 0.
+    xor     a
+    ld      [SlideTarget], a
+    ld      [SlideTarget + 1], a
+    ld      [SlideTarget + 2], a
+.sbloAlign:
+    call    SlideAlignTarget
+    call    EnsureWindowLocal
+    or      a
+    jr      nz, .sbloFail
+    or      a                            ; CF = 0 success
+    ret
+.sbloFail:
+    scf
+    ret
+
+; SlideBackwardRemote: remote analogue. Same 24-bit subtract pattern
+; as SlideBackwardLocal; bridge's GET CHUNK serves any byte range of
+; the cached body.
+SlideBackwardRemote:
+    ld      hl, [DocOffset]
+    ld      de, FILE_BUF_SIZE
+    or      a
+    sbc     hl, de
+    ld      [SlideTarget], hl
+    ld      a, [DocOffset + 2]
+    sbc     a, 0
+    ld      [SlideTarget + 2], a
+    jr      nc, .sbroAlign
+    xor     a
+    ld      [SlideTarget], a
+    ld      [SlideTarget + 1], a
+    ld      [SlideTarget + 2], a
+.sbroAlign:
+    call    SlideAlignTarget
+    call    EnsureWindowRemote
+    or      a
+    jr      nz, .sbroFail
+    or      a
+    ret
+.sbroFail:
+    scf
+    ret
+
+; PageDown: advance ScrollLine by TEXT_MAX_LINES - 1 and clamp the target
+; so the viewport stays full -- the final page pins to
+; max(0, TotalLines - TEXT_MAX_LINES) instead of TotalLines-1, which
+; would leave the content area mostly blank.
 PAGE_SCROLL_STEP equ TEXT_MAX_LINES - 1
 
 PageDown:
-    ld      a, [TotalLines]
-    or      a
-    ret     z
-    cp      TEXT_MAX_LINES + 1
-    ret     c                           ; all content fits: nothing to scroll
-    sub     TEXT_MAX_LINES              ; A = last reachable top-line
-    ld      d, a                        ; D = max ScrollLine
-    ld      a, [ScrollLine]
-    cp      d
-    ret     nc                          ; already at (or past) last page: no-op
-    add     a, PAGE_SCROLL_STEP
-    cp      d
-    jr      c, .pdStore
-    ld      a, d                        ; clamp to max so viewport stays full
+    ; Max-check uses HtmlLineCount (the real rendered line count of
+    ; what's currently in FileBuf) NOT TotalLines -- TotalLines is
+    ; inflated with the remaining-pages estimate so the scrollbar
+    ; thumb sizes the full document, but the scroll-clamp must stop
+    ; at the actual rendered tail or .pdMaybeFetch never fires.
+    ld      hl, [HtmlLineCount]
+    ld      a, h
+    or      l
+    jr      z, .pdMaybeFetch            ; zero-line doc -> maybe MORE
+    ld      de, TEXT_MAX_LINES + 1
+    and     a
+    sbc     hl, de
+    jr      c, .pdMaybeFetch            ; everything fits -> maybe MORE
+    ; HL = TotalLines - TEXT_MAX_LINES - 1; add 1 back so HL = max ScrollLine.
+    inc     hl
+    ex      de, hl                      ; DE = max ScrollLine
+    ld      hl, [ScrollLine]
+    and     a
+    sbc     hl, de
+    jr      nc, .pdAtMax                ; already at (or past) the bottom
+    ; ScrollLine + PAGE_SCROLL_STEP
+    ld      hl, [ScrollLine]
+    ld      bc, PAGE_SCROLL_STEP
+    add     hl, bc
+    and     a
+    push    hl
+    sbc     hl, de
+    pop     hl
+    jr      c, .pdStore                 ; sum < max -> use it
+    ex      de, hl                      ; clamp: HL = max ScrollLine
 .pdStore:
-    ld      [ScrollLine], a
+    ld      [ScrollLine], hl
     jp      RefreshAfterScroll
+.pdAtMax:
+.pdMaybeFetch:
+    ; Already at the bottom of the buffered content. Two ways to
+    ; advance:
+    ;   (a) Remote session: TryFetchMore pulls the next "GET MORE"
+    ;       chunk, which APPENDS to FileBuf at the current WindowLen.
+    ;       ScrollLine bumps by PAGE_SCROLL_STEP because the user's
+    ;       previous viewport is still in the buffer.
+    ;   (b) Local session past initial chunk: SlideForwardLocal
+    ;       slides the FileBuf window to the next FILE_BUF_SIZE chunk
+    ;       of the file. The OLD viewport is gone, so ScrollLine
+    ;       resets to 0 (top of new chunk).
+    ld      a, [IsRemoteSession]
+    or      a
+    jr      z, .pdLocalSlide
+    call    TryFetchMore
+    jr      nc, .pdRemoteAppend
+    ; TryFetchMore returned CF=1: either we've drained the bridge's
+    ; pixel-paginated chunks (SerialPage == SerialPageTotal) or the
+    ; next chunk wouldn't fit in FileBuf. In both cases, attempt a
+    ; byte-range slide via GET CHUNK at the next unread offset; if
+    ; the bridge has body bytes there, we land on a fresh window.
+    call    SlideForwardRemote
+    jr      nc, .pdRemoteSlid
+    ret                                  ; genuinely at end-of-document
+.pdRemoteAppend:
+    ld      hl, [ScrollLine]
+    ld      bc, PAGE_SCROLL_STEP
+    add     hl, bc
+    ld      [ScrollLine], hl
+    call    RefreshAfterScroll
+    call    StoreTotalLinesWithPages
+    ret
+.pdRemoteSlid:
+    ld      hl, 0
+    ld      [ScrollLine], hl
+    jp      RefreshAfterScroll
+.pdLocalSlide:
+    call    SlideForwardLocal
+    ret     c
+    ld      hl, 0
+    ld      [ScrollLine], hl
+    jp      RefreshAfterScroll
+
+; SlideForwardLocal: shift the FileBuf window one chunk forward
+; through the open local file. Used by PageDown / ScrollDown when
+; the user has paged past the buffered content but the file has
+; more bytes left.
+;
+; Returns CF=0 on slide success (DocOffset / WindowLen advanced),
+; CF=1 if the file has no more bytes past the current window.
+;
+; Scope notes:
+;   - Local-only. Caller checks IsRemoteSession before invoking.
+;   - The "next chunk" is FILE_BUF_SIZE bytes starting at
+;     DocOffset + WindowLen, with no overlap. The first line of
+;     the new chunk may render with parser-state defaults (no
+;     <ul>/<font>/<a> context restored) since we just reset the
+;     LineCache; cosmetically the user might see one slightly-off
+;     line at the top of the new chunk before paragraphs flow
+;     correctly. A future refinement will use cached snapshots
+;     to bridge across slides cleanly.
+SlideForwardLocal:
+    ; desired_target = DocOffset + WindowLen, 24-bit add. WindowLen is
+    ; 16-bit so it zero-extends; DocOffset's high byte gets a +carry
+    ; from the low-word add.
+    ld      hl, [DocOffset]
+    ld      de, [WindowLen]
+    add     hl, de
+    ld      [SlideTarget], hl
+    ld      a, [DocOffset + 2]
+    adc     a, 0
+    ld      [SlideTarget + 2], a
+    ; Bail if desired_target >= DocSize (nothing left to fetch).
+    ; 24-bit compare: SlideTarget - DocSize.
+    ld      hl, [SlideTarget]
+    ld      bc, [DocSize]
+    or      a
+    sbc     hl, bc
+    ld      a, [SlideTarget + 2]
+    ld      b, a
+    ld      a, [DocSize + 2]
+    ld      c, a
+    ld      a, b
+    sbc     a, c
+    jr      c, .sflFetch                 ; SlideTarget < DocSize -> fetch
+    scf
+    ret
+.sflFetch:
+    ; Cache-align: if a cached safe boundary sits at or before
+    ; desired_target, slide to *that* offset instead so the matching
+    ; parser-state snapshot can be restored after the slide. Otherwise
+    ; SlideTarget is unchanged and PendingRestoreSlot stays at 0xFF.
+    call    SlideAlignTarget
+    call    EnsureWindowLocal
+    or      a
+    jr      nz, .sflFail
+    or      a                            ; CF = 0 success
+    ret
+.sflFail:
+    scf
+    ret
+
+; SlideForwardRemote: remote analogue of SlideForwardLocal. Sends GET
+; CHUNK at the byte just past the current window. The bridge returns
+; 404 (-> A != 0 from EnsureWindowRemote) when the offset is at or
+; past the cached body's EOF, which we surface as CF=1 so the caller
+; stops trying to advance.
+;
+; Used by PageDown / ScrollDown's remote .pdMaybeFetch tail when
+; TryFetchMore can no longer append (either SerialPage ==
+; SerialPageTotal or the buffer would overflow). Replaces FileBuf
+; contents with the next byte-range chunk, similar to
+; SlideForwardLocal.
+SlideForwardRemote:
+    ; desired_target = DocOffset + WindowLen (24-bit add into
+    ; SlideTarget). Cache-align identically to SlideForwardLocal so
+    ; the post-slide render's restore hook can rebuild the parser
+    ; scope across the boundary.
+    ld      hl, [DocOffset]
+    ld      de, [WindowLen]
+    add     hl, de
+    ld      [SlideTarget], hl
+    ld      a, [DocOffset + 2]
+    adc     a, 0
+    ld      [SlideTarget + 2], a
+    call    SlideAlignTarget
+    call    EnsureWindowRemote
+    or      a
+    jr      nz, .sfrFail
+    or      a                            ; CF = 0 success
+    ret
+.sfrFail:
+    scf
+    ret
 
 ; ScrollDown: if there's more content below the viewport, bump ScrollLine
 ; and refresh. Clamps at max(0, TotalLines - TEXT_MAX_LINES) so the
 ; viewport never bottoms out with a mostly-blank canvas.
 ScrollDown:
-    ld      a, [TotalLines]
-    cp      TEXT_MAX_LINES + 1
-    ret     c                           ; everything fits
-    sub     TEXT_MAX_LINES              ; A = max ScrollLine
-    ld      d, a
-    ld      a, [ScrollLine]
-    cp      d
-    ret     nc                          ; already at max
-    inc     a
-    ld      [ScrollLine], a
+    ; Same TotalLines-vs-HtmlLineCount distinction as PageDown -- the
+    ; clamp must use real rendered lines, not the inflated estimate.
+    ld      hl, [HtmlLineCount]
+    ld      de, TEXT_MAX_LINES + 1
+    and     a
+    sbc     hl, de
+    jr      c, .sdAtMax                 ; everything fits -> maybe MORE on bridge?
+    inc     hl                          ; HL = max ScrollLine
+    ex      de, hl                      ; DE = max ScrollLine
+    ld      hl, [ScrollLine]
+    and     a
+    sbc     hl, de
+    jr      nc, .sdAtMax
+    ld      hl, [ScrollLine]
+    inc     hl
+    ld      [ScrollLine], hl
+    jp      RefreshAfterScroll
+.sdAtMax:
+    ; Bottom of buffered content. Same two-path branch as PageDown:
+    ; remote sessions append via TryFetchMore (advance by 1 line for
+    ; line-by-line scroll), local sessions slide the window forward
+    ; one chunk and reset ScrollLine.
+    ld      a, [IsRemoteSession]
+    or      a
+    jr      z, .sdLocalSlide
+    call    TryFetchMore
+    jr      nc, .sdRemoteAppend
+    ; TryFetchMore CF=1: try forward slide via GET CHUNK (Phase 6).
+    call    SlideForwardRemote
+    jr      nc, .sdRemoteSlid
+    ret                                  ; genuinely at end-of-document
+.sdRemoteAppend:
+    ld      hl, [ScrollLine]
+    inc     hl
+    ld      [ScrollLine], hl
+    call    RefreshAfterScroll
+    call    StoreTotalLinesWithPages
+    ret
+.sdRemoteSlid:
+    ld      hl, 0
+    ld      [ScrollLine], hl
+    jp      RefreshAfterScroll
+.sdLocalSlide:
+    call    SlideForwardLocal
+    ret     c
+    ld      hl, 0
+    ld      [ScrollLine], hl
     jp      RefreshAfterScroll
 
 ; ============================================================================
@@ -7548,162 +15388,80 @@ GetMouseAxis:
 GetMouseNibble:
     di
     ld      a, 15
-    out     [PSG_ADDR_PORT], a
+    out     (PSG_ADDR_PORT), a
     ld      a, d
-    out     [PSG_DATA_WR], a
+    out     (PSG_DATA_WR), a
     ld      b, 10
 .wait:
     djnz    .wait
     ld      a, 14
-    out     [PSG_ADDR_PORT], a
-    in      a, [PSG_DATA_RD]
+    out     (PSG_ADDR_PORT), a
+    in      a, (PSG_DATA_RD)
     ei
     ret
 
-; EraseCursor: if the cursor is currently visible, restore the 16 VRAM bytes
-; under it from CursorBg and clear the visible flag. Safe to call any time.
+; EraseCursor: hide the cursor sprite. Kept for the keypress-redraw
+; call site in MainLoop -- hardware sprites don't actually need
+; erasing before bitmap redraws (they composite on top), but parking
+; the sprite below screen during long repaints keeps the pointer
+; from sitting on top of half-drawn dialogs.
+;
+; In the old software-cursor version this routine restored 16 saved
+; VRAM bytes under the cursor; now it just writes Y = 0xD9 to SAT[0].
 EraseCursor:
     ld      a, [CursorVisible]
     or      a
     ret     z
-
-    ld      hl, [CursorX]
-    srl     h
-    rr      l
-    srl     h
-    rr      l                           ; HL = CursorX / 4
-    ld      a, l
-    ld      [CursorByteCol], a
-    ld      a, [CursorY]
-    ld      [CursorRowY], a
-    ld      hl, CursorBg
-    ld      [CursorBgPtr], hl
-
-    ld      e, 8                        ; 8 rows
-.rowLoop:
-    ld      a, [CursorByteCol]
-    ld      b, a
-    ld      a, [CursorRowY]
-    ld      c, a
-    push    de
-    call    SetVramWritePos
-    pop     de
-    ld      hl, [CursorBgPtr]
-    ld      a, [hl]
-    out     [VDP_DATA], a
-    inc     hl
-    ld      a, [hl]
-    out     [VDP_DATA], a
-    inc     hl
-    ld      [CursorBgPtr], hl
-
-    ld      a, [CursorRowY]
-    inc     a
-    ld      [CursorRowY], a
-    dec     e
-    jr      nz, .rowLoop
-
+    di
+    ld      a, 1                         ; R14 = segment 1
+    out     (VDP_CMD), a
+    ld      a, 0x80 | 14
+    out     (VDP_CMD), a
+    ei
+    ld      hl, 0x3600                   ; SAT[0].Y
+    call    VdpSetWriteAddr
+    ld      a, 0xD9
+    out     (VDP_DATA), a
     xor     a
     ld      [CursorVisible], a
     ret
 
-; DrawCursor: save VRAM under (MouseX, MouseY), then paint an 8x8 black
-; square there. Assumes the cursor is NOT already visible (EraseCursor is
-; idempotent and safe to call first).
+; DrawCursor: position hardware sprite 0 at (MouseX, MouseY).
+;
+; Screen 6 sprites use 8-bit X with one sprite pixel = two screen
+; pixels, so X_sprite = MouseX / 2. The sprite "Y" coordinate is the
+; line ABOVE the first painted row, so we subtract 1 from MouseY.
+; The sprite engine renders entirely in hardware -- no raster race,
+; no VRAM save/restore, no vblank deadline.
 DrawCursor:
-    call    EraseCursor                 ; ensure clean state
+    di
+    ld      a, 1                         ; R14 = segment 1
+    out     (VDP_CMD), a
+    ld      a, 0x80 | 14
+    out     (VDP_CMD), a
+    ei
+    ld      hl, 0x3600                   ; SAT[0]
+    call    VdpSetWriteAddr
 
-    ; Record the position we're drawing at so EraseCursor restores correctly.
+    ld      a, [MouseY]
+    dec     a                            ; sprite Y = pixel Y - 1
+    out     (VDP_DATA), a
+    ld      hl, [MouseX]
+    srl     h
+    rr      l                            ; HL = MouseX / 2 (0..255)
+    ld      a, l
+    out     (VDP_DATA), a
+    xor     a
+    out     (VDP_DATA), a                ; pattern = 0
+
+    ; Track the painted position for any code that still reads CursorX/Y.
     ld      hl, [MouseX]
     ld      [CursorX], hl
     ld      a, [MouseY]
     ld      [CursorY], a
-
-    ld      hl, [MouseX]
-    srl     h
-    rr      l
-    srl     h
-    rr      l
-    ld      a, l
-    ld      [CursorByteCol], a
-    ld      a, [MouseY]
-    ld      [CursorRowY], a
-
-    ; --- Save 2 VRAM bytes * 8 rows into CursorBg ---
-    ld      hl, CursorBg
-    ld      [CursorBgPtr], hl
-    ld      e, 8
-.saveLoop:
-    ld      a, [CursorByteCol]
-    ld      b, a
-    ld      a, [CursorRowY]
-    ld      c, a
-    push    de
-    call    SetVramReadPos
-    pop     de
-    in      a, [VDP_DATA]
-    ld      hl, [CursorBgPtr]
-    ld      [hl], a
-    inc     hl
-    in      a, [VDP_DATA]
-    ld      [hl], a
-    inc     hl
-    ld      [CursorBgPtr], hl
-
-    ld      a, [CursorRowY]
-    inc     a
-    ld      [CursorRowY], a
-    dec     e
-    jr      nz, .saveLoop
-
-    ; --- Paint 2 bytes per row: new = saved_bg OR cursor_mask.
-    ld      a, [MouseY]
-    ld      [CursorRowY], a
-    ld      ix, CursorBg
-    ld      iy, CursorMask
-    ld      e, 8
-.drawLoop:
-    ld      a, [CursorByteCol]
-    ld      b, a
-    ld      a, [CursorRowY]
-    ld      c, a
-    push    de
-    call    SetVramWritePos
-    pop     de
-
-    ld      a, [ix + 0]
-    or      [iy + 0]
-    out     [VDP_DATA], a
-    ld      a, [ix + 1]
-    or      [iy + 1]
-    out     [VDP_DATA], a
-
-    inc     ix
-    inc     ix
-    inc     iy
-    inc     iy
-    ld      a, [CursorRowY]
-    inc     a
-    ld      [CursorRowY], a
-    dec     e
-    jr      nz, .drawLoop
-
     ld      a, 1
     ld      [CursorVisible], a
     ret
-
-; CursorMask: 8 rows x 2 bytes. Each byte has 11-pair for opaque pixels, 00
-; elsewhere. OR'd with saved bg to produce the final cursor row. Shape from
-; resources/mouse_pointer.bmp (top-left anchored arrow, 8x8 MSX pixels).
-CursorMask:
-    db  0xF0, 0x00
-    db  0xFC, 0x00
-    db  0xFF, 0xC0
-    db  0xFF, 0xF0
-    db  0xFF, 0xFC
-    db  0xFC, 0x00
-    db  0xF0, 0x00
-    db  0xC0, 0x00
 
 ; PollMouse: called every main-loop iteration. Reads mouse, clamps position,
 ; detects a press edge (prev=0 -> now=1) and dispatches to HandleClick.
@@ -7796,10 +15554,13 @@ PollMouse:
 ; under (MouseX, MouseY). Either returns (no-op) or jumps into an existing
 ; keyboard-handler routine; MainLoop is the shared return point.
 HandleClick:
-    ; Popup mode: only the popup's X-glyph closes the dialog.
+    ; Popup mode: only the popup's own click targets are live.
     ld      a, [AboutOpen]
     or      a
     jp      nz, ClickInPopup
+    ld      a, [SaveOpen]
+    or      a
+    jp      nz, ClickInSavePopup
 
     ; Out-of-screen clicks (shouldn't happen with our clamp) are ignored.
     ld      a, [MouseY + 1]
@@ -7828,22 +15589,38 @@ CpHL:
     cp      e
     ret
 
-; ---- titlebar: "?" glyph opens About, "X" glyph exits ----
+; ---- titlebar: "[]" save, "?" About, "X" exit ----
+; Glyph rects in pixel-X:
+;   [] at WIDTH-48 .. WIDTH-32 (16 px = 2 glyphs)
+;   ?  at WIDTH-24 .. WIDTH-16 (1 glyph; 8-px gap before it)
+;   X  at WIDTH-12 .. WIDTH     (1 glyph; 4-px gap before it)
 ClickTitle:
     ld      hl, [MouseX]
+
+    ; "[]" save button
+    ld      de, WIDTH - 48
+    call    CpHL
+    ret     c                           ; left of "[]" -- just text
+    ld      de, WIDTH - 32
+    call    CpHL
+    jp      c, OpenSaveFromTitlebar
+
+    ; "?" Help / About
     ld      de, WIDTH - 24
     call    CpHL
-    ret     c                           ; left of "?" -- just text
+    ret     c                           ; gap between "[]" and "?"
     ld      de, WIDTH - 16
     call    CpHL
-    jp      c, OpenAbout                ; "?" glyph
+    jp      c, OpenAbout
+
+    ; "X" close
     ld      de, WIDTH - 12
     call    CpHL
-    ret     c                           ; between glyphs
+    ret     c                           ; gap between "?" and "X"
     ld      de, WIDTH
     call    CpHL
     ret     nc
-    jp      Shutdown                    ; "X" glyph
+    jp      Shutdown
 
 ; ---- toolbar: Back / Forward / Address-bar + clear-X / Refresh(Go) ----
 ; Regions are tested left-to-right; the `ret c` guards mean any click that
@@ -7885,8 +15662,13 @@ ClickToolbar:
     ret
 
 .tAddr:
-    ; In address bar. Check if over clear-x glyph (ADDR_X1 - 8..ADDR_X1).
-    ld      de, ADDR_X1 - 8
+    ; In address bar. The clear-x glyph is drawn at ADDR_X1 - 12
+    ; (8-px-wide glyph, so it spans [ADDR_X1-12, ADDR_X1-5]). The old
+    ; hotspot sat at ADDR_X1-8..ADDR_X1, 4 px to the right of the
+    ; glyph -- clicks on the visible X silently fell through to the
+    ; "focus the address bar" branch. Line up the hotspot with the
+    ; glyph (plus a couple of pixels of slack on the right).
+    ld      de, ADDR_X1 - 12
     call    CpHL
     jr      c, .addrMain
     ; Clear-x click
@@ -7917,9 +15699,23 @@ ClickContent:
     ld      de, SCROLL_X0
     call    CpHL
     jr      nc, .cScroll                ; x >= 496 -> scrollbar
-    ; Click inside the text. First check for a link hit, otherwise focus
-    ; the content area so scroll keys work.
+    ; Click inside the text. First check for a form submit-button hit
+    ; (we own the line: flash + dispatch + re-render); then a link hit;
+    ; otherwise focus the content area so scroll keys work.
+    call    TryFormClick                ; returns/jumps away on hit
     call    TryLinkClick                ; navigates + returns if hit
+    ; No widget / link under the cursor: this is a "click empty space"
+    ; gesture. Drop the form-focus so Space / arrows go back to page
+    ; scrolling instead of typing into whatever field Tab last
+    ; parked on. Re-render so the previously-focused widget drops its
+    ; black border.
+    ld      a, [HtmlFormFocus]
+    cp      0xFF
+    jr      z, .ccNoFormToDrop
+    ld      a, 0xFF
+    ld      [HtmlFormFocus], a
+    call    RefreshContentInPlace
+.ccNoFormToDrop:
     ld      a, FOC_CONTENT
     ld      [Focus], a
     jp      PaintToolbar
@@ -7936,21 +15732,43 @@ ClickContent:
     ; and PageDown would otherwise push the view past the end leaving only the
     ; last line visible.
     ld      b, a                        ; B = click Y
-    ld      a, [TotalLines]
-    cp      TEXT_MAX_LINES + 1
+    ld      hl, [TotalLines]
+    ld      de, TEXT_MAX_LINES + 1
+    and     a
+    sbc     hl, de
     ret     c                           ; <= TEXT_MAX_LINES -> no-op
     ld      a, [ThumbTop]
     cp      b
     jp      nc, PageUp                  ; ThumbTop > click -> click is above thumb
     jp      PageDown
 
-; ---- popup's X-glyph closes the About dialog ----
+; ---- popup click dispatch: title-bar X closes; image checkbox toggles ----
 ClickInPopup:
     ld      a, [MouseY]
     cp      ABOUT_Y
     ret     c
+
+    ; Top title strip: hand off to the close-X test.
     cp      ABOUT_Y + 16
+    jr      c, .pTitle
+
+    ; Image-toggle row: 8-px tall band centred on IMG_CHK_Y. The visible
+    ; checkbox is 24 px wide ("[ ]"); allow a 4-px overshoot on each
+    ; side so the user doesn't have to hit pixel-perfect.
+    cp      IMG_CHK_Y
+    ret     c
+    cp      IMG_CHK_Y + 8
     ret     nc
+    ld      hl, [MouseX]
+    ld      de, IMG_CHK_X - 4
+    call    CpHL
+    ret     c
+    ld      de, IMG_CHK_X + 28
+    call    CpHL
+    ret     nc
+    jp      ToggleShowImages
+
+.pTitle:
     ld      hl, [MouseX]
     ld      de, ABOUT_X + ABOUT_W - 16
     call    CpHL
@@ -7959,6 +15777,39 @@ ClickInPopup:
     call    CpHL
     ret     nc
     jp      CloseAbout
+
+; ToggleShowImages: flip the ShowImages flag, redraw the checkbox glyph
+; in place (no full popup repaint), and -- if the bridge is connected --
+; sync the new state over the wire so the bridge's HTML rewriter agrees
+; with the browser. Always returns to the main loop via the parent
+; HandleClick flow.
+ToggleShowImages:
+    ld      a, [ShowImages]
+    xor     1
+    ld      [ShowImages], a
+    call    DrawImgCheckbox
+    jp      SyncBridgeImgState
+
+; SyncBridgeImgState: tell the bridge whether to mint imNN.pcx handles.
+; No-op when no remote session has been opened yet (bridge isn't on the
+; other end of the rs232 wire). The bridge replies with an empty OK HTM
+; that RemoteGet parses cleanly; SerialLen=0 means no body to drain.
+SyncBridgeImgState:
+    ld      a, [IsRemoteSession]
+    or      a
+    ret     z
+    call    SerialMaskVblank
+    ld      a, [ShowImages]
+    or      a
+    ld      hl, ImgOnCmd
+    jr      nz, .sbiSend
+    ld      hl, ImgOffCmd
+.sbiSend:
+    call    RemoteGet
+    jp      SerialUnmaskVblank
+
+ImgOnCmd:       db "IMG ON", 0
+ImgOffCmd:      db "IMG OFF", 0
 
 ; ============================================================================
 ; Step 2.5: About popup (opened via F1, closed via Esc)
@@ -7970,53 +15821,976 @@ ClickInPopup:
 ; unwinds back through PollMouse correctly. Keyboard-path callers wrap each
 ; in `call OpenAbout / jp MainLoop`.
 OpenAbout:
-    ld      a, 1
+    call    PopupSaveFocusAndUnfocusChrome
+    ld      a, ABOUT_H
+    call    SavePopupBg                 ; HMMM-snapshot the bg under the popup
+    ld      a, 2
     ld      [AboutOpen], a
     jp      DrawAboutPopup              ; DrawAboutPopup ends with `ret`
 
 CloseAbout:
     xor     a
     ld      [AboutOpen], a
-    call    ClearContentArea
-    jp      PrintFileContent            ; PrintFileContent ends with `ret`
+    call    PopupRestoreFocusAndPaintChrome
+    jp      RestorePopupBg              ; HMMM-blit the bg back; no re-parse
 
-DrawAboutPopup:
-    ; Popup body: 256 x 120 centred in the content area, at (128, 50).
-    ld      b, ABOUT_X / 4
-    ld      c, ABOUT_Y
-    ld      d, ABOUT_W / 4
-    ld      e, ABOUT_H
+; Snapshot the toolbar Focus and force it to a sentinel that doesn't
+; match any focusable element (ComputeFocusState compares against
+; FOC_* enums 0..4), then repaint the toolbar. Address bar / buttons
+; lose their black focus frame; address bar in particular falls back
+; to the DGRAY unfocused border in PaintAddressBar. The matching
+; PopupRestoreFocusAndPaintChrome on popup close undoes both.
+PopupSaveFocusAndUnfocusChrome:
+    ld      a, [Focus]
+    ld      [PopupFocusBefore], a
+    ld      a, 0xFF                     ; sentinel: matches no FOC_*
+    ld      [Focus], a
+    jp      PaintToolbar                ; tail-call (ends with ret)
+
+PopupRestoreFocusAndPaintChrome:
+    ld      a, [PopupFocusBefore]
+    ld      [Focus], a
+    jp      PaintToolbar
+
+; ----------------------------------------------------------------------------
+; Popup background save/restore via V9938 HMMM (VRAM->VRAM blit).
+;
+; On popup OPEN: snapshot the popup-region pixels from the currently
+; displayed page into a backup area at the top of VRAM page 2.
+; On popup CLOSE: blit the backup back over the popup region.
+; Replaces the slow ClearContentArea + PrintFileContent re-parse on
+; close: a 280 x 136 region copies in ~5 ms via HMMM instead of
+; ~200 ms of CPU-side parsing + rendering.
+;
+; Why page 2: MWBRO's current bitmap pipeline uses only pages 0 and
+; 1 (display + back buffer for the lesson-4 page-flip / prerender).
+; Page 2 is otherwise idle on 128 KB-VRAM MSX2 machines (HB-F1XD,
+; AX-370, HB-F700D etc. all ship with 128 KB).
+;
+; Worst-case backup size: ABOUT_W * ABOUT_H * 2 bits = 280 * 136 / 4
+; = ~9.5 KB, fits comfortably in page 2's 32 KB.
+;
+; The command engine's 10-bit Y address space stacks the 4 pages:
+;   page 0 -> Y 0..255,   page 1 -> Y 256..511,
+;   page 2 -> Y 512..767, page 3 -> Y 768..1023.
+; So SY-high (R35) == DisplayedPage selects "the page the user sees".
+;
+; TODO: probe VRAM size at boot via the BIOS work area (the bottom
+; nibble of MSXVER's RAMVAL byte distinguishes 16/64/128 KB). On a
+; 64 KB VRAM MSX2 the page-2 backup wraps to page 0 and corrupts
+; the display; fall back to the old ClearContentArea +
+; PrintFileContent re-render path for those machines. All MWBRO's
+; current test targets ship with 128 KB, so this isn't urgent.
+; ----------------------------------------------------------------------------
+
+; SavePopupBg(A = popup height in rows): HMMM-copy the popup region
+; on the displayed page to the backup area at (0, 0) on page 2.
+SavePopupBg:
+    ld      [PopupBgHeight], a            ; stash for the matching restore
+    ld      [PopupBgSaveCmd + 10], a      ; patch NY-low (height)
+    ld      a, [DisplayedPage]
+    ld      [PopupBgSaveCmd + 3], a       ; patch SY-high (source page)
+    ld      hl, PopupBgSaveCmd
+    call    VdpCmd
+    jp      VdpCmdWait                    ; block until the bg is safely saved
+
+; RestorePopupBg: mirror -- HMMM the backup back over the popup region.
+RestorePopupBg:
+    ld      a, [PopupBgHeight]
+    ld      [PopupBgRestoreCmd + 10], a   ; NY-low
+    ld      a, [DisplayedPage]
+    ld      [PopupBgRestoreCmd + 7], a    ; DY-high (dest page)
+    ld      hl, PopupBgRestoreCmd
+    call    VdpCmd
+    jp      VdpCmdWait
+
+; HMMM register-block templates. SY-high (byte 3 in save) / DY-high
+; (byte 7 in restore) carry the displayed-page selector; NY-low
+; (byte 10) carries the popup height. Both patched at runtime.
+PopupBgSaveCmd:
+    dw      SAVE_X                        ; +0..1  SX
+    db      SAVE_Y, 0                     ; +2..3  SY low/high (high <- DisplayedPage)
+    dw      0                             ; +4..5  DX
+    db      0, 2                          ; +6..7  DY = 0, page-2 (high=2)
+    dw      SAVE_W                        ; +8..9  NX
+    db      0, 0                          ; +10..11 NY low/high  (low <- height)
+    db      0                             ; +12    CLR (unused for HMMM)
+    db      0                             ; +13    ARG (forward dir)
+    db      0xD0                          ; +14    CMD = HMMM
+
+PopupBgRestoreCmd:
+    dw      0                             ; +0..1  SX
+    db      0, 2                          ; +2..3  SY = 0, page-2
+    dw      SAVE_X                        ; +4..5  DX
+    db      SAVE_Y, 0                     ; +6..7  DY low/high (high <- DisplayedPage)
+    dw      SAVE_W                        ; +8..9  NX
+    db      0, 0                          ; +10..11 NY low/high  (low <- height)
+    db      0                             ; +12    CLR
+    db      0                             ; +13    ARG
+    db      0xD0                          ; +14    CMD = HMMM
+
+PopupBgHeight: db 0
+
+; ============================================================================
+; Save-file popup (titlebar [] button, and later: link click to
+; unrecognised file). Phase 1: paints the dialog, wires Save / Cancel
+; / X / Esc. Save is currently a stub -- closes the popup without
+; touching disk. Phase 2 will add the BDOS sequential-write streaming
+; from the bridge / FileBuf into a:<filename>, with the progress
+; readout updating live and Cancel deleting the partial file.
+; ============================================================================
+
+; Popup X/W shared with About (visual consistency); H is per-popup so
+; each dialog snaps to its own content height with no empty tail.
+SAVE_X  equ ABOUT_X
+SAVE_Y  equ ABOUT_Y
+SAVE_W  equ ABOUT_W
+SAVE_H  equ 80                                                    ; fits title + 2 body lines + gap + button row
+
+; Title bar height shared by the popup-frame helper (DrawPopupFrame).
+POPUP_TITLE_H   equ 16
+
+; Button geometry (text rendered inside a black-bordered rect).
+SAVE_BTN_W      equ 60
+SAVE_BTN_H      equ 14
+SAVE_BTN_Y      equ SAVE_Y + SAVE_H - 24
+SAVE_BTN1_X     equ SAVE_X + 32                                   ; "Save"
+SAVE_BTN2_X     equ SAVE_X + SAVE_W - SAVE_BTN_W - 32             ; "Cancel"
+
+; Entry point used by HandleClick / ClickTitle when the user clicks
+; the "[]" titlebar glyph. Source tag = 0 (saving the currently
+; displayed page/image).
+OpenSaveFromTitlebar:
+    ; The Save popup only handles remote (web-bridge) URLs. Local
+    ; disk paths ("a:foo.htm") are silently no-op'd: the user can
+    ; just COPY in MSX-DOS, and the FileBuf-only save path was a
+    ; foot-gun if a >FILE_BUF_SIZE local file were saved after a
+    ; disk swap (we'd read past the end of FileBuf from a disk
+    ; that isn't even in the drive anymore).
+    ld      hl, UrlBuf
+    call    IsLocalUrl
+    ret     z                             ; local -> silently no-op
+
+    xor     a
+    ld      [SaveStatus], a               ; SaveStatus_Idle
+    ld      [SaveBytesWritten], a
+    ld      [SaveBytesWritten + 1], a
+
+    ; Build the DEST FCB from UrlBuf's basename. For remote URLs like
+    ; "http://127.0.0.1/SERPOC.COM" the raw UrlBuf confuses BuildFcb
+    ; (it stops at the first '.' in "127.0.0.1"), so strip off the
+    ; host part first and pass just "SERPOC.COM" to BuildFcbFromHL.
+    ; Local URLs ("a:foo.htm") have no extra '/' and the basename
+    ; pointer is just UrlBuf+2 -- fine for the FCB parser.
+    ld      hl, UrlBuf
+    call    FindUrlBasename
+    call    BuildFcbFromHL
+    ld      a, [Fcb + 1]
+    or      a
+    jr      nz, .ostHaveName
+    ld      hl, SaveStubFcb
+    ld      de, Fcb + 1
+    ld      bc, 11
+    ldir
+.ostHaveName:
+    ld      hl, Fcb
+    ld      de, SaveDestFcb
+    ld      bc, 12                        ; drive + 8 name + 3 ext
+    ldir
+    call    ResetSaveDestFcbTail
+
+    ; Auto-bump the extension if the dest file already exists, so
+    ; we never silently overwrite (e.g. saving from "a:foo.htm"
+    ; when foo.htm is already on the disk picks "foo.2" instead).
+    ; FindAvailableDestName probes ext "ORIG", then "2", "3", ...
+    ; "9", "A", ... "Z" until DOS_OPEN fails (= no such file).
+    call    FindAvailableDestName
+
+    ; Now copy whatever ext SaveDestFcb ended up with into the
+    ; popup-display SaveFilename so the user sees the actual save
+    ; target before clicking Save.
+    call    DestFcbToSaveFilename
+
+    ; Snapshot 24-bit DocOffset so CloseSave can refetch the user's
+    ; original window after the chunk-loop trashed FileBuf.
+    ld      hl, [DocOffset]
+    ld      [SaveResumeOffset], hl
+    ld      a, [DocOffset + 2]
+    ld      [SaveResumeOffset + 2], a
+
+    ; Ask the bridge how big the currently-loaded doc actually is
+    ; ("GET SIZE" returns "OK HTM <total_bytes>\r\n", no body).
+    ; If the query succeeds we know the exact byte count; otherwise
+    ; fall back to WindowLen as a one-chunk-best-guess. The final
+    ; "Saved" frame at .dsCloseAndDone overwrites SaveByteCount with
+    ; the true byte total anyway, so any mismatch is cosmetic.
+    call    SerialMaskVblank
+    ld      hl, BridgeSizeCmd
+    call    RemoteGet
+    push    af                              ; preserve CF
+    call    SerialUnmaskVblank
+    pop     af
+    jr      c, .ostFallback
+    ld      a, [SerialKind]
+    cp      1                                ; HTM
+    jr      nz, .ostFallback
+    ld      hl, [SerialLen]                  ; 16-bit; saturates at 0xFFFF
+    jr      .ostHaveSize
+.ostFallback:
+    ld      hl, [WindowLen]
+.ostHaveSize:
+    ld      [SaveByteCount], hl
+    jr      OpenSave
+
+BridgeSizeCmd: db "SIZE", 0
+
+OpenSave:
+    call    PopupSaveFocusAndUnfocusChrome
+    ld      a, SAVE_H
+    call    SavePopupBg                 ; HMMM-snapshot the bg
+    ld      a, 1
+    ld      [SaveOpen], a
+    jp      DrawSavePopup
+
+CloseSave:
+    ; If DoSave's chunk-loop reached the wire (SaveStatus left Idle),
+    ; FileBuf no longer holds the user's original window. Refetch it
+    ; from SaveResumeOffset before we paint chrome back, so the page
+    ; the user sees afterwards is the page they were looking at when
+    ; they opened the popup.
+    ld      a, [SaveStatus]
+    or      a                               ; SaveStatus_Idle == 0
+    jr      z, .csNoRefetch
+    ld      hl, [SaveResumeOffset]
+    ld      [SlideTarget], hl
+    ld      a, [SaveResumeOffset + 2]
+    ld      [SlideTarget + 2], a
+    call    EnsureWindowRemote
+    ; If the refetch fails we leave FileBuf as-is; the user can hit
+    ; Refresh to recover. Don't fail-close the popup over it.
+.csNoRefetch:
+    xor     a
+    ld      [SaveOpen], a
+    call    PopupRestoreFocusAndPaintChrome
+    call    RestorePopupBg              ; HMMM-blit the bg back
+    ; Drain any keys the user mashed while the chunk-loop / refetch
+    ; were busy. Without this a second Esc queued during the multi-
+    ; second cancel-cleanup reaches MainLoop with SaveOpen=0 and
+    ; hits the .noPopup branch -> Shutdown, killing the program.
+.csDrainKbd:
+    ld      c, DOS_CONST
+    call    BDOS_ENTRY
+    or      a
+    ret     z
+    ld      c, DOS_DIRIN
+    call    BDOS_ENTRY
+    jr      .csDrainKbd
+
+; DoSave: stream the remote source from offset 0 to the dest FCB
+; via the web bridge, 6 KB chunks at a time.
+;
+; Each chunk:
+;   1. Set SlideTarget to the current SaveStreamOff (24-bit).
+;   2. EnsureWindowRemote -- issues "GET CHUNK <hex_offset>" and
+;      drains the response body into FileBuf, updating WindowLen
+;      with the byte count received (clamped to FILE_BUF_SIZE; the
+;      bridge serves SERIAL_CHUNK_RANGE_BYTES = 6 KB so a full
+;      response fits with ~512 B headroom).
+;   3. Zero-fill the trailing partial record so MSX-DOS doesn't
+;      flush FileBuf garbage past EOF (only matters on the final
+;      short chunk; full 6 KB chunks are already multiple of 128).
+;   4. DOS_WRITE the WindowLen bytes in 128-B records, polling Esc
+;      between records for user-cancel.
+;   5. Stop when WindowLen == 0 (bridge returned empty body) or
+;      when WindowLen < SERIAL_CHUNK_RANGE_BYTES (short = last
+;      chunk).
+;
+; FileBuf is trashed by the time DoSave returns; CloseSave refetches
+; the user's original window via SaveResumeOffset so the page they
+; were viewing comes back when the popup closes.
+;
+; Notes:
+;   * MSX-DOS 1 writes whole 128-B records, so the dest file size
+;     gets rounded up to the next record boundary. The bridge
+;     stream byte count itself is exact.
+;   * Local URLs are gated off at OpenSaveFromTitlebar (use DOS
+;     COPY); DoSave only runs for web-bridge sources.
+SERIAL_CHUNK_RANGE_BYTES equ 6 * 1024
+
+DoSave:
+    ; If the previous save already completed, Save button is showing
+    ; "OK" -- treat a click on it the same as Cancel / X / Esc.
+    ld      a, [SaveStatus]
+    cp      SaveStatus_Done
+    jp      z, CloseSave
+
+    ; Re-stamp the cursor (PollMouse erased it before HandleClick
+    ; fired; without this it stays gone for the duration of the
+    ; multi-second download, so the user can't visually track where
+    ; Cancel sits to click it).
+    call    DrawCursor
+
+    ld      a, SaveStatus_Saving
+    ld      [SaveStatus], a
+    xor     a
+    ld      [SaveBytesWritten], a
+    ld      [SaveBytesWritten + 1], a
+    ld      [SaveStreamOff], a
+    ld      [SaveStreamOff + 1], a
+    ld      [SaveStreamOff + 2], a
+    call    PaintSaveSizeProgress
+
+    ; --- F_CREATE the dest once, up front. ---
+    call    ResetSaveDestFcbTail
+    ld      de, SaveDestFcb
+    ld      c, DOS_CREATE
+    call    BDOS_ENTRY
+    or      a
+    jp      nz, .dsFailed
+
+.dsChunk:
+    ; Fetch next 6 KB chunk into FileBuf.
+    ld      hl, [SaveStreamOff]
+    ld      [SlideTarget], hl
+    ld      a, [SaveStreamOff + 2]
+    ld      [SlideTarget + 2], a
+    call    EnsureWindowRemote
+    or      a
+    jp      nz, .dsFailedClose
+
+    ; If WindowLen == 0 the bridge has no more bytes for us; close out.
+    ld      hl, [WindowLen]
+    ld      a, h
+    or      l
+    jp      z, .dsCloseAndDone
+
+    ; Zero-fill the trailing partial record (only nonzero work when
+    ; WindowLen isn't a multiple of 128 -- i.e. the last chunk).
+    ld      a, l
+    and     0x7F
+    jr      z, .dsNoFill
+    ld      b, a
+    ld      a, 128
+    sub     b
+    ld      b, a
+    ld      de, FileBuf
+    ld      hl, [WindowLen]
+    add     hl, de
+    xor     a
+.dsZF:
+    ld      [hl], a
+    inc     hl
+    djnz    .dsZF
+.dsNoFill:
+
+    ; B = record count = (WindowLen + 127) / 128.
+    ld      hl, [WindowLen]
+    ld      bc, 127
+    add     hl, bc
+    ld      a, h
+    add     a, a
+    ld      b, a
+    ld      a, l
+    rlca
+    and     1
+    add     a, b
+    ld      b, a
+
+    ld      hl, FileBuf
+.dsLoop:
+    ; Esc-cancel poll between records.
+    push    bc
+    push    hl
+    ld      c, DOS_CONST
+    call    BDOS_ENTRY
+    or      a
+    jr      z, .dsNoKey
+    ld      c, DOS_DIRIN
+    call    BDOS_ENTRY
+    cp      KEY_ESC
+    jr      z, .dsCancelEnter
+.dsNoKey:
+    pop     hl
+    pop     bc
+
+    push    bc
+    push    hl
+    ex      de, hl
+    ld      c, DOS_SETDMA
+    call    BDOS_ENTRY
+    ld      de, SaveDestFcb
+    ld      c, DOS_WRITE
+    call    BDOS_ENTRY
+    pop     hl
+    pop     bc
+    or      a
+    jp      nz, .dsFailedClose
+    ld      de, 128
+    add     hl, de
+
+    ; Bump byte counter and repaint progress every 8 records (1 KB).
+    push    bc
+    push    hl
+    ld      hl, [SaveBytesWritten]
+    ld      bc, 128
+    add     hl, bc
+    ld      [SaveBytesWritten], hl
+    ld      a, l
+    and     0x03                            ; multiple of 4*128 = 512 B
+    or      h
+    call    z, PaintSaveSizeProgress
+    pop     hl
+    pop     bc
+    djnz    .dsLoop
+
+    ; Chunk drained. Was it short (< 6 KB) -> last chunk -> done.
+    ld      hl, [WindowLen]
+    ld      de, SERIAL_CHUNK_RANGE_BYTES
+    or      a
+    sbc     hl, de
+    jp      c, .dsCloseAndDone              ; WindowLen < 6 KB
+
+    ; Advance stream offset by SERIAL_CHUNK_RANGE_BYTES (24-bit).
+    ld      hl, [SaveStreamOff]
+    ld      de, SERIAL_CHUNK_RANGE_BYTES
+    add     hl, de
+    ld      [SaveStreamOff], hl
+    jr      nc, .dsNoHi
+    ld      a, [SaveStreamOff + 2]
+    inc     a
+    ld      [SaveStreamOff + 2], a
+.dsNoHi:
+    jp      .dsChunk
+
+.dsCloseAndDone:
+    ld      de, SaveDestFcb
+    ld      c, DOS_CLOSE
+    call    BDOS_ENTRY
+    or      a
+    jp      nz, .dsFailed
+    ; Match Size to the exact byte total so Progress hits 100 %.
+    ld      hl, [SaveBytesWritten]
+    ld      [SaveByteCount], hl
+    ld      a, SaveStatus_Done
+    ld      [SaveStatus], a
+    call    PaintSaveSizeProgress
+    jp      PaintSaveButton
+
+.dsCancelEnter:
+    pop     hl
+    pop     bc
+    ; User cancelled. Close + DOS_DELETE the partial dest.
+    ld      de, SaveDestFcb
+    ld      c, DOS_CLOSE
+    call    BDOS_ENTRY
+    ld      de, SaveDestFcb
+    ld      c, DOS_DELETE
+    call    BDOS_ENTRY
+    jp      CloseSave
+
+.dsFailedClose:
+    ld      de, SaveDestFcb
+    ld      c, DOS_CLOSE
+    call    BDOS_ENTRY
+.dsFailed:
+    ld      a, SaveStatus_Failed
+    ld      [SaveStatus], a
+    jp      PaintSaveSizeProgress
+
+; FindAvailableDestName: probe SaveDestFcb's filename via DOS_OPEN.
+; If file exists (open succeeds), bump the extension to "2  ", then
+; "3  ", ... "9  ", "A  ", "B  ", ..., "Z  " until we find a slot
+; that doesn't exist. CF=1 on give-up (all 33 variants taken),
+; otherwise CF=0 with SaveDestFcb pointing at a free name.
+FindAvailableDestName:
+    call    ProbeDestExists
+    ret     nc                            ; original ext is free
+    ld      b, '2'
+.fadnLoop:
+    ld      a, b
+    ld      [SaveDestFcb + 9], a
+    ld      a, ' '
+    ld      [SaveDestFcb + 10], a
+    ld      [SaveDestFcb + 11], a
+    call    ProbeDestExists
+    ret     nc                            ; free -- ext is set
+    ld      a, b
+    inc     a
+    cp      '9' + 1                       ; '9'+1 = ':'
+    jr      nz, .fadnNotTen
+    ld      a, 'A'                        ; skip ':'..'@' over to 'A'
+.fadnNotTen:
+    cp      'Z' + 1
+    jr      nc, .fadnGiveUp
+    ld      b, a
+    jr      .fadnLoop
+.fadnGiveUp:
+    scf
+    ret
+
+; ProbeDestExists: try DOS_OPEN on SaveDestFcb. Returns CF=1 if the
+; file exists (and immediately closes it), CF=0 if not. Resets the
+; FCB tail each probe so a previous failed open doesn't leak state
+; into the next attempt.
+ProbeDestExists:
+    push    bc
+    call    ResetSaveDestFcbTail
+    ld      de, SaveDestFcb
+    ld      c, DOS_OPEN
+    call    BDOS_ENTRY
+    or      a
+    jr      nz, .pdeNotFound
+    ld      de, SaveDestFcb
+    ld      c, DOS_CLOSE
+    call    BDOS_ENTRY
+    pop     bc
+    scf
+    ret
+.pdeNotFound:
+    pop     bc
+    or      a                             ; CF=0
+    ret
+
+; DestFcbToSaveFilename: same shape as FcbNameToDisplay but reads
+; from SaveDestFcb (where the auto-bump may have changed the ext).
+DestFcbToSaveFilename:
+    ld      hl, SaveDestFcb + 1
+    ld      de, SaveFilename
+    ld      bc, 8
+    ldir
+    ld      a, '.'
+    ld      [de], a
+    inc     de
+    ld      hl, SaveDestFcb + 9
+    ld      bc, 3
+    ldir
+    xor     a
+    ld      [de], a
+    ret
+
+; FcbNameToDisplay: copy the FCB filename (8 chars at Fcb+1) + "." +
+; extension (3 chars at Fcb+9) into SaveFilename (13 bytes incl NUL).
+; The FCB stores name/ext space-padded; we preserve those spaces so
+; the popup renders the canonical "NAME    .EXT" layout.
+FcbNameToDisplay:
+    ld      hl, Fcb + 1
+    ld      de, SaveFilename
+    ld      bc, 8
+    ldir
+    ld      a, '.'
+    ld      [de], a
+    inc     de
+    ld      hl, Fcb + 9
+    ld      bc, 3
+    ldir
+    xor     a
+    ld      [de], a
+    ret
+
+; PaintSaveStatusLine: replaces the body's "Size:" / "Progress:" row
+; with a centred status string based on SaveStatus.
+; PaintSaveSizeProgress: paint the body's "Size: X.X KB  Progress:
+; Y.Y KB" row. On Save_Failed it shows a single "Save failed."
+; centred message instead. Called once when the popup opens
+; (renders "Size: N KB  Progress: 0.0 KB"), then per-update as
+; DoSave streams bytes (live-tracks Progress), then on completion
+; (Progress == Size).
+PaintSaveSizeProgress:
+    ; LGRAY-fill the row.
+    ld      b, (SAVE_X + 4) / 4
+    ld      c, SAVE_Y + 40
+    ld      d, (SAVE_W - 8) / 4
+    ld      e, 8
     ld      a, COL_LGRAY
     call    FillRect
-
-    ld      b, ABOUT_X / 4
-    ld      c, ABOUT_Y
-    ld      d, ABOUT_W / 4
-    ld      e, ABOUT_H
-    ld      a, COL_BLACK
-    call    DrawRectBorder
-
-    ; Black-on-lgray body text so it blends with the popup fill.
     ld      a, COL_BLACK
     ld      l, COL_LGRAY
     call    SetTextColours
 
-    ld      de, ABOUT_X + 8
-    ld      c, ABOUT_Y + 4
-    ld      hl, AboutTitleMsg
+    ld      a, [SaveStatus]
+    cp      SaveStatus_Failed
+    jr      z, .pspFailed
+
+    ; --- Size field on the left: "Size: X.X KB" ---
+    ld      de, SaveStatusBuf
+    ld      hl, SizeLabel
+    call    StrCopy
+    ld      hl, [SaveByteCount]
+    call    FormatKB
+    xor     a
+    ld      [de], a
+    ld      hl, SaveStatusBuf
+    ld      de, SAVE_X + 8
+    ld      c, SAVE_Y + 40
     call    DrawString
 
-    ld      de, ABOUT_X + ABOUT_W - 13  ; X glyph in the popup's top-right (1 px left of the border)
-    ld      c, ABOUT_Y + 4
+    ; --- Progress field on the right: "Progress: Y.Y KB" ---
+    ld      de, SaveStatusBuf
+    ld      hl, ProgressLabel
+    call    StrCopy
+    ld      hl, [SaveBytesWritten]
+    call    FormatKB
+    xor     a
+    ld      [de], a
+    ld      hl, SaveStatusBuf
+    ld      de, SAVE_X + 8 + 120
+    ld      c, SAVE_Y + 40
+    jp      DrawString
+
+.pspFailed:
+    ld      hl, SaveStatusFailedMsg
+    ld      de, SAVE_X + 16
+    ld      c, SAVE_Y + 40
+    jp      DrawString
+
+; PaintSaveButton: redraw the Save button. Label is "Save" while
+; the save is idle / in flight / failed, and "OK" once it's done so
+; the user has a clear "dismiss" action paired with the right
+; ClickInSavePopup behaviour (both Save and Cancel close the popup
+; in the Done state).
+PaintSaveButton:
+    ld      b, SAVE_BTN1_X / 4
+    ld      c, SAVE_BTN_Y
+    ld      d, SAVE_BTN_W / 4
+    ld      e, SAVE_BTN_H
+    ld      a, COL_LGRAY
+    call    FillRect
+    ld      b, SAVE_BTN1_X / 4
+    ld      c, SAVE_BTN_Y
+    ld      d, SAVE_BTN_W / 4
+    ld      e, SAVE_BTN_H
+    ld      a, COL_BLACK
+    call    DrawRectBorder
+    ld      a, COL_BLACK
+    ld      l, COL_LGRAY
+    call    SetTextColours
+    ld      a, [SaveStatus]
+    cp      SaveStatus_Done
+    jr      z, .psbOk
+    ld      hl, SaveBtnSaveMsg
+    ld      de, SAVE_BTN1_X + (SAVE_BTN_W - 4 * 8) / 2  ; "Save" = 4 chars
+    jr      .psbDraw
+.psbOk:
+    ld      hl, SaveBtnOkMsg
+    ld      de, SAVE_BTN1_X + (SAVE_BTN_W - 2 * 8) / 2  ; "OK" = 2 chars
+.psbDraw:
+    ld      c, SAVE_BTN_Y + 3
+    jp      DrawString
+
+; StrCopy: copy NUL-terminated string from HL to DE. Stops at the
+; NUL (does NOT copy it -- caller appends one). Returns DE = position
+; past the last byte copied, HL = past the NUL.
+StrCopy:
+    ld      a, [hl]
+    or      a
+    ret     z
+    ld      [de], a
+    inc     hl
+    inc     de
+    jr      StrCopy
+
+; FormatKB: render HL (unsigned 16-bit byte count) as "X.Y KB" at DE.
+; Integer part is HL/1024 (floor), decimal digit is the next 1/10
+; (floor). Max value 0xFFFF -> "63.9 KB". Returns DE past the last
+; char. Doesn't NUL-terminate -- caller does, so this composes with
+; StrCopy.
+FormatKB:
+    push    bc
+
+    ; Integer part = HL >> 10. For 16-bit values the integer fits
+    ; in the high byte's top 6 bits.
+    ld      a, h
+    srl     a
+    srl     a
+    ld      b, a                          ; B = integer KB (0..63)
+
+    ; Print integer: 0..9 single digit, 10..63 two digits.
+    cp      10
+    jr      c, .fkbOnes
+    ; Tens: peel off in a loop (max 6 iterations for B<=63).
+    ld      c, 0
+.fkbTens:
+    cp      10
+    jr      c, .fkbTensDone
+    sub     10
+    inc     c
+    jr      .fkbTens
+.fkbTensDone:
+    push    af                            ; A = ones digit
+    ld      a, c
+    add     a, '0'
+    ld      [de], a
+    inc     de
+    pop     af
+.fkbOnes:
+    add     a, '0'
+    ld      [de], a
+    inc     de
+
+    ; Decimal point.
+    ld      a, '.'
+    ld      [de], a
+    inc     de
+
+    ; Decimal digit = (HL & 0x3FF) * 10 / 1024. Clear high 6 bits of
+    ; H, multiply HL by 10, take the high 6 bits of H.
+    ld      a, h
+    and     0x03
+    ld      h, a
+    ; HL * 10 = HL*8 + HL*2. Use a temp in BC.
+    ld      b, h
+    ld      c, l
+    add     hl, hl                        ; HL*2
+    add     hl, hl                        ; HL*4
+    add     hl, bc                        ; HL*4 + HL*1 = HL*5
+    add     hl, hl                        ; HL*10
+    ld      a, h
+    srl     a
+    srl     a                             ; A = (HL*10) >> 10
+    add     a, '0'
+    ld      [de], a
+    inc     de
+
+    ; " KB" suffix.
+    ld      a, ' '
+    ld      [de], a
+    inc     de
+    ld      a, 'K'
+    ld      [de], a
+    inc     de
+    ld      a, 'B'
+    ld      [de], a
+    inc     de
+
+    pop     bc
+    ret
+
+SaveStatus_Idle    equ 0
+SaveStatus_Saving  equ 1
+SaveStatus_Done    equ 2
+SaveStatus_Failed  equ 3
+
+SaveStatusFailedMsg: db "Save failed.", 0
+SizeLabel:           db "Size: ", 0
+ProgressLabel:       db "Progress: ", 0
+SaveBtnOkMsg:        db "OK", 0
+; FCB-format placeholder when UrlBuf is empty (Open [] on a blank
+; page): 8-char name + 3-char ext, space-padded, no dot.
+SaveStubFcb:         db "PAGE    HTM"
+
+; ClickInSavePopup: dispatch a click while the Save popup is open.
+; Targets (X-band tests guarded by Y-band so out-of-rect clicks
+; silently no-op):
+;   - X glyph top-right -> CloseSave (= Cancel)
+;   - Save button rect  -> DoSave
+;   - Cancel button rect -> CloseSave
+ClickInSavePopup:
+    ld      a, [MouseY]
+    cp      SAVE_Y
+    ret     c                               ; above popup
+    ld      hl, [MouseX]
+
+    ; Top title strip: hand off to the close-X test.
+    cp      SAVE_Y + 16
+    jr      c, .csTitle
+
+    ; Buttons row.
+    cp      SAVE_BTN_Y
+    ret     c
+    cp      SAVE_BTN_Y + SAVE_BTN_H
+    ret     nc
+
+    ; Save button hotspot.
+    ld      de, SAVE_BTN1_X
+    call    CpHL
+    jr      c, .csTrySaveDone
+    ld      de, SAVE_BTN1_X + SAVE_BTN_W
+    call    CpHL
+    jp      c, DoSave
+.csTrySaveDone:
+
+    ; Cancel button hotspot.
+    ld      de, SAVE_BTN2_X
+    call    CpHL
+    ret     c
+    ld      de, SAVE_BTN2_X + SAVE_BTN_W
+    call    CpHL
+    ret     nc
+    jp      CloseSave
+
+.csTitle:
+    ld      de, SAVE_X + SAVE_W - 16
+    call    CpHL
+    ret     c
+    ld      de, SAVE_X + SAVE_W
+    call    CpHL
+    ret     nc
+    jp      CloseSave
+
+; ----------------------------------------------------------------------------
+; DrawPopupFrame: shared LGRAY body + BLACK border + title row + X
+; close glyph. Used by both DrawAboutPopup and DrawSavePopup so the
+; popup chrome is authored once.
+;
+; Inputs:
+;   A  = body / popup height in pixels (each popup picks its own H
+;        to snap to its content; X / Y / W stay shared for visual
+;        consistency)
+;   B  = title-bar background colour (COL_LGRAY blends with body,
+;        COL_WHITE gives the Save dialog its distinct title strip)
+;   HL = title string ptr (NUL terminated)
+;
+; Leaves the SetTextColours pair on BLACK-on-LGRAY so the caller can
+; immediately DrawString body lines without re-setting colours.
+; ----------------------------------------------------------------------------
+DrawPopupFrame:
+    push    hl                          ; save title ptr
+    push    bc                          ; save title-bar bg colour (B)
+    push    af                          ; save body height (A)
+
+    ; Body fill (LGRAY) + black border, full popup.
+    ld      b, SAVE_X / 4
+    ld      c, SAVE_Y
+    ld      d, SAVE_W / 4
+    ld      e, a                        ; height (still in A from caller)
+    push    de                          ; need E (height) later
+    ld      a, COL_LGRAY
+    call    FillRect
+    pop     de
+    ld      b, SAVE_X / 4
+    ld      c, SAVE_Y
+    ld      d, SAVE_W / 4
+    ld      a, COL_BLACK
+    call    DrawRectBorder
+
+    ; Title bar overlay. SAVE_X is 4-px aligned (108 = 27*4) so the
+    ; strip fill lands cleanly. We re-draw the top + side border
+    ; bytes afterwards so the title strip looks framed even when the
+    ; overlay colour matches the body (COL_LGRAY case).
+    pop     af                          ; A = saved body height (unused below)
+    pop     bc                          ; B = title-bar bg colour
+    push    bc
+    ld      a, b
+    cp      COL_LGRAY
+    jr      z, .pfNoTitleFill           ; matches body -- no overlay needed
+    ld      b, SAVE_X / 4
+    ld      c, SAVE_Y
+    ld      d, SAVE_W / 4
+    ld      e, POPUP_TITLE_H
+    ; A still holds the title-bar bg colour from the cp above.
+    call    FillRect
+    ; Re-paint the top + side border pixels eaten by the fill above.
+    ld      b, SAVE_X / 4
+    ld      c, SAVE_Y
+    ld      d, SAVE_W / 4
+    ld      e, POPUP_TITLE_H
+    ld      a, COL_BLACK
+    call    DrawRectBorder
+.pfNoTitleFill:
+
+    ; Title text colour: pair with whichever title-bar background we
+    ; just painted (caller's B).
+    pop     bc
+    ld      a, COL_BLACK
+    ld      l, b                        ; bg for SetTextColours
+    push    bc
+    call    SetTextColours
+
+    pop     bc                          ; bg (unused past here)
+    pop     hl                          ; HL = title string
+
+    ; Title text top-left (1 px inside left border + small margin).
+    push    hl
+    ld      de, SAVE_X + 8
+    ld      c, SAVE_Y + 4
+    call    DrawString
+
+    ; "X" close glyph top-right.
+    ld      de, SAVE_X + SAVE_W - 13
+    ld      c, SAVE_Y + 4
     ld      hl, CharX
     call    DrawString
+    pop     hl
+
+    ; Body text is BLACK on LGRAY for both popups; leave colour pair
+    ; armed for the caller's body lines.
+    ld      a, COL_BLACK
+    ld      l, COL_LGRAY
+    jp      SetTextColours              ; tail-call returns to caller
+
+; ----- DrawSavePopup: shared frame + 2 body lines + buttons -----
+DrawSavePopup:
+    ld      a, SAVE_H
+    ld      b, COL_WHITE                ; title strip is white per spec
+    ld      hl, SaveTitleMsg
+    call    DrawPopupFrame
+    ; Title is painted; colour pair now back at BLACK-on-LGRAY.
+
+    ; Body line 1: "Save as: " + path + filename. Drive prefix is
+    ; hardcoded to "A:" for now; future polish will query the
+    ; current drive via BDOS function 0x19.
+    ld      de, SAVE_X + 8
+    ld      c, SAVE_Y + 24
+    ld      hl, SaveAsLabel
+    call    DrawString
+    ld      de, SAVE_X + 8 + (9 * 8)        ; past "Save as: " (9 chars)
+    ld      c, SAVE_Y + 24
+    ld      hl, SavePathPrefix
+    call    DrawString
+    ld      de, SAVE_X + 8 + (11 * 8)       ; past "Save as: A:" (11 chars)
+    ld      c, SAVE_Y + 24
+    ld      hl, SaveFilename
+    call    DrawString
+
+    ; Body line 2: "Size: X.X KB" + "Progress: Y.Y KB". The shared
+    ; PaintSaveSizeProgress renders the row; DoSave then re-calls it
+    ; on each progress tick.
+    call    PaintSaveSizeProgress
+
+    ; --- Save button: black border + "Save" label ---
+    ld      b, SAVE_BTN1_X / 4
+    ld      c, SAVE_BTN_Y
+    ld      d, SAVE_BTN_W / 4
+    ld      e, SAVE_BTN_H
+    ld      a, COL_BLACK
+    call    DrawRectBorder
+    ld      de, SAVE_BTN1_X + (SAVE_BTN_W - 4 * 8) / 2  ; "Save" = 4 chars
+    ld      c, SAVE_BTN_Y + 3
+    ld      hl, SaveBtnSaveMsg
+    call    DrawString
+
+    ; --- Cancel button ---
+    ld      b, SAVE_BTN2_X / 4
+    ld      c, SAVE_BTN_Y
+    ld      d, SAVE_BTN_W / 4
+    ld      e, SAVE_BTN_H
+    ld      a, COL_BLACK
+    call    DrawRectBorder
+    ld      de, SAVE_BTN2_X + (SAVE_BTN_W - 6 * 8) / 2  ; "Cancel" = 6 chars
+    ld      c, SAVE_BTN_Y + 3
+    ld      hl, SaveBtnCancelMsg
+    jp      DrawString                          ; tail-call; returns to caller
+
+; Strings used by the Save popup.
+SaveTitleMsg:        db "Save file?", 0
+SaveAsLabel:         db "Save as: ", 0
+SavePathPrefix:      db "A:", 0
+SaveBtnSaveMsg:      db "Save", 0
+SaveBtnCancelMsg:    db "Cancel", 0
+
+DrawAboutPopup:
+    ; Shared frame: LGRAY body + black border + title row + X close.
+    ; About keeps its title strip blending with the body (COL_LGRAY).
+    ld      a, ABOUT_H
+    ld      b, COL_LGRAY
+    ld      hl, AboutTitleMsg
+    call    DrawPopupFrame
+    ; Colour pair now back at BLACK-on-LGRAY (see DrawPopupFrame tail).
 
     ; Centre "MSX WBrowser" (12 glyphs * 8 px = 96 px) and render it
-    ; bold via DrawCharFast. FontLUT_BlackOnLgray matches the popup's
-    ; LGRAY background; HtmlStyleFlags=STYLE_BOLD makes DrawCharFast
-    ; OR each glyph row with itself shifted right one pixel.
-    ld      hl, FontLUT_BlackOnLgray
-    ld      [CurrentFontLUT], hl
+    ; bold via DrawCharFast. SetTextColours(BLACK, LGRAY) above already
+    ; pointed CurrentFontLUT at FontLUT_BlackOnLgray; just flip on the
+    ; STYLE_BOLD bit so DrawCharFast ORs each row with itself shifted.
     ld      a, STYLE_BOLD
     ld      [HtmlStyleFlags], a
     ld      b, (ABOUT_X + (ABOUT_W - 96) / 2) / 4    ; byte col = pixel/4
@@ -8038,8 +16812,8 @@ DrawAboutPopup:
 .apmDone:
     xor     a
     ld      [HtmlStyleFlags], a
-    ld      hl, FontLUT
-    ld      [CurrentFontLUT], hl
+    ; Leave CurrentFontLUT pointing at FontLUT_BlackOnLgray for the
+    ; body lines below; DrawString picks it up unchanged.
 
     ; Centre the Arabic tagline: 23 glyphs * 8 px = 184 px wide.
     ld      de, ABOUT_X + (ABOUT_W - 184) / 2
@@ -8052,14 +16826,38 @@ DrawAboutPopup:
     ld      hl, AboutLine3
     call    DrawString
 
+    ; Image-toggle row, centred above the F-key list. Three DrawString
+    ; calls so we can paint Latin -> [_] -> Arabic in a single line
+    ; without an intermediate buffer. ImgCheckArabic is hand-shaped to
+    ; AX-370 CGTABL glyph codes (see its comment block for the recipe).
+    ld      de, ABOUT_X + 36
+    ld      c, IMG_CHK_Y
+    ld      hl, ImgCheckLatin
+    call    DrawString
+    call    DrawImgCheckbox             ; renders [ ] or [X] at IMG_CHK_X
+    ld      de, IMG_CHK_X + 32          ; checkbox is 3 chars + 1 space = 32 px
+    ld      c, IMG_CHK_Y
+    ld      hl, ImgCheckArabic
+    call    DrawString
+
     ld      de, ABOUT_X + 8
-    ld      c, ABOUT_Y + 60
+    ld      c, ABOUT_Y + 70
     ld      hl, AboutLine4
     call    DrawString
 
     ld      de, ABOUT_X + 8
-    ld      c, ABOUT_Y + 72
+    ld      c, ABOUT_Y + 82
     ld      hl, AboutLine5
+    call    DrawString
+
+    ld      de, ABOUT_X + 8
+    ld      c, ABOUT_Y + 94
+    ld      hl, AboutLine6
+    call    DrawString
+
+    ld      de, ABOUT_X + 8
+    ld      c, ABOUT_Y + 106
+    ld      hl, AboutLine7
     call    DrawString
 
     ld      de, ABOUT_X + 8
@@ -8069,6 +16867,32 @@ DrawAboutPopup:
 
     ; 53x15 logo sits to the right of the "MSX WBrowser" line.
     jp      DrawLogoBitmap
+
+; DrawImgCheckbox: paint [ ] or [X] at (IMG_CHK_X, IMG_CHK_Y) based on
+; the current ShowImages flag. Used by both the initial popup paint
+; and the click-toggle redraw. Black-on-white -- the white background
+; inside and around the brackets makes the cell read as an actual
+; checkbox box against the popup's lgray body, instead of the two
+; loose [ and ] glyphs floating in the middle of a label.
+DrawImgCheckbox:
+    ld      a, COL_BLACK
+    ld      l, COL_WHITE
+    call    SetTextColours
+    ld      a, [ShowImages]
+    or      a
+    ld      hl, ImgCheckOff
+    jr      z, .dicGo
+    ld      hl, ImgCheckOn
+.dicGo:
+    ld      de, IMG_CHK_X
+    ld      c, IMG_CHK_Y
+    call    DrawString
+    ; Restore the popup body's black-on-lgray colour pair so the next
+    ; DrawString call (Arabic tail, F-key lines, footer) doesn't paint
+    ; against a white background.
+    ld      a, COL_BLACK
+    ld      l, COL_LGRAY
+    jp      SetTextColours
 
 ; DrawLogoBitmap: blit LogoBitmap (LOGO_W_BYTES x LOGO_H) into VRAM to
 ; the right of the "MSX WBrowser" label, vertically centred around that
@@ -8101,7 +16925,7 @@ DrawLogoBitmap:
     ld      b, LOGO_W_BYTES
 .dlbCol:
     ld      a, [hl]
-    out     [VDP_DATA], a
+    out     (VDP_DATA), a
     inc     hl
     djnz    .dlbCol
     ld      a, [LogoCurY]
@@ -8166,6 +16990,30 @@ DrawTitleLabel:
     ld      c, 1
     ld      hl, TitleSuffix
     call    DrawString
+
+    ; Save-page button: "[]" placeholder, 8 px gap before the "?" so
+    ; the cluster reads as three distinct glyphs ("[]", "?", "X").
+    ; Dimmed (DGRAY on LGRAY) when the address bar holds a local
+    ; drive-letter URL -- OpenSaveFromTitlebar no-ops in that case
+    ; (use DOS COPY instead) so the disabled glyph mirrors the
+    ; behaviour. Web-bridge URLs paint BLACK as before.
+    ld      hl, UrlBuf
+    call    IsLocalUrl
+    ld      a, COL_BLACK
+    jr      nz, .dtlSaveColorReady
+    ld      a, COL_DGRAY
+.dtlSaveColorReady:
+    ld      l, COL_LGRAY
+    call    SetTextColours
+    ld      de, WIDTH - 48
+    ld      c, 1
+    ld      hl, CharSaveBtn
+    call    DrawString
+
+    ; Restore BLACK ink for the remaining titlebar glyphs.
+    ld      a, COL_BLACK
+    ld      l, COL_LGRAY
+    call    SetTextColours
 
     ; "?" button (About popup; shortcut F1). Placed left of the X.
     ld      de, WIDTH - 24
@@ -8262,6 +17110,127 @@ PrepTitleDraw:
     add     hl, de
     xor     a
     ld      [hl], a
+
+    ; --- BiDi fix-up for Latin runs inside an RTL title ----------------
+    ; .ptLoop reversed the whole string so Arabic reads correctly under
+    ; the LTR GRPPRT renderer. That also reverses Latin/digit/space runs
+    ; ("BBC News" came out "sweN CBB"). Walk the source: for every
+    ; maximal non-Arabic run at logical positions [i..j-1], its reversed
+    ; image sits at TitleDrawBuf[N-j..N-i-1]. Swap that slice end-for-
+    ; end to restore the run's natural reading order while leaving the
+    ; Arabic slices alone.
+    xor     a
+    ld      [TitleI], a                 ; i = 0
+.ptfScanI:
+    ld      a, [TitleI]
+    ld      b, a
+    ld      a, [TitleN]
+    cp      b
+    jp      z, .ptDone                  ; i == N -> finished
+    ld      a, b                        ; A = i
+    call    .ptfProbeAt                 ; Z = non-Arabic at index A
+    jr      nz, .ptfSkipArabic          ; Arabic char at i -> advance one
+    ; Start of a non-Arabic run. Set TitleJ = i and extend until Arabic
+    ; or end-of-string.
+    ld      a, b
+    ld      [TitleJ], a
+.ptfExtendJ:
+    ld      a, [TitleN]
+    ld      c, a
+    ld      a, [TitleJ]
+    cp      c
+    jr      z, .ptfRunFound             ; reached end
+    call    .ptfProbeAt                 ; A still = TitleJ after the cp
+    jr      nz, .ptfRunFound            ; Arabic boundary
+    ld      a, [TitleJ]
+    inc     a
+    ld      [TitleJ], a
+    jr      .ptfExtendJ
+.ptfRunFound:
+    ; The run lives at source[TitleI .. TitleJ-1] (non-Arabic only).
+    ; In the main pass we wrote src[k] to buf[N-1-k], so the reversed
+    ; image of that slice sits at buf[N-TitleJ .. N-TitleI-1]. Swap the
+    ; slice end-for-end to put the Latin letters back in reading order.
+    ; Registers after the math:
+    ;   E = lo  = N - j
+    ;   D = hi  = N - i - 1
+    ld      a, [TitleN]
+    ld      b, a
+    ld      a, [TitleJ]
+    ld      c, a
+    ld      a, b
+    sub     c                           ; A = N - j
+    ld      e, a                        ; E = lo
+    ld      a, [TitleI]
+    ld      c, a
+    ld      a, b
+    sub     c
+    dec     a                           ; A = N - i - 1
+    ld      d, a                        ; D = hi
+    cp      e
+    jr      c, .ptfRunNext              ; hi <  lo -> empty slice
+    jr      z, .ptfRunNext              ; hi == lo -> single char, no swap
+    sub     e                           ; A = hi - lo
+    inc     a                           ; A = slice width
+    srl     a                           ; A = swap count
+    jr      z, .ptfRunNext
+    ld      [TitleConn], a              ; stash count; B is about to be clobbered
+    ; HL = &buf[lo]
+    ld      hl, TitleDrawBuf
+    ld      c, e
+    ld      b, 0
+    add     hl, bc
+    ; IX = HL + (hi - lo)  = &buf[hi]
+    push    hl
+    pop     ix
+    ld      a, d
+    sub     e
+    ld      c, a
+    add     ix, bc                      ; B is still 0 here
+    ld      a, [TitleConn]
+    ld      b, a                        ; B = swaps remaining
+.ptfSwap:
+    ld      a, [hl]
+    ld      c, [ix + 0]
+    ld      [hl], c
+    ld      [ix + 0], a
+    inc     hl
+    dec     ix
+    djnz    .ptfSwap
+.ptfRunNext:
+    ld      a, [TitleJ]
+    ld      [TitleI], a                 ; i = j, continue scan
+    jp      .ptfScanI
+.ptfSkipArabic:
+    ld      a, [TitleI]
+    inc     a
+    ld      [TitleI], a
+    jr      .ptfScanI
+
+.ptfProbeAt:
+    ; Input:  A = index into HtmlTitleBuf
+    ; Output: Z set  iff the byte is ASCII or a non-Arabic upper-ISO char.
+    ;         Destroys D,E,HL; preserves B,C,TitleI,TitleJ.
+    ld      e, a
+    ld      d, 0
+    ld      hl, HtmlTitleBuf
+    add     hl, de
+    ld      a, [hl]
+    cp      0x80
+    jr      c, .ptfProbeAscii           ; ASCII -> not Arabic
+    sub     0x80
+    ld      e, a
+    ld      d, 0
+    ld      hl, IsoJoin
+    add     hl, de
+    ld      a, [hl]
+    and     IS_ARABIC
+    ret                                 ; Z = not Arabic
+.ptfProbeAscii:
+    xor     a                           ; Z flag set
+    ret
+
+.ptDone:
     ld      hl, TitleDrawBuf
     ld      a, [TitleN]
     ret
@@ -8382,13 +17351,13 @@ TitleShapeOne:
     xor     a
     jr      .tsLookup
 .tsEnd:
-    ld      a, 1
+    ld      a, 2
     jr      .tsLookup
 .tsIni:
     ld      a, 2
     jr      .tsLookup
 .tsMid:
-    ld      a, 3
+    ld      a, 2
 .tsLookup:
     ; glyph = IsoMap[(TitleCur - 0x80)*4 + form]
     ld      e, a                        ; E = form
@@ -8405,12 +17374,1529 @@ TitleShapeOne:
     ld      a, [hl]
     ret
 
+; ============================================================================
+; Serial web-bridge transport  (Generic MSX RS-232C, Intel 8251)
+;
+; Protocol (see tools/web_bridge.py for the other end):
+;   MSX -> bridge: GET <target>\r\n
+;   bridge -> MSX: OK <KIND> <len>\r\n<body>   KIND = "HTM" | "PCX"
+;                  ERR <code>\r\n
+; ============================================================================
+
+UART_DATA       equ 0x80
+UART_STATUS     equ 0x81
+
+; Screen-6 R1 default: display + VBLANK enabled. BIOS shadow
+; (RG1SAV @ 0xF3E0) after CHGMOD 6 reads 0x60; the top bit in our
+; write turns out to be don't-care on the V9938's R1, and the value
+; 0xE0 is what renders cleanly on example.com. See
+; tools/NOTES_serial_bridge.md for the frogfind chrome-glitch
+; writeup.
+SerialR1Value   equ 0xE0
+
+SerialMaskVblank:
+    ld      a, SerialR1Value & 0xDF      ; VBLANK off
+    jr      SerialWriteR1
+SerialUnmaskVblank:
+    ld      a, SerialR1Value
+SerialWriteR1:
+    ; Mirror the value into VdpR1Saved so that any subsequent
+    ; VdpBlank / VdpUnblank pair (e.g. inside RenderRemoteBitmap)
+    ; restores THIS R1 state on Unblank, not the cold default. Without
+    ; this, blanking inside a SerialMaskVblank section would silently
+    ; flip IE0 back on and re-arm the vblank IRQ during the burst.
+    ld      [VdpR1Saved], a
+    di
+    out     (VDP_CMD), a
+    ld      a, 0x80 | 1
+    out     (VDP_CMD), a
+    ei
+    ret
+
+; SerialInit: program the i8253 timer + i8251 USART for high-speed
+; async 8-N-1 with RxEN + TxEN, RTS initially deasserted.
+;
+; Generic MSX RS-232 cartridges put an i8253 timer at I/O 0x84..0x87
+; alongside the i8251 USART at 0x80..0x81. Counter 0 drives the
+; i8251 RxC clock and counter 1 the TxC. The wire baud rate is
+;
+;   1.8432 MHz / SERIAL_DIVISOR / 16
+;
+; with the /16 coming from the i8251's mode-byte prescale (0x4E).
+; Stick to /16 because /1 prescale (mode 0x4D) shrinks the i8251's
+; per-byte time to ~65 us at the same clock period -- 16x faster
+; than the documented wire rate, which the Z80 poll loop can't drain.
+;
+; RTS hardware flow control: SerialInit boots with RTS = 0
+; (CMD_RTS_OFF). SerialRead asserts RTS while it's actively waiting
+; for a byte and clears it again before returning, so the bridge
+; only delivers one byte at a time, exactly when the .COM is ready
+; to consume it. This makes the receive path independent of per-
+; byte processing time -- the spinner, BIOS calls, BDOS, PCX RLE
+; replays, scrolling, anything in between SerialRead calls is fine.
+; Wire baud becomes a bandwidth knob, not a correctness one.
+PIT_CTRL        equ 0x87
+PIT_C0          equ 0x84
+PIT_C1          equ 0x85
+
+; SERIAL_DIVISOR can be overridden at build time:
+;   sjasmplus -DSERIAL_DIVISOR=N src/mwbrowser.asm
+; Standard rates (i8251 mode 0x4E = /16 prescale):
+;   1   -> 115200 (emulator-only ceiling)
+;   2   -> 57600
+;   3   -> 38400
+;   6   -> 19200 (real-cartridge documented ceiling)
+;   12  -> 9600
+;   24  -> 4800
+;   96  -> 1200  (BIOS default; what real hardware boots into)
+    IFNDEF SERIAL_DIVISOR
+; Default = 1 -> 115200 baud. Safe at any rate now that SerialRead
+; uses RTS hardware flow control: bytes only flow while the .COM is
+; actively waiting in SerialRead, so per-byte processing time can
+; be arbitrarily long without risking an i8251 overrun. For real
+; hardware (Sony HB-G900 / Toshiba HX-23F etc.) cap at divisor 6
+; (19200 baud, the documented cartridge ceiling) by passing
+; `-b 19200` to tools/run.sh or `SERIAL_BAUD=19200 tools/build.sh`.
+SERIAL_DIVISOR  equ 1
+    ENDIF
+
+SerialInit:
+    ; i8253 counter 0 (RxC) + counter 1 (TxC), both mode 3, 16-bit
+    ; divisor read from RAM (SerialDivisor) so SerialAutoProbe can
+    ; reprogram the wire rate at runtime without rebuilding. The
+    ; build-time default (SERIAL_DIVISOR symbol) is just the seed
+    ; value SerialDivisor gets at boot via InitState.
+    ld      a, 0x36                     ; counter 0 ctrl, mode 3, R/W LSB+MSB
+    out     (PIT_CTRL), a
+    ld      a, [SerialDivisor]
+    out     (PIT_C0), a
+    ld      a, [SerialDivisor + 1]
+    out     (PIT_C0), a
+    ld      a, 0x76                     ; counter 1 ctrl, mode 3, R/W LSB+MSB
+    out     (PIT_CTRL), a
+    ld      a, [SerialDivisor]
+    out     (PIT_C1), a
+    ld      a, [SerialDivisor + 1]
+    out     (PIT_C1), a
+
+    ; i8251 reset / mode / command sequence.
+    xor     a
+    out     (UART_STATUS), a
+    out     (UART_STATUS), a
+    out     (UART_STATUS), a
+    ld      a, 0x40                     ; IR = internal reset
+    out     (UART_STATUS), a
+    ld      a, 0x4E                     ; mode: 8 data, no parity, 1 stop, /16
+    out     (UART_STATUS), a
+    ; cmd: ER | RxEN | DTR | TxEN, RTS = 0. SerialRead asserts RTS
+    ; only while waiting for a byte and clears it again on return,
+    ; so the bridge cannot push more than one byte at a time and
+    ; the .COM is free to take any amount of time between bytes.
+    ; This is how the i8251 implements hardware flow control --
+    ; openMSX's RS232Net::signal() already gates byte delivery on
+    ; the RTS state.
+    ld      a, 0x17
+    out     (UART_STATUS), a
+    ret
+
+; Command register shorthand. 0x37 = RTS asserted + everything else.
+; 0x17 = RTS cleared + everything else.  ER (Error Reset) bit is
+; always set so the next write also clears any latched OE/PE/FE.
+CMD_RTS_ON      equ 0x37
+CMD_RTS_OFF     equ 0x17
+
+; Runtime serial state. SerialDivisor seeds with the build-time
+; SERIAL_DIVISOR (default 1 = 115200) and gets overwritten by
+; SerialAutoProbe with the first divisor the bridge actually
+; responds at. SerialProbed flips to 1 once a rate is locked, so
+; subsequent fetches skip the probe walk.
+SerialDivisor:  dw SERIAL_DIVISOR
+SerialProbed:   db 0
+
+; ProbeTable: divisors to try, fastest first, 0-terminated. The
+; first one to round-trip a probe wins. 38400 / 57600 / 115200 only
+; work in emulator-land or with fast TCP-bridge gateways; 19200 is
+; the documented real-cartridge ceiling; 1200 is the BIOS default.
+ProbeTable:
+    dw  1, 2, 3, 6, 12, 24, 48, 96, 0
+
+; SerialAutoProbe: walk ProbeTable, reprogramming the i8253 + i8251
+; for each divisor and asking the bridge for an empty "IMG OFF"
+; response. First rate where the bridge replies with 'O' (start of
+; "OK HTM 0\r\n") wins; we lock SerialDivisor + SerialProbed and
+; return CF=0. If no rate works, return CF=1 -- caller surfaces a
+; 404 page like for any other unreachable bridge.
+SerialAutoProbe:
+    ld      hl, ProbeTable
+.spLoop:
+    ld      e, [hl]
+    inc     hl
+    ld      d, [hl]
+    inc     hl
+    ld      a, d
+    or      e
+    jr      z, .spFail
+    ld      [SerialDivisor], de
+    push    hl
+    call    SerialInit
+    call    SerialProbeOnce
+    pop     hl
+    jr      c, .spLoop                  ; CF=1: rate didn't work, try next
+    ld      a, 1
+    ld      [SerialProbed], a
+    and     a                           ; CF=0
+    ret
+.spFail:
+    scf
+    ret
+
+; SerialProbeOnce: send "GET IMG OFF\r\n", wait briefly for the first
+; reply byte, validate it's 'O'. CF=0 on success, CF=1 on timeout or
+; bad first byte. After a successful probe we drain the rest of
+; "K HTM 0\r\n" through the regular SerialRead path so the bridge's
+; queue is empty before the real fetch starts.
+SerialProbeOnce:
+    call    SerialMaskVblank
+    ld      hl, ProbeReq
+    call    SerialWriteZ
+    ld      a, 0x0D
+    call    SerialWrite
+    ld      a, 0x0A
+    call    SerialWrite
+
+    ; Wait for the first reply byte with a tight timeout (~0.1 s
+    ; emulated). A wrong rate produces no recognisable bytes; we
+    ; want to bail fast and try the next divisor.
+    ld      a, CMD_RTS_ON
+    out     (UART_STATUS), a
+    ld      bc, 0x8000                  ; ~100 ms emulated of polling
+.spWait:
+    in      a, (UART_STATUS)
+    bit     1, a                        ; RxRDY?
+    jr      nz, .spByte
+    dec     bc
+    ld      a, b
+    or      c
+    jr      nz, .spWait
+    ; Timeout.
+    ld      a, CMD_RTS_OFF
+    out     (UART_STATUS), a
+    call    SerialUnmaskVblank
+    scf
+    ret
+
+.spByte:
+    in      a, (UART_DATA)
+    cp      'O'
+    jr      nz, .spBad
+    ; First byte 'O' -- probe matched. Drain the rest of the line so
+    ; whatever bytes are buffered upstream don't get re-read by the
+    ; next request. "OK HTM 0\r\n" is 10 chars; 9 left after 'O'.
+    ld      a, CMD_RTS_OFF
+    out     (UART_STATUS), a
+    ld      b, 9
+.spDrain:
+    push    bc
+    call    SerialRead                  ; standard timeout per byte
+    pop     bc
+    jr      c, .spDrainDone             ; bridge stopped early -- ok
+    djnz    .spDrain
+.spDrainDone:
+    call    SerialUnmaskVblank
+    and     a                           ; CF=0
+    ret
+.spBad:
+    ld      a, CMD_RTS_OFF
+    out     (UART_STATUS), a
+    call    SerialUnmaskVblank
+    scf
+    ret
+
+; Distinct from "IMG OFF" so the bridge can log link-rate negotiation
+; separately from the regular images-on/off sync that follows. Bridge
+; replies with the same empty OK HTM frame either way.
+ProbeReq:
+    db      "GET PROBE", 0
+
+SerialWrite:    ; send byte in A; bounded poll for TxRDY so a stuck
+                ; UART (no cartridge / dead bridge) drops the byte
+                ; instead of locking the browser. Roughly a quarter
+                ; second of wall time before giving up.
+    push    af
+    push    bc
+    ld      bc, 0x4000
+.sw:
+    in      a, (UART_STATUS)
+    rrca
+    jr      c, .swReady
+    dec     bc
+    ld      a, b
+    or      c
+    jr      nz, .sw
+    pop     bc
+    pop     af
+    ret                                 ; timeout -> drop byte
+.swReady:
+    pop     bc
+    pop     af
+    out     (UART_DATA), a
+    ret
+
+; ---------------------------------------------------------------------------
+; BusyHeartbeat: cheap visual "still alive" cue while RemoteLoadFile is
+; chewing through a multi-KB body. Most calls just bump BusyTick and
+; return; every 64 bytes the spinner advances one phase ('|' '/' '-' '\\')
+; and we re-paint the X cell with the new glyph. Caller's registers all
+; preserved, so the body loop can `call BusyHeartbeat` between bytes
+; without bracketing it in extra push/pops.
+;
+; The repaint reuses PaintToolbar's busy-X path: SetTextColours +
+; DrawString of a 1-char string at the X-button cell. DrawString uses
+; BIOS GRPPRT, which is happy to run with VBLANK masked -- no interrupt
+; involvement, just VDP I/O.
+; ---------------------------------------------------------------------------
+BusyHeartbeat:
+    push    af
+    ; Only animate when caller is actually loading. PrintFileContent
+    ; calls us per parsed byte even on idle re-renders (scroll); we
+    ; must NOT overpaint the toolbar's Refresh icon at those times.
+    ld      a, [Busy]
+    or      a
+    jr      z, .bhBail
+    ld      a, [BusyTick]
+    inc     a
+    ld      [BusyTick], a
+    ; Throttle: act every 256 bytes (BusyTick wraps to 0). At 9600
+    ; baud the heavy DrawString-via-BIOS call takes longer than the
+    ; emulator's inter-byte gap (~1 ms), so the previous "every 64
+    ; bytes" cadence caused ~1 OE drop per spinner update. 256
+    ; reduces visible activity slightly but eliminates almost all
+    ; the drops on multi-KB fetches.
+    or      a                           ; Z when BusyTick wrapped to 0
+    jr      nz, .bhDone
+    push    bc
+    push    de
+    push    hl
+    ; Advance BusyPhase 0..3 cycle each time BusyTick wraps. (The
+    ; original code read phase from BusyTick post-wrap, which is
+    ; always 0 -- so the spinner sat on '|' forever instead of
+    ; rotating |/-\.)
+    ld      a, [BusyPhase]
+    inc     a
+    and     0x03
+    ld      [BusyPhase], a
+    ld      e, a
+    ld      d, 0
+    ld      hl, BusySpinner
+    add     hl, de
+    ld      a, [hl]
+    ld      [BusyChar], a
+    ld      a, COL_BLACK
+    ld      l, COL_LGRAY
+    call    SetTextColours
+    ld      de, BTN2_X + 12
+    ld      c, BTN_Y0 + 4
+    ld      hl, BusyChar
+    call    DrawString
+    ; Poll the MSX STOP key (matrix row 7 bit 4) so a multi-KB transfer
+    ; is interruptible. We're already paying the cost of a full
+    ; toolbar repaint here every 64 bytes; the row-select + read is
+    ; cheap on top. UserCancel sticks until NavigateToCurrentUrl /
+    ; RemoteLoadFile / TryFetchMore reset it on the next request.
+    call    IsStopDown
+    jr      nz, .bhSkipCancel
+    ld      a, 2
+    ld      [UserCancel], a
+.bhSkipCancel:
+    pop     hl
+    pop     de
+    pop     bc
+.bhDone:
+.bhBail:
+    pop     af
+    ret
+
+; IsStopDown: returns Z (and CF=0) when the MSX STOP key is pressed,
+; NZ otherwise. Same DI / row-select / restore dance as IsShiftDown,
+; just for matrix row 7 bit 4.
+IsStopDown:
+    di
+    in      a, (0xAA)
+    ld      c, a
+    and     0xF0
+    or      7                               ; select row 7
+    out     (0xAA), a
+    in      a, (0xA9)
+    ld      b, a
+    ld      a, c
+    out     (0xAA), a                       ; restore PPI C
+    ei
+    ld      a, b
+    and     0x10                            ; bit 4 = STOP (0 = pressed)
+    ret
+
+BusyTick:       db 0
+BusyPhase:      db 0                    ; spinner phase 0..3 (|/-\)
+BusyChar:       db 'X', 0               ; live char (single byte + NUL term)
+BusySpinner:    db '|', '/', '-', '\\'
+UserCancel:     db 0                    ; latched 1 by BusyHeartbeat when STOP
+                                        ; was pressed during the receive loop;
+                                        ; the body / drain code skips storage
+                                        ; while still consuming bridge bytes
+                                        ; so the wire stays in sync for the
+                                        ; next request.
+TfmRefused:     db 0                    ; latched 1 by TryFetchMore when the
+                                        ; next chunk wouldn't fit FileBuf;
+                                        ; piggy-backs on UserCancel's "drain
+                                        ; without storing" body-loop logic
+                                        ; and forces TryFetchMore's tail to
+                                        ; return CF=1 instead of advancing
+                                        ; WindowLen.
+
+SerialRead:     ; Poll for RxRDY and return byte in A.
+                ;
+                ; Hardware flow control via RTS. We assert RTS at
+                ; entry to tell the bridge (through openMSX's
+                ; RS232Net) that we're ready for one byte, then
+                ; clear RTS at exit so the bridge holds the rest of
+                ; the stream until the next call. This makes RX
+                ; timing-independent: the .COM can spend any amount
+                ; of CPU between bytes (PCX RLE replays, BDOS
+                ; calls, BIOS GRPPRT for the spinner, ...) without
+                ; risking an i8251 overrun. The wire baud still
+                ; sets max throughput, but it stops being a
+                ; correctness constraint.
+                ;
+                ; Overrun / Parity / Framing errors in status bits
+                ; 3..5 latch until the command register is
+                ; rewritten with ER=1; we re-write CMD_RTS_ON on
+                ; the way through so the next byte is clean.
+                ;
+                ; Bounded wait so a dead / unplugged bridge doesn't
+                ; hang the browser forever: the (B, HL) counter
+                ; below unwinds after roughly 1.6 s of wall time
+                ; if no byte arrives, returning CF=1 (= timeout).
+                ; On success CF=0 and A holds the received byte.
+    ld      a, CMD_RTS_ON
+    out     (UART_STATUS), a            ; raise RTS -- bridge may send 1 byte
+    ld      b, SR_TIMEOUT_OUTER
+.srOuter:
+    ld      hl, 0xFFFF
+.srPoll:
+    in      a, (UART_STATUS)
+    bit     1, a                        ; RxRDY
+    jr      nz, .srGot
+    and     0x38                        ; PE | OE | FE
+    jr      z, .srTick
+    ld      a, CMD_RTS_ON               ; clear errors, keep RTS asserted
+    out     (UART_STATUS), a
+.srTick:
+    dec     hl
+    ld      a, h
+    or      l
+    jr      nz, .srPoll
+    djnz    .srOuter
+    ; Timeout: clear RTS so the bridge stops trying to push when
+    ; the caller has given up.
+    ld      a, CMD_RTS_OFF
+    out     (UART_STATUS), a
+    scf                                 ; out of budget -> timeout
+    ret
+.srGot:
+    in      a, (UART_DATA)              ; consume byte; clears RxRDY
+    push    af
+    ld      a, CMD_RTS_OFF              ; close the gate before returning
+    out     (UART_STATUS), a
+    pop     af
+    and     a                           ; CF=0
+    ret
+
+; Outer loop counter for SerialRead's budget. One "inner pass" is ~45
+; Z80 cycles * 65536 iterations = ~0.8 s at 3.58 MHz; the outer count
+; multiplies that into a ~1.6 s total before we give up.
+SR_TIMEOUT_OUTER equ 2
+
+SerialWriteZ:   ; HL -> NUL-terminated string.
+    ld      a, [hl]
+    or      a
+    ret     z
+    push    hl
+    call    SerialWrite
+    pop     hl
+    inc     hl
+    jr      SerialWriteZ
+
+; HasScheme (legacy): kept around for the few places that still want the
+; "any ':/' anywhere in the URL" answer. New routing decisions go
+; through IsLocalUrl below.
+HasScheme:
+    push    hl
+.hs:
+    ld      a, [hl]
+    or      a
+    jr      z, .hsNo
+    inc     hl
+    cp      ':'
+    jr      nz, .hs
+    ld      a, [hl]
+    cp      '/'
+    jr      nz, .hs
+    pop     hl
+    xor     a
+    ret
+.hsNo:
+    pop     hl
+    or      1
+    ret
+
+; IsLocalUrl: HL -> NUL URL. Returns Z when the URL's second character
+; is ':' (i.e. looks like an MSX-DOS drive-letter path "X:..."); NZ
+; otherwise. Anything else routes to the web bridge -- bare names like
+; "INDEX.HTM", IP literals like "127.0.0.1", and schemed URLs like
+; "https://msn.com" all flow over serial. The first-char-letter check
+; that earlier versions added (A..Z or a..z before the ':') was
+; tightened away after the user reported wanting the bridge to handle
+; everything except an explicit drive prefix.
+IsLocalUrl:
+    ld      a, [hl]
+    or      a
+    jr      z, .iulNo                   ; empty -> not local
+    inc     hl
+    ld      a, [hl]                     ; A = second char
+    dec     hl
+    cp      ':'
+    ret     z                           ; Z = local (drive-letter form)
+.iulNo:
+    or      1
+    ret
+
+; IsViewUrl: HL -> NUL URL. Returns Z if the URL starts with "view:"
+; (case-insensitive), NZ otherwise. Used by LoadFile to route the
+; hybrid bitmap pipeline. The match is "v","i","e","w",":" -- five
+; chars, no whitespace allowed before.
+IsViewUrl:
+    push    hl
+    push    bc
+    ld      bc, IvuPattern
+.ivuLoop:
+    ld      a, [bc]
+    or      a
+    jr      z, .ivuMatch                 ; pattern exhausted -> match
+    ld      e, a                         ; pattern char (already lowercase ':' or letter)
+    ld      a, [hl]
+    or      a
+    jr      z, .ivuNo                    ; URL ended early
+    ; Lowercase URL char (only A-Z; ':' is unchanged).
+    cp      'A'
+    jr      c, .ivuCmp
+    cp      'Z' + 1
+    jr      nc, .ivuCmp
+    add     a, 'a' - 'A'
+.ivuCmp:
+    cp      e
+    jr      nz, .ivuNo
+    inc     hl
+    inc     bc
+    jr      .ivuLoop
+.ivuMatch:
+    pop     bc
+    pop     hl
+    xor     a                            ; Z = view-prefix match
+    ret
+.ivuNo:
+    pop     bc
+    pop     hl
+    or      1                            ; NZ = no match
+    ret
+IvuPattern: db "view:", 0
+
+; UrlStripViewPrefix: shift UrlBuf left by 5 bytes (drop "view:")
+; in place. Caller has confirmed the prefix exists via IsViewUrl.
+UrlStripViewPrefix:
+    push    hl
+    push    de
+    push    bc
+    ld      hl, UrlBuf + 5
+    ld      de, UrlBuf
+    ld      bc, URL_MAX                 ; copies URL_MAX bytes including the trailing NUL
+    ldir
+    ; Adjust UrlLen by -5 (clamp at 0).
+    ld      a, [UrlLen]
+    sub     5
+    jr      nc, .uspvOk
+    xor     a
+.uspvOk:
+    ld      [UrlLen], a
+    pop     bc
+    pop     de
+    pop     hl
+    ret
+
+; RemoteGet: HL -> NUL target. Sends "GET <target>\r\n", reads status
+; line, leaves body bytes queued on the UART. Outputs:
+;   SerialKind: 1=HTM/HTMP, 2=PCX, 3=BMP (hybrid bitmap), 0=ERR
+;   SerialLen:  16-bit body length
+; Returns CF=1 on ERR / parse failure.
+RgGet:          db "GET ", 0
+RgGetView:      db "GET VIEW ", 0       ; hybrid bitmap pipeline
+RemoteGet:
+    push    hl
+    ld      hl, RgGet
+    call    SerialWriteZ
+    pop     hl
+    call    SerialWriteZ
+    ld      a, 0x0D
+    call    SerialWrite
+    ld      a, 0x0A
+    call    SerialWrite
+RemoteGetParseReply:
+    ; Re-entry point for callers that built their own "GET <whatever>\r\n"
+    ; (e.g. RemoteLoadView's "GET VIEW <url>") and want only the OK / ERR
+    ; header parsing. Clobbers everything RemoteGet does -- assume nothing
+    ; about register state on entry.
+    ;
+    ; Drain status line into SerialBuf (16 B); parser reads fresh bytes
+    ; from the UART directly rather than buffering so we save code.
+    ; Every SerialRead can now time out; CF=1 surfaces as a failure so
+    ; a dead / unplugged bridge doesn't hang the browser forever.
+    call    SerialRead                  ; 'O' or 'E'
+    jp      c, .rgFail
+    push    af
+    ld      a, 2
+    ld      [LoadPhase], a              ; phase 2: bridge talking back
+    pop     af
+    cp      'E'
+    jp      z, .rgDrainErr
+    cp      'O'
+    jp      nz, .rgFail
+    call    SerialRead                  ; 'K'
+    jp      c, .rgFail
+    cp      'K'
+    jp      nz, .rgFail
+    call    SerialRead                  ; ' '
+    jp      c, .rgFail
+    call    SerialRead                  ; 'H', 'P', 'B', or 'S'
+    jp      c, .rgFail
+    ld      b, 1                         ; SerialKind=1 -> HTM/HTMP
+    cp      'H'
+    jr      z, .rgKind
+    ld      b, 2                         ; SerialKind=2 -> PCX
+    cp      'P'
+    jr      z, .rgKind
+    ld      b, 3                         ; SerialKind=3 -> BMP (hybrid bitmap)
+    cp      'B'
+    jr      z, .rgKind
+    ld      b, 4                         ; SerialKind=4 -> SC6 (raw image)
+    cp      'S'
+    jp      nz, .rgFail
+.rgKind:
+    ld      a, b
+    ld      [SerialKind], a
+    call    SerialRead                  ; second kind char (T/C)
+    jp      c, .rgFail
+    call    SerialRead                  ; third kind char (M/X)
+    jp      c, .rgFail
+    call    SerialRead                  ; space
+    jp      c, .rgFail
+    ; Default the page-info fields to 1/1 ONLY for HTM responses --
+    ; the legacy bridge format ("OK HTM <bytes>\r\n") doesn't carry
+    ; pagination, so a non-paginated HTM should default to 1/1. PCX
+    ; responses (image fetches) must leave the HTM-side page state
+    ; alone; otherwise an inline <img> mid-render wipes the
+    ; SerialPage/SerialPageTotal the wiki page just established and
+    ; the scrollbar thinks the doc is single-page.
+    ld      a, [SerialKind]
+    cp      1
+    jr      nz, .rgKeepPageState
+    ld      a, 2
+    ld      [SerialPage], a
+    ld      [SerialPageTotal], a
+.rgKeepPageState:
+    ld      de, 0
+.rgDigit:
+    call    SerialRead
+    jr      c, .rgFail
+    cp      0x0D
+    jr      z, .rgEol
+    cp      ' '
+    jr      z, .rgPageInfo              ; "<bytes> <page>/<total>\r\n"
+    sub     '0'
+    cp      10
+    jr      nc, .rgFail
+    ld      c, a
+    ex      de, hl
+    ld      d, h
+    ld      e, l
+    add     hl, hl
+    add     hl, hl
+    add     hl, de
+    add     hl, hl
+    ex      de, hl                      ; DE *= 10
+    ld      a, e
+    add     a, c
+    ld      e, a
+    ld      a, d
+    adc     a, 0
+    ld      d, a
+    jr      .rgDigit
+.rgPageInfo:
+    ; Latch the byte count parsed so far, then read "<page>/<total>".
+    ld      [SerialLen], de
+    ; Page number (1-byte; clamps to 255 on overflow).
+    ld      e, 0
+.rgPageNo:
+    call    SerialRead
+    jr      c, .rgFail
+    cp      '/'
+    jr      z, .rgPageSlash
+    sub     '0'
+    cp      10
+    jr      nc, .rgFail
+    ld      d, a
+    ld      a, e
+    add     a, a
+    ld      c, a
+    add     a, a
+    add     a, a
+    add     a, c                        ; A = E * 10
+    add     a, d
+    ld      e, a
+    jr      .rgPageNo
+.rgPageSlash:
+    ld      a, e
+    ld      [SerialPage], a
+    ld      e, 0
+.rgTotal:
+    call    SerialRead
+    jr      c, .rgFail
+    cp      0x0D
+    jr      z, .rgTotalDone
+    sub     '0'
+    cp      10
+    jr      nc, .rgFail
+    ld      d, a
+    ld      a, e
+    add     a, a
+    ld      c, a
+    add     a, a
+    add     a, a
+    add     a, c
+    add     a, d
+    ld      e, a
+    jr      .rgTotal
+.rgTotalDone:
+    ld      a, e
+    ld      [SerialPageTotal], a
+    call    SerialRead                  ; consume LF
+    jr      c, .rgFail
+    and     a
+    ret
+.rgEol:
+    call    SerialRead                  ; consume LF
+    jr      c, .rgFail
+    ld      [SerialLen], de
+    and     a
+    ret
+.rgDrainErr:
+    call    SerialRead                  ; consume remainder of "ERR ..." line
+    jr      c, .rgFail
+    cp      0x0A
+    jr      nz, .rgDrainErr
+.rgFail:
+    xor     a
+    ld      [SerialKind], a
+    scf
+    ret
+
+; RemoteLoadFile: URL sits in UrlBuf. Expects OK HTM; streams body into
+; FileBuf (capped at FILE_BUF_SIZE, extra bytes drained so the next
+; request finds a clean stream). Returns A=0 on success.
+RemoteLoadFile:
+    ; Same invalidation contract as LoadFile: the cache holds offsets
+    ; into the previous document, which becomes stale the moment we
+    ; start streaming a new body.
+    call    LineCacheReset
+
+    ; Auto-probe the wire rate on the first remote fetch. Walks
+    ; ProbeTable from fastest down to the BIOS default 1200 and
+    ; locks at the first divisor the bridge actually responds at,
+    ; so a binary built with `-b 115200` still works against a
+    ; 9600-only gateway / real cartridge / older bridge build
+    ; without a rebuild. Subsequent fetches see SerialProbed=1 and
+    ; skip the walk.
+    ld      a, [SerialProbed]
+    or      a
+    call    z, SerialAutoProbe
+    jp      c, .rlfFail                 ; no rate worked -> 404 surface
+
+    ; Fresh request -> clear any prior STOP-key cancel latch so this
+    ; load isn't pre-aborted by a leftover flag from the previous one.
+    xor     a
+    ld      [UserCancel], a
+    ; Re-stamp the cursor at its last polled position. PollMouse erased
+    ; it before HandleClick fired; without this the user sees the
+    ; cursor disappear for the duration of a multi-second fetch and
+    ; can't tell where a click would land.
+    call    DrawCursor
+    call    SerialMaskVblank
+    ; Make the bridge agree with the local ShowImages flag before we
+    ; ask for a page -- otherwise a freshly-started bridge defaults to
+    ; "no images" while the user may have toggled the Help checkbox on
+    ; (or vice versa). The IMG ON/OFF reply is an empty OK HTM; we only
+    ; care that it doesn't error.
+    ld      a, [ShowImages]
+    or      a
+    ld      hl, ImgOnCmd
+    jr      nz, .rlfImgSend
+    ld      hl, ImgOffCmd
+.rlfImgSend:
+    call    RemoteGet
+    jr      c, .rlfFail
+    ld      hl, UrlBuf
+    call    RemoteGet
+    jr      c, .rlfFail
+    ld      a, [SerialKind]
+    cp      1
+    jr      nz, .rlfFail
+    ; DocOffset = 0 because every load starts at doc byte 0 today.
+    ; WindowLen = min(SerialLen, FILE_BUF_SIZE) is the clamped working
+    ; set in FileBuf. EnsureWindowRemote slides DocOffset forward via
+    ; "GET CHUNK <offset>" for SlideForwardRemote / SlideBackwardRemote.
+    ld      hl, [SerialLen]
+    ld      de, 0
+    ld      [DocOffset], de
+    xor     a
+    ld      [DocOffset + 2], a          ; clear high byte of 24-bit DocOffset
+    ld      de, FILE_BUF_SIZE
+    push    hl
+    and     a
+    sbc     hl, de
+    pop     hl
+    jr      c, .rlfOk
+    ld      hl, FILE_BUF_SIZE
+.rlfOk:
+    ld      [WindowLen], hl
+    ld      de, FileBuf
+    ld      bc, [WindowLen]
+.rlfBody:
+    ld      a, b
+    or      c
+    jr      z, .rlfTail
+    push    bc
+    push    de
+    call    SerialRead
+    pop     de
+    pop     bc
+    jr      c, .rlfFail                  ; mid-body timeout -> bail
+    ; If STOP was pressed since the last heartbeat, swallow the byte
+    ; without storing it so the body loop drains the rest of the
+    ; chunk into oblivion (DE stays put). Once BC hits zero we fall
+    ; through to .rlfTail which drains any post-cap excess.
+    ld      h, a                         ; stash UART byte before cancel test
+    ld      a, [UserCancel]
+    or      a
+    jr      nz, .rlfBodyDrop
+    ld      a, h                         ; restore byte and store
+    ld      [de], a
+    inc     de
+.rlfBodyDrop:
+    dec     bc
+    ; Heartbeat: every 256 bytes the spinner advances one phase.
+    ; Safe to call here regardless of baud now that SerialRead
+    ; flow-controls via RTS -- the BIOS GRPPRT inside the heavy
+    ; path can take any amount of time without risking i8251 OE.
+    call    BusyHeartbeat
+    jr      .rlfBody
+.rlfTail:
+    ld      hl, [SerialLen]
+    ld      de, [WindowLen]
+    and     a
+    sbc     hl, de
+    ld      b, h
+    ld      c, l
+.rlfDrain:
+    ld      a, b
+    or      c
+    jr      z, .rlfDone
+    push    bc
+    call    SerialRead
+    pop     bc
+    jr      c, .rlfFail                  ; unplugged bridge -> abandon the drain
+    dec     bc
+    jr      .rlfDrain
+.rlfDone:
+    call    SerialUnmaskVblank
+    ld      a, 2
+    ld      [LoadPhase], a              ; phase 3: body fully streamed
+    xor     a
+    ret
+.rlfFail:
+    ; VBLANK-unmask before returning so the main loop's keyboard ISR
+    ; comes back even if we abort mid-transfer.
+    call    SerialUnmaskVblank
+    ld      a, 2
+    ret                                  ; caller's 404 handler paints via DrawString
+
+; StoreTotalLinesWithPages: TotalLines = HtmlLineCount + (chunks the
+; bridge still has queued) * TEXT_MAX_LINES. The estimate lets the
+; scrollbar thumb size against the FULL document instead of just the
+; chunks already in FileBuf, so the user sees there's more to scroll
+; before the auto-MORE fetch fires. When SerialPage == SerialPageTotal
+; the multiplier collapses to 0 and TotalLines = HtmlLineCount exactly.
+StoreTotalLinesWithPages:
+    push    bc
+    push    de
+    ; Local-file path: PrintFileContent's ExtrapolateHtmlLineCountIfShort
+    ; already wrote a thumb-friendly TotalLines estimate (high-water
+    ; mark across renders, locked to the exact count after natural
+    ; EOF or snap-back). Don't stomp it with HtmlLineCount, which
+    ; we deliberately saturate at 0xFFFF for PageDown's clamp.
+    ld      a, [IsRemoteSession]
+    or      a
+    jr      z, .stlDone
+    ; remaining = SerialPageTotal - SerialPage  (0 when no more chunks)
+    ld      a, [SerialPageTotal]
+    ld      c, a
+    ld      a, [SerialPage]
+    cpl
+    add     a, 1                        ; A = -SerialPage
+    add     a, c                        ; A = remaining (>= 0 by construction)
+    ld      h, 0
+    ld      l, a                        ; HL = remaining
+    add     hl, hl                      ; *2
+    ld      d, h
+    ld      e, l                        ; DE = remaining * 2
+    add     hl, hl                      ; *4
+    ld      b, h
+    ld      c, l                        ; BC = remaining * 4
+    add     hl, hl                      ; *8
+    add     hl, hl                      ; *16
+    add     hl, bc                      ; *20
+    add     hl, de                      ; *22 (TEXT_MAX_LINES)
+    ld      de, [HtmlLineCount]
+    add     hl, de                      ; HL = HtmlLineCount + remaining*22
+    ld      [TotalLines], hl
+.stlDone:
+    pop     de
+    pop     bc
+    ret
+
+; ----------------------------------------------------------------------
+; Hybrid bitmap pipeline (BITMAP_PIPELINE_DESIGN.md).
+;
+; Bridge command: "GET VIEW <url>\r\n" -> "OK BMP <bytes>\r\n<body>".
+; Body is exactly 23424 bytes: 183 rows x 128 bytes/row of Screen-6
+; 2-bpp pixels for the content area only (rows 29..211). The MSX
+; blits these straight to VRAM via OUT (VDP_DATA), A in two phases
+; because the content area straddles R14=0 and R14=1 windows:
+;   phase 1: rows 29..127 in R14=0, 99 rows * 128 = 12672 bytes,
+;            VRAM start address 29 * 128 = 0x0E80.
+;   phase 2: rows 128..211 in R14=1, 84 rows * 128 = 10752 bytes,
+;            VRAM start address 0x0000 (within R14=1's 16 KB window).
+; Total = 23424 bytes -- matches the bridge's SCREEN6_VIEW_BYTES.
+;
+; The point of this path: at 115200 baud the wire transfer is ~2 s,
+; vs the 6-8 s the HTML parser + per-glyph render takes for a doc
+; of similar visible size. Subsequent scrolls cost zero parse work
+; (just blit the next viewport bitmap when the user PageDowns).
+; ----------------------------------------------------------------------
+RemoteLoadView:
+    ; UrlBuf has the URL (post-"view:" stripping if a prefix was
+    ; involved at navigation time). Sends the wire request, parses
+    ; the OK BMP header, then drains body bytes into VRAM.
+    ld      a, [SerialProbed]
+    or      a
+    call    z, SerialAutoProbe
+    jp      c, .rlvFail                  ; no rate worked
+    ld      a, 2
+    ld      [IsRemoteSession], a
+    call    SerialMaskVblank
+
+    ; Send "GET VIEW <UrlBuf>\r\n".
+    ld      hl, RgGetView
+    call    SerialWriteZ
+    ld      hl, UrlBuf
+    call    SerialWriteZ
+    ld      a, 0x0D
+    call    SerialWrite
+    ld      a, 0x0A
+    call    SerialWrite
+
+    ; Parse the OK / ERR header, populating SerialKind + SerialLen.
+    call    RemoteGetParseReply
+    jp      c, .rlvFail
+    ld      a, [SerialKind]
+    cp      3                            ; BMP
+    jp      nz, .rlvFail
+
+    ; Drain body bytes into VRAM. The bridge always sends exactly
+    ; 23424 bytes for this command; SerialLen carries the same value
+    ; on the wire and we use that as the master count so any future
+    ; ranged BMP frames (partial viewport) work without code change.
+    call    RenderRemoteBitmap
+    or      a
+    jr      nz, .rlvFail
+
+    call    SerialUnmaskVblank
+    xor     a
+    ld      [Busy], a
+    call    PaintToolbar
+    ; Tell NavigateToCurrentUrl to skip ClearContentArea +
+    ; PrintFileContent -- our pixels are already on screen.
+    ld      a, 1
+    ld      [IsViewMode], a
+    xor     a
+    ret
+
+.rlvFail:
+    call    SerialUnmaskVblank
+    xor     a
+    ld      [Busy], a
+    call    PaintToolbar
+    or      1                            ; ensure A != 0 -> caller surfaces 404
+    ret
+
+; RenderRemoteBitmap: stream SerialLen bytes from the UART straight
+; into the Screen-6 content-area VRAM. Two-phase because Screen-6
+; pages span R14=0 (rows 0..127) and R14=1 (rows 128..255 / 211).
+;
+; Returns A = 0 on success, !=0 if a SerialRead times out. On
+; failure VRAM is partially overwritten (best-effort: the prefix
+; pixels that arrived before the timeout are visible; the rest of
+; the viewport keeps whatever was there before).
+RenderRemoteBitmap:
+    ; Lesson #2: blank the display for the bulk serial -> VRAM
+    ; transfer. The serial wait alone dominates wall time at lower
+    ; baud rates so the saving here is smaller than for ClearContent
+    ; / RenderSc6File, but the wrap costs only 11 bytes and removes
+    ; one source of variability in the bench numbers.
+    call    VdpBlank
+    ; Phase 1: rows 29..127 in R14=0. 99 rows * 128 = 12672 bytes.
+    ld      b, 0
+    ld      c, CONTENT_Y0                ; row 29
+    call    SetVramWritePos              ; uses R14=0 since C < 128
+    ld      bc, 12672
+.rrbPhase1:
+    ld      a, b
+    or      c
+    jr      z, .rrbPhase2
+    push    bc
+    call    SerialRead
+    pop     bc
+    jr      c, .rrbFail
+    out     (VDP_DATA), a
+    dec     bc
+    jr      .rrbPhase1
+
+.rrbPhase2:
+    ; Switch to R14=1 (rows 128..211).
+    ld      a, 1
+    call    VdpSetR14
+    ld      hl, 0x0000                   ; VRAM offset within R14=1 window
+    call    VdpSetWriteAddr
+    ld      bc, 10752                    ; 84 rows * 128 bytes
+.rrbPhase2Loop:
+    ld      a, b
+    or      c
+    jr      z, .rrbDone
+    push    bc
+    call    SerialRead
+    pop     bc
+    jr      c, .rrbFail
+    out     (VDP_DATA), a
+    dec     bc
+    jr      .rrbPhase2Loop
+
+.rrbDone:
+    call    VdpUnblank                   ; balance VdpBlank at entry
+    xor     a
+    ret
+.rrbFail:
+    call    VdpUnblank                   ; balance even on partial paint
+    or      1
+    ret
+
+; TryFetchMore: pulls the next paginated chunk from the bridge ("GET
+; MORE\r\n"), appends the body to FileBuf at the current WindowLen, and
+; bumps WindowLen. Returns CF=0 on success (new bytes appended), CF=1
+; when there's nothing more to fetch (only one page on the server,
+; already at the last page, or the bridge has no remote session).
+; Caller is responsible for re-rendering after a successful append.
+RgMore:         db "MORE", 0
+TryFetchMore:
+    ; Bail if we're not in a remote session at all (local file load).
+    ld      a, [IsRemoteSession]
+    or      a
+    jp      z, .tfmNone
+
+    ; Bail if we've already pulled the last page.
+    ld      a, [SerialPage]
+    ld      b, a
+    ld      a, [SerialPageTotal]
+    cp      b
+    jp      z, .tfmNone                  ; SerialPage == total -> done
+    jp      c, .tfmNone                  ; SerialPage > total (paranoia)
+
+    ; Flip the toolbar to busy/X so the spinner BusyHeartbeat overdraws
+    ; has the right base glyph -- otherwise scroll-driven MORE fetches
+    ; paint spinner chars on top of the idle refresh arrow and look
+    ; broken. Reset BusyTick so the phase starts from '|'. Clear the
+    ; STOP-cancel latch so a leftover press from a previous request
+    ; doesn't pre-empty this chunk.
+    xor     a
+    ld      [UserCancel], a
+    ld      [TfmRefused], a
+    ld      a, 2
+    ld      [Busy], a
+    xor     a
+    ld      [BusyTick], a
+    ld      a, 'X'
+    ld      [BusyChar], a
+    call    PaintToolbar
+    call    DrawCursor
+
+    call    SerialMaskVblank
+    ld      hl, RgMore
+    call    RemoteGet
+    jp      c, .tfmFail
+    ld      a, [SerialKind]
+    cp      1
+    jp      nz, .tfmFail
+
+    ; Cap the chunk against remaining FileBuf headroom. If the whole
+    ; chunk doesn't fit, REFUSE the append outright -- forcing
+    ; UserCancel-style drain mode so the bridge stays in sync but
+    ; nothing gets stored. Storing a partial chunk would cut the HTML
+    ; mid-tag and the parser would render raw attribute soup from the
+    ; cut point onward (the symptom: page 3 of ar.wikipedia.org came
+    ; out as "class="vector-..." " text). Better to stop at the last
+    ; clean page boundary than to corrupt the render.
+    ld      hl, FILE_BUF_SIZE
+    ld      de, [WindowLen]
+    and     a
+    sbc     hl, de                       ; HL = remaining bytes
+    ld      de, [SerialLen]
+    sbc     hl, de                       ; remaining - SerialLen
+    jr      nc, .tfmReadAll              ; remaining >= SerialLen -> store
+    ; Buffer can't hold the full chunk: drain the body without storing,
+    ; then return CF=1 so the caller knows no new content arrived.
+    ld      a, 2
+    ld      [UserCancel], a
+    ld      a, 2
+    ld      [TfmRefused], a              ; tail: post-loop cleanup branch
+.tfmReadAll:
+    ld      bc, [SerialLen]
+    ld      hl, FileBuf
+    ld      de, [WindowLen]
+    add     hl, de
+    ex      de, hl                       ; DE = FileBuf + WindowLen
+.tfmBody:
+    ld      a, b
+    or      c
+    jr      z, .tfmAppendDone
+    push    bc
+    push    de
+    call    SerialRead
+    pop     de
+    pop     bc
+    jr      c, .tfmFail
+    ; STOP-key cancel: keep draining bytes off the wire (so the bridge
+    ; doesn't desync) but stop appending them to FileBuf.
+    ld      h, a
+    ld      a, [UserCancel]
+    or      a
+    jr      nz, .tfmBodyDrop
+    ld      a, h
+    ld      [de], a
+    inc     de
+.tfmBodyDrop:
+    dec     bc
+    call    BusyHeartbeat               ; safe again -- RTS flow control
+    jr      .tfmBody
+.tfmAppendDone:
+    ; If we refused the append because the buffer would overflow, the
+    ; body loop just drained bytes -- skip the WindowLen bump and report
+    ; CF=1 so PageDown/ScrollDown stop trying to fetch further pages.
+    ld      a, [TfmRefused]
+    or      a
+    jr      nz, .tfmRefuseExit
+    ; WindowLen += SerialLen
+    ld      hl, [WindowLen]
+    ld      de, [SerialLen]
+    add     hl, de
+    ld      [WindowLen], hl
+    call    SerialUnmaskVblank
+    xor     a
+    ld      [Busy], a
+    call    PaintToolbar
+    and     a                            ; CF=0 -> appended
+    ret
+.tfmRefuseExit:
+    ; Clean up the cancel/refuse latches so the next user-driven fetch
+    ; (e.g. clicking Refresh) starts fresh.
+    xor     a
+    ld      [UserCancel], a
+    ld      [TfmRefused], a
+    call    SerialUnmaskVblank
+    xor     a
+    ld      [Busy], a
+    call    PaintToolbar
+    scf
+    ret
+.tfmFail:
+    call    SerialUnmaskVblank
+    xor     a
+    ld      [Busy], a
+    call    PaintToolbar
+    scf
+    ret
+.tfmNone:
+    scf
+    ret
+
+; Format5Decimal: write HL as 5 ASCII decimal digits + NUL at [DE].
+; Always emits exactly 5 digits with leading zeros (the bridge-side
+; int() parser ignores them) so callers don't have to worry about
+; suppression. Range: HL = 0..65535; output buffer must hold >=6 bytes.
+;
+; Strategy: subtract powers of 10 in unsigned 16-bit, counting how many
+; subtractions until the result goes negative. The trailing sbc with
+; CF=0 restores HL after one too many subtracts. Same idiom as a
+; classic CP/M binary-to-decimal printer.
+;
+; Out: DE advanced 6 bytes (5 digits + NUL).
+; Clobbers: A, BC, HL, DE (DE moves forward).
+Format5Decimal:
+    ld      bc, -10000
+    call    .f5dDigit
+    ld      bc, -1000
+    call    .f5dDigit
+    ld      bc, -100
+    call    .f5dDigit
+    ld      bc, -10
+    call    .f5dDigit
+    ld      a, l
+    add     a, '0'
+    ld      [de], a
+    inc     de
+    xor     a
+    ld      [de], a
+    inc     de
+    ret
+.f5dDigit:
+    ld      a, '0' - 1
+.f5dLoop:
+    inc     a
+    add     hl, bc
+    jr      c, .f5dLoop                 ; CF set when subtraction (BC<0) didn't underflow
+    sbc     hl, bc                       ; restore HL after the failing subtract
+    ld      [de], a
+    inc     de
+    ret
+
+; EnsureWindowRemote: replace FileBuf with a fresh window of body bytes
+; starting at the given target_doc_offset. Sends "GET CHUNK <offset>"
+; over the wire and drains the body into FileBuf at byte 0. Mirrors
+; EnsureWindowLocal but for remote sessions.
+;
+; Inputs:
+;   HL = target_doc_offset (16-bit; the bridge accepts up to ~64 KB
+;        before a 24-bit widening becomes necessary)
+;
+; Outputs:
+;   On success: DocOffset = target, WindowLen = bytes received (clamped
+;     to FILE_BUF_SIZE), FileBuf populated, LineCache reset, A = 0.
+;   On failure (timeout, 404, wrong kind): A != 0, DocOffset / WindowLen
+;     unchanged.
+;
+; Caller is responsible for the post-fetch ScrollLine reset and
+; RefreshAfterScroll, mirroring how PageDown's local-slide path
+; handles it for EnsureWindowLocal.
+RgChunkPrefix:  db "CHUNK ", 0
+
+; Caller convention: 24-bit SlideTarget pre-set in RAM before the
+; call. Wire format: "GET CHUNK NNNNNN\r\n" with NNNNNN being 6
+; uppercase hex digits (24-bit). Bridge accepts hex via int(target,
+; 16) so the same parse path handles 0..16 MB byte offsets.
+EnsureWindowRemote:
+    ; Build "CHUNK XXXXXX\0" in ChunkCmdBuf.
+    ld      de, ChunkCmdBuf
+    ld      hl, RgChunkPrefix
+.ewrCpPrefix:
+    ld      a, [hl]
+    or      a
+    jr      z, .ewrCpDone
+    ld      [de], a
+    inc     hl
+    inc     de
+    jr      .ewrCpPrefix
+.ewrCpDone:
+    ; Read 24-bit SlideTarget into A:HL and emit as 6 hex digits.
+    ld      hl, [SlideTarget]
+    ld      a, [SlideTarget + 2]
+    call    Format6Hex                   ; writes 6 hex + NUL at [DE]
+
+    ; Send "GET CHUNK XXXXXX\r\n" and parse the OK / ERR header.
+    call    SerialMaskVblank
+    ld      hl, ChunkCmdBuf
+    call    RemoteGet
+    jr      c, .ewrFail
+    ld      a, [SerialKind]
+    cp      1                            ; HTM (kind 1 = HTM/HTMP)
+    jr      nz, .ewrFail
+
+    ; Compute clamped WindowLen = min(SerialLen, FILE_BUF_SIZE).
+    ld      hl, [SerialLen]
+    ld      de, FILE_BUF_SIZE
+    push    hl
+    or      a
+    sbc     hl, de
+    pop     hl
+    jr      c, .ewrLenOk
+    ld      hl, FILE_BUF_SIZE
+.ewrLenOk:
+    ld      [WindowLen], hl
+
+    ; Drain SerialLen body bytes into FileBuf. The first WindowLen
+    ; bytes are stored; any tail past the cap is drained (kept off
+    ; the wire) so the bridge stays in sync.
+    ld      de, FileBuf
+    ld      bc, [WindowLen]
+.ewrBody:
+    ld      a, b
+    or      c
+    jr      z, .ewrTail
+    push    bc
+    push    de
+    call    SerialRead
+    pop     de
+    pop     bc
+    jr      c, .ewrFailDrop
+    ld      [de], a
+    inc     de
+    dec     bc
+    call    BusyHeartbeat
+    jr      .ewrBody
+.ewrTail:
+    ld      hl, [SerialLen]
+    ld      de, [WindowLen]
+    and     a
+    sbc     hl, de
+    ld      b, h
+    ld      c, l
+.ewrDrain:
+    ld      a, b
+    or      c
+    jr      z, .ewrDone
+    push    bc
+    call    SerialRead
+    pop     bc
+    jr      c, .ewrFailDrop
+    dec     bc
+    jr      .ewrDrain
+
+.ewrDone:
+    call    SerialUnmaskVblank
+    ; Commit 24-bit SlideTarget -> DocOffset.
+    ld      hl, [SlideTarget]
+    ld      [DocOffset], hl
+    ld      a, [SlideTarget + 2]
+    ld      [DocOffset + 2], a
+    call    LineCacheReset
+    xor     a
+    ret
+
+.ewrFailDrop:
+    call    SerialUnmaskVblank
+    or      1                            ; ensure A != 0
+    ret
+
+.ewrFail:
+    call    SerialUnmaskVblank
+    or      1
+    ret
+
+; Format6Hex: emit a 24-bit unsigned integer as exactly 6 ASCII
+; uppercase hex digits + NUL terminator, starting at [DE]. Caller
+; passes the value in A:HL (A = high byte, HL = low word).
+;
+; In:   A:HL = value, DE = output buffer (>= 7 bytes).
+; Out:  DE advances 7 bytes (6 digits + NUL).
+; Clobbers: A, BC, HL.
+Format6Hex:
+    ld      b, a                         ; B = high byte
+    ; Emit B (top 8 bits) as 2 hex chars.
+    ld      a, b
+    rrca
+    rrca
+    rrca
+    rrca
+    call    .nybble
+    ld      a, b
+    call    .nybble
+    ; Emit H (mid 8 bits).
+    ld      a, h
+    rrca
+    rrca
+    rrca
+    rrca
+    call    .nybble
+    ld      a, h
+    call    .nybble
+    ; Emit L (low 8 bits).
+    ld      a, l
+    rrca
+    rrca
+    rrca
+    rrca
+    call    .nybble
+    ld      a, l
+    call    .nybble
+    xor     a
+    ld      [de], a
+    inc     de
+    ret
+.nybble:
+    and     0x0F
+    cp      10
+    jr      c, .digit
+    add     a, 'A' - '0' - 10
+.digit:
+    add     a, '0'
+    ld      [de], a
+    inc     de
+    ret
+
+; RemoteImgOpen: filename is in ImgNameBuf. Expects OK PCX or OK SC6;
+; saves body length into ImgBytesLeft so ImgStreamByte can pull from
+; the UART. Both kinds stream raw file bytes through ImgBuf; the
+; image-decoder dispatch (RenderPcxFile / RenderSc6File) happens at
+; the TagImg level based on the URL's extension, not the wire kind.
+RemoteImgOpen:
+    call    SerialMaskVblank
+    ld      hl, ImgNameBuf
+    call    RemoteGet
+    jr      c, .rioFail
+    ld      a, [SerialKind]
+    cp      2                            ; PCX
+    jr      z, .rioOk
+    cp      4                            ; SC6
+    jr      nz, .rioFail
+.rioOk:
+    ld      hl, [SerialLen]
+    ld      [ImgBytesLeft], hl
+    ld      hl, 0
+    ld      [ImgBytesLeft + 2], hl
+    xor     a
+    ld      [ImgReadLen], a
+    and     a                           ; CF=0
+    ret                                 ; mask stays on across body drain
+.rioFail:
+    call    SerialUnmaskVblank
+    scf
+    ret
+
+; RemoteImgByte: pull next body byte from the UART and decrement
+; ImgBytesLeft. CF=1 on end-of-body OR on SerialRead timeout -- both
+; surface the same way to the image decoders (they treat CF as "no
+; more bytes", render whatever they've drawn, and let TagImg fall
+; through to the alt-text / placeholder if we hadn't committed any
+; pixels yet).
+RemoteImgByte:
+    ld      hl, [ImgBytesLeft]
+    ld      a, h
+    or      l
+    jr      nz, .ribGo
+    ld      hl, [ImgBytesLeft + 2]
+    ld      a, h
+    or      l
+    scf
+    ret     z
+.ribGo:
+    call    SerialRead
+    ret     c                            ; bridge timeout -> propagate EOF
+    push    af
+    ld      hl, [ImgBytesLeft]
+    ld      a, h
+    or      l
+    jr      nz, .ribLo
+    ld      hl, [ImgBytesLeft + 2]
+    dec     hl
+    ld      [ImgBytesLeft + 2], hl
+    ld      hl, 0xFFFF
+.ribLo:
+    dec     hl
+    ld      [ImgBytesLeft], hl
+    pop     af
+    and     a
+    ret
+
+; RemoteImgRefill: pull up to 128 bytes from the UART into ImgBuf. The
+; per-byte dec of ImgBytesLeft happens inside RemoteImgByte so no
+; parallel 32-bit bookkeeping is needed here.
+RemoteImgRefill:
+    ld      hl, ImgBuf
+    ld      [ImgReadPtr], hl
+    ld      b, 128
+    ld      c, 0                        ; C = bytes successfully read
+.rirL:
+    push    bc
+    push    hl
+    call    RemoteImgByte
+    pop     hl
+    pop     bc
+    jr      c, .rirEof
+    ld      [hl], a
+    inc     hl
+    inc     c
+    djnz    .rirL
+.rirEof:
+    ld      a, c
+    ld      [ImgReadLen], a
+    or      a
+    scf
+    ret     z                           ; 0 bytes == EOF
+    and     a
+    ret
+
+; RemoteImgClose: drain any leftover body bytes so the next GET finds
+; a clean socket. Cheap -- happens rarely since images typically
+; stream to completion.
+;
+; If RemoteImgByte returns CF=1 (SerialRead timed out -- a byte got
+; lost en route), it does NOT decrement ImgBytesLeft. The old loop
+; would then poll forever on the same byte: an endless body parse
+; hang we hit on https://www.msx.org/wiki/Sakhr_AX-370 right after
+; the header MSX logo rendered. Now we bail out on timeout: the
+; remaining bytes are lost but VBLANK gets unmasked so the keyboard
+; ISR comes back and the parser can resume.
+RemoteImgClose:
+.ricL:
+    ld      hl, [ImgBytesLeft]
+    ld      a, h
+    or      l
+    jr      nz, .ricP
+    ld      hl, [ImgBytesLeft + 2]
+    ld      a, h
+    or      l
+    jp      z, SerialUnmaskVblank        ; EOF -> tail-call restores VBLANK
+.ricP:
+    call    RemoteImgByte
+    jr      nc, .ricL                    ; CF=0 -> byte drained, keep going
+    jp      SerialUnmaskVblank           ; CF=1 -> serial timeout, abandon
+
+SerialKind:     db 0                    ; 0=ERR, 1=HTM/HTMP, 2=PCX, 3=BMP
+SerialLen:      dw 0
+SerialPage:     db 1                    ; 1-indexed page number this response is
+SerialPageTotal: db 1                   ; total pages estimated by the bridge
+IsRemoteSession: db 0                   ; 1 during a bridge-served render
+
 TitleI:         db 0
 TitleN:         db 0
 TitleCur:       db 0
 TitleCurFlags:  db 0
 TitleConn:      db 0
-TitleDrawBuf:   ds TITLE_BUF_MAX + 1
+TitleJ:         db 0                    ; end index of current non-Arabic run
 
 ; ============================================================================
 ; Data
@@ -8423,9 +18909,26 @@ CharGreater:    db ">", 0
 CharX:          db "X", 0
 CharLowerX:     db "x", 0
 CharHelp:       db "?", 0
+CharSaveBtn:    db "[]", 0          ; titlebar save-page placeholder
 UrlInit:        db 0                    ; address bar starts empty
 
-AboutTitleMsg:  db "About", 0
+AboutTitleMsg:  db "Help", 0
+; Image-toggle row. The Arabic tail "أظهر الصور" is hand-shaped to
+; AX-370 CGTABL glyph codes (user-supplied byte string, in display
+; order = byte order, since the run is rendered through plain
+; DrawString without a per-character BiDi pass). Same recipe as
+; AboutLine2: the bytes are MSX-specific joined-form glyph codes,
+; not ISO-8859-6 codepoints.
+ImgCheckLatin:  db "Show images ", 0
+ImgCheckOff:    db "[ ]", 0
+ImgCheckOn:     db "[X]", 0
+; Glyphs emitted in BiDi-mirrored order so right-to-left reading lands
+; the words in their natural sequence: DrawString paints byte 0 at the
+; leftmost pixel, so the byte stream below is the user-supplied source
+; reversed -- ر و ص ل ا (space) ر ه ظ أ in pixel order reads as
+; أظهر الصور when the eye walks RTL.
+ImgCheckArabic: db 0xE7, 0xE9, 0xB3, 0xCC, 0xE2, 0x20
+                db 0xE7, 0xD2, 0xB8, 0xD9, 0
 AboutLine1:     db "MSX WBrowser", 0
 ; AboutLine2: pre-shaped + BiDi-resolved "متصفح إنترنت لأجهزة MSX2" for an
 ; RTL paragraph. Each Arabic byte is already the final MSX font glyph code
@@ -8438,24 +18941,372 @@ AboutLine2:     db 0x4D, 0x53, 0x58, 0x32, 0x20
                 db 0xA6, 0xD0, 0xE7, 0xA5, 0xD0, 0xE0, 0x20
                 db 0xAC, 0xC6, 0xB3, 0xA5, 0xCE, 0
 AboutLine3:     db "github.com/techana/mwbrowser", 0
-AboutLine4:     db "F1 shows this dialog.", 0
-AboutLine5:     db "Esc closes / quits.", 0
-AboutFooter:    db "v0.5 demo build", 0
+AboutLine4:     db "F1 Help  F2 Back  F3 Fwd", 0
+AboutLine5:     db "F4 Clear  F5 Reload  F6 Save", 0
+AboutLine6:     db "M/Space PgDn  N PgUp", 0
+AboutLine7:     db "Stop Halt  Esc Quit", 0
+AboutFooter:    db "v0.8 Demo", 0
 
 ; Screen-6 icon bitmaps (4 px/byte, 11=black, 01=bg/lgray).
 
 ; Right-pointing arrow = up-arrow rotated 90 deg CW. 8 px wide x 8 rows.
 ; Used as the Refresh-button glyph; the "stop" (busy) case renders an 'X'
 ; via DrawCharFast so we don't need a separate bitmap.
+; Refresh-button "play" triangle, 8x8 px, 2 bpp (11 = black, 01 = lgray).
+; The tip is shifted 1 MSX pixel to the right inside its 8-wide cell
+; so the icon sits visually centred in the 32-px-wide button's lgray
+; face; without the shift the triangle hugs the left side of its
+; byte-col pair and reads as off-centre.
 IconArrowRight:
-    db  0xD5, 0x55
-    db  0xF5, 0x55
-    db  0xFD, 0x55
-    db  0xFF, 0x55
-    db  0xFF, 0x55
-    db  0xFD, 0x55
-    db  0xF5, 0x55
-    db  0xD5, 0x55
+    db  0x75, 0x55      ; row 0: 1 black pixel at x=1
+    db  0x7D, 0x55      ; row 1: 2 black pixels at x=1..2
+    db  0x7F, 0x55      ; row 2: 3 black pixels at x=1..3
+    db  0x7F, 0xD5      ; row 3: 4 black pixels at x=1..4 (crosses byte)
+    db  0x7F, 0xD5      ; row 4: same as row 3
+    db  0x7F, 0x55      ; row 5: same as row 2
+    db  0x7D, 0x55      ; row 6: same as row 1
+    db  0x75, 0x55      ; row 7: same as row 0
+
+; ---------------------------------------------------------------------------
+; Form-widget cell bitmaps. Each is 8 px wide x WG_HEIGHT (14) rows tall =
+; 28 bytes (2 bytes/row). Cells slot into the line-buffer at one CELL
+; each; LineDrawCells' dispatch picks them up when the glyph code is < 0x10
+; (those bytes never appear as printable ASCII text). Pixel pairs are
+; MSB-first: 00 = pal0 (DGRAY), 01 = pal1 (lgrey), 10 = pal2 (white),
+; 11 = pal3 (black). 0xAA = 4 white px; 0x00 = 4 dgray px (the default
+; widget border colour -- black is reserved for the focus state).
+;
+; The 14-row paint extends the widget 3 px above and 3 px below the
+; 8-row text baseline (DrawWidgetGlyph subtracts 3 from C). That yields
+; ~2 rows of empty padding above + below an inner glyph -- enough to read
+; "[ Send ]" without the label kissing the border.
+;
+; WG_BOX_L / _M / _R together form a text-input / button outline. The
+; M cell carries top + bottom horizontals only; the L / R cells add the
+; matching vertical sides. PaintBoxConnectors stretches the top + bottom
+; borders across any non-widget cells (label glyphs) sitting between an
+; L / R pair so the outline stays continuous.
+;
+; WG_CHK_OFF / _ON are stand-alone single-cell checkboxes; same for
+; WG_RAD_OFF / _ON for radio buttons. Sized roughly 8 x 12 -- as big as
+; the cell allows without spilling into the next byte column.
+; ---------------------------------------------------------------------------
+WG_BOX_L        equ 0x01
+WG_BOX_M        equ 0x02
+WG_BOX_R        equ 0x03
+WG_CHK_OFF      equ 0x04
+WG_CHK_ON       equ 0x05
+WG_RAD_OFF      equ 0x06
+WG_RAD_ON       equ 0x07
+WG_SEL_ARROW    equ 0x08                    ; down-pointing dropdown indicator
+WG_BOX_LF       equ 0x09                    ; focused-input variants: black
+WG_BOX_MF       equ 0x0A                    ; border instead of dgray
+WG_BOX_RF       equ 0x0B
+WG_CHK_OFFF     equ 0x0C                    ; focused checkbox variants
+WG_CHK_ONF      equ 0x0D
+WG_RAD_OFFF     equ 0x0E                    ; focused radio variants
+WG_RAD_ONF      equ 0x0F
+WG_LAST         equ 0x0F
+
+WG_HEIGHT       equ 14
+WG_Y_RAISE      equ 3                       ; widget top sits this many px above TextY
+
+; Pixel pair encoding cheat sheet (MSB pixel first within each byte; each
+; pair is 2 bits: 00=G/dgray, 01=L/lgrey, 10=W/white, 11=K/black). The
+; cell is 8 px wide so each row is exactly 2 bytes (left half = pixels
+; 0-3, right half = pixels 4-7).
+;     0x00 = G G G G        0x0A = G G W W        0xA0 = W W G G
+;     0xAA = W W W W        0x22 = G W G W        0x88 = W G W G
+;     0x2A = G W W W        0xA8 = W W W G        0x28 = G W W G
+;     0x82 = W G G W        0x8A = W G W W        0xA2 = W W G W
+;     0x20 = G W G G        0x08 = G G W G
+
+WidgetBoxL:
+    db  0x00, 0x00      ; row 0:  top border (8 px dgray)
+    db  0x2A, 0xAA      ; row 1:  G W W W W W W W
+    db  0x2A, 0xAA      ; row 2
+    db  0x2A, 0xAA      ; row 3
+    db  0x2A, 0xAA      ; row 4
+    db  0x2A, 0xAA      ; row 5
+    db  0x2A, 0xAA      ; row 6
+    db  0x2A, 0xAA      ; row 7
+    db  0x2A, 0xAA      ; row 8
+    db  0x2A, 0xAA      ; row 9
+    db  0x2A, 0xAA      ; row 10
+    db  0x2A, 0xAA      ; row 11
+    db  0x2A, 0xAA      ; row 12
+    db  0x00, 0x00      ; row 13: bottom border
+
+WidgetBoxM:
+    db  0x00, 0x00      ; row 0:  top border
+    db  0xAA, 0xAA      ; row 1:  white interior
+    db  0xAA, 0xAA      ; row 2
+    db  0xAA, 0xAA      ; row 3
+    db  0xAA, 0xAA      ; row 4
+    db  0xAA, 0xAA      ; row 5
+    db  0xAA, 0xAA      ; row 6
+    db  0xAA, 0xAA      ; row 7
+    db  0xAA, 0xAA      ; row 8
+    db  0xAA, 0xAA      ; row 9
+    db  0xAA, 0xAA      ; row 10
+    db  0xAA, 0xAA      ; row 11
+    db  0xAA, 0xAA      ; row 12
+    db  0x00, 0x00      ; row 13: bottom border
+
+WidgetBoxR:
+    db  0x00, 0x00      ; row 0:  top border
+    db  0xAA, 0xA8      ; row 1:  W W W W W W W G
+    db  0xAA, 0xA8      ; row 2
+    db  0xAA, 0xA8      ; row 3
+    db  0xAA, 0xA8      ; row 4
+    db  0xAA, 0xA8      ; row 5
+    db  0xAA, 0xA8      ; row 6
+    db  0xAA, 0xA8      ; row 7
+    db  0xAA, 0xA8      ; row 8
+    db  0xAA, 0xA8      ; row 9
+    db  0xAA, 0xA8      ; row 10
+    db  0xAA, 0xA8      ; row 11
+    db  0xAA, 0xA8      ; row 12
+    db  0x00, 0x00      ; row 13: bottom border
+
+; Checkbox + radio share a 1-px-wide white margin on each side of the
+; cell (cols 0 and 7 are always blank), so they don't kiss the labels
+; sitting either side of them. The actual ring/box lives in cols 1..6
+; -- 6 px wide.
+
+WidgetChkOff:
+    db  0xAA, 0xAA      ; row 0:  blank
+    db  0x80, 0x02      ; row 1:  W G G G G G G W  (top border)
+    db  0x8A, 0xA2      ; row 2:  W G W W W W G W  (left + right verticals)
+    db  0x8A, 0xA2      ; row 3
+    db  0x8A, 0xA2      ; row 4
+    db  0x8A, 0xA2      ; row 5
+    db  0x8A, 0xA2      ; row 6
+    db  0x8A, 0xA2      ; row 7
+    db  0x8A, 0xA2      ; row 8
+    db  0x8A, 0xA2      ; row 9
+    db  0x8A, 0xA2      ; row 10
+    db  0x8A, 0xA2      ; row 11
+    db  0x80, 0x02      ; row 12: bottom border
+    db  0xAA, 0xAA      ; row 13: blank
+
+; Checked = the same outline plus a slim dark-grey indicator bar at
+; cols 3..4 rows 3..10. Two columns is the widest inset that still
+; leaves visible white space between the bar and the cell's left/right
+; verticals; without that gap the indicator vanishes into the outline
+; at small render scales.
+WidgetChkOn:
+    db  0xAA, 0xAA      ; row 0:  blank
+    db  0x80, 0x02      ; row 1:  W G G G G G G W  (top border)
+    db  0x8A, 0xA2      ; row 2:  W G W W W W G W  (sides only)
+    db  0x88, 0x22      ; row 3:  W G W G G W G W  (sides + inset top)
+    db  0x88, 0x22      ; row 4
+    db  0x88, 0x22      ; row 5
+    db  0x88, 0x22      ; row 6
+    db  0x88, 0x22      ; row 7
+    db  0x88, 0x22      ; row 8
+    db  0x88, 0x22      ; row 9
+    db  0x88, 0x22      ; row 10: sides + inset bottom
+    db  0x8A, 0xA2      ; row 11
+    db  0x80, 0x02      ; row 12: bottom border
+    db  0xAA, 0xAA      ; row 13: blank
+
+; 6 px-wide oval radio living in cols 1..6. Top + bottom caps step in
+; one column at a time so the curve looks rounded rather than rectangular.
+WidgetRadOff:
+    db  0xAA, 0xAA      ; row 0:  blank
+    db  0xA8, 0x2A      ; row 1:  W W W G G W W W  (top cap)
+    db  0xA2, 0x8A      ; row 2:  W W G W W G W W
+    db  0x8A, 0xA2      ; row 3:  W G W W W W G W
+    db  0x8A, 0xA2      ; row 4
+    db  0x8A, 0xA2      ; row 5
+    db  0x8A, 0xA2      ; row 6
+    db  0x8A, 0xA2      ; row 7
+    db  0x8A, 0xA2      ; row 8
+    db  0x8A, 0xA2      ; row 9
+    db  0x8A, 0xA2      ; row 10
+    db  0xA2, 0x8A      ; row 11: W W G W W G W W
+    db  0xA8, 0x2A      ; row 12: W W W G G W W W  (bottom cap)
+    db  0xAA, 0xAA      ; row 13: blank
+
+; Filled radio: same outer ring; the "selected" indicator is a 6-px-wide
+; x 5-px-tall dark-grey blob at cols 1..6, rows 5..9 -- a chunky
+; horizontal bar through the centre that reads cleanly even at
+; small render scales.
+WidgetRadOn:
+    db  0xAA, 0xAA      ; row 0:  blank
+    db  0xA8, 0x2A      ; row 1:  top cap
+    db  0xA2, 0x8A      ; row 2
+    db  0x8A, 0xA2      ; row 3
+    db  0x8A, 0xA2      ; row 4
+    db  0x80, 0x02      ; row 5:  W G G G G G G W  (blob top)
+    db  0x80, 0x02      ; row 6
+    db  0x80, 0x02      ; row 7
+    db  0x80, 0x02      ; row 8
+    db  0x80, 0x02      ; row 9:  blob bottom
+    db  0x8A, 0xA2      ; row 10
+    db  0xA2, 0x8A      ; row 11
+    db  0xA8, 0x2A      ; row 12: bottom cap
+    db  0xAA, 0xAA      ; row 13
+
+; Focused-input variants of the box edges/middle. Border colour shifts
+; from dgray (00) to black (FF) so the user can see which text/password
+; field will receive their keystrokes. The interior whites are unchanged.
+WidgetBoxLF:
+    db  0xFF, 0xFF      ; row 0:  top border (8 px black)
+    db  0xEA, 0xAA      ; row 1:  K W W W W W W W
+    db  0xEA, 0xAA      ; row 2
+    db  0xEA, 0xAA      ; row 3
+    db  0xEA, 0xAA      ; row 4
+    db  0xEA, 0xAA      ; row 5
+    db  0xEA, 0xAA      ; row 6
+    db  0xEA, 0xAA      ; row 7
+    db  0xEA, 0xAA      ; row 8
+    db  0xEA, 0xAA      ; row 9
+    db  0xEA, 0xAA      ; row 10
+    db  0xEA, 0xAA      ; row 11
+    db  0xEA, 0xAA      ; row 12
+    db  0xFF, 0xFF      ; row 13: bottom border
+
+WidgetBoxMF:
+    db  0xFF, 0xFF      ; row 0
+    db  0xAA, 0xAA      ; row 1
+    db  0xAA, 0xAA      ; row 2
+    db  0xAA, 0xAA      ; row 3
+    db  0xAA, 0xAA      ; row 4
+    db  0xAA, 0xAA      ; row 5
+    db  0xAA, 0xAA      ; row 6
+    db  0xAA, 0xAA      ; row 7
+    db  0xAA, 0xAA      ; row 8
+    db  0xAA, 0xAA      ; row 9
+    db  0xAA, 0xAA      ; row 10
+    db  0xAA, 0xAA      ; row 11
+    db  0xAA, 0xAA      ; row 12
+    db  0xFF, 0xFF      ; row 13
+
+WidgetBoxRF:
+    db  0xFF, 0xFF      ; row 0
+    db  0xAA, 0xAB      ; row 1:  W W W W W W W K
+    db  0xAA, 0xAB      ; row 2
+    db  0xAA, 0xAB      ; row 3
+    db  0xAA, 0xAB      ; row 4
+    db  0xAA, 0xAB      ; row 5
+    db  0xAA, 0xAB      ; row 6
+    db  0xAA, 0xAB      ; row 7
+    db  0xAA, 0xAB      ; row 8
+    db  0xAA, 0xAB      ; row 9
+    db  0xAA, 0xAB      ; row 10
+    db  0xAA, 0xAB      ; row 11
+    db  0xAA, 0xAB      ; row 12
+    db  0xFF, 0xFF      ; row 13
+
+; Focused-checkbox / focused-radio variants -- same shapes as the
+; unfocused ones, but border / outline colour is black (3) instead of
+; dgray (0). Tab focus then highlights the active widget without needing
+; a separate post-pass to draw an outline.
+WidgetChkOffF:
+    db  0xAA, 0xAA      ; row 0
+    db  0xBF, 0xFE      ; row 1:  W K K K K K K W  (top border)
+    db  0xBA, 0xAE      ; row 2:  W K W W W W K W  (vertical sides)
+    db  0xBA, 0xAE      ; row 3
+    db  0xBA, 0xAE      ; row 4
+    db  0xBA, 0xAE      ; row 5
+    db  0xBA, 0xAE      ; row 6
+    db  0xBA, 0xAE      ; row 7
+    db  0xBA, 0xAE      ; row 8
+    db  0xBA, 0xAE      ; row 9
+    db  0xBA, 0xAE      ; row 10
+    db  0xBA, 0xAE      ; row 11
+    db  0xBF, 0xFE      ; row 12: bottom border
+    db  0xAA, 0xAA      ; row 13
+
+WidgetChkOnF:
+    db  0xAA, 0xAA      ; row 0
+    db  0xBF, 0xFE      ; row 1:  top border
+    db  0xBA, 0xAE      ; row 2:  sides only
+    db  0xBB, 0xEE      ; row 3:  W K W K K W K W  (sides + inner bar)
+    db  0xBB, 0xEE      ; row 4
+    db  0xBB, 0xEE      ; row 5
+    db  0xBB, 0xEE      ; row 6
+    db  0xBB, 0xEE      ; row 7
+    db  0xBB, 0xEE      ; row 8
+    db  0xBB, 0xEE      ; row 9
+    db  0xBB, 0xEE      ; row 10
+    db  0xBA, 0xAE      ; row 11
+    db  0xBF, 0xFE      ; row 12
+    db  0xAA, 0xAA      ; row 13
+
+WidgetRadOffF:
+    db  0xAA, 0xAA      ; row 0
+    db  0xAF, 0xFA      ; row 1:  W W K K K K W W  (top arc)
+    db  0xAE, 0xBA      ; row 2:  W W K W W K W W
+    db  0xBA, 0xAE      ; row 3:  W K W W W W K W
+    db  0xBA, 0xAE      ; row 4
+    db  0xBA, 0xAE      ; row 5
+    db  0xBA, 0xAE      ; row 6
+    db  0xBA, 0xAE      ; row 7
+    db  0xBA, 0xAE      ; row 8
+    db  0xBA, 0xAE      ; row 9
+    db  0xBA, 0xAE      ; row 10
+    db  0xAE, 0xBA      ; row 11
+    db  0xAF, 0xFA      ; row 12
+    db  0xAA, 0xAA      ; row 13
+
+WidgetRadOnF:
+    db  0xAA, 0xAA      ; row 0
+    db  0xAF, 0xFA      ; row 1
+    db  0xAE, 0xBA      ; row 2
+    db  0xBA, 0xAE      ; row 3
+    db  0xBA, 0xAE      ; row 4
+    db  0xBF, 0xFE      ; row 5:  W K K K K K K W  (blob top)
+    db  0xBF, 0xFE      ; row 6
+    db  0xBF, 0xFE      ; row 7
+    db  0xBF, 0xFE      ; row 8
+    db  0xBF, 0xFE      ; row 9:  blob bottom
+    db  0xBA, 0xAE      ; row 10
+    db  0xAE, 0xBA      ; row 11
+    db  0xAF, 0xFA      ; row 12
+    db  0xAA, 0xAA      ; row 13
+
+; Down-pointing arrow used as the dropdown indicator on the right edge
+; of <select>. Carries the M-cell top + bottom border rows so the box's
+; outline stays continuous if PaintBoxConnectors is ever skipped; the
+; arrow itself is a 6-2-2 stepped triangle in cols 1..6, rows 6..8.
+WidgetSelArrow:
+    db  0x00, 0x00      ; row 0:  top border
+    db  0xAA, 0xAA      ; row 1
+    db  0xAA, 0xAA      ; row 2
+    db  0xAA, 0xAA      ; row 3
+    db  0xAA, 0xAA      ; row 4
+    db  0xAA, 0xAA      ; row 5
+    db  0x80, 0x02      ; row 6:  W G G G G G G W  (arrow top)
+    db  0xA0, 0x0A      ; row 7:  W W G G G G W W  (narrowing)
+    db  0xA8, 0x2A      ; row 8:  W W W G G W W W  (point)
+    db  0xAA, 0xAA      ; row 9
+    db  0xAA, 0xAA      ; row 10
+    db  0xAA, 0xAA      ; row 11
+    db  0xAA, 0xAA      ; row 12
+    db  0x00, 0x00      ; row 13: bottom border
+
+; Lookup table indexed by widget id (0..8). Index 0 is a NULL placeholder
+; so DrawWidgetGlyph can use `id * 2` to index without subtracting 1.
+WidgetBitmaps:
+    dw  0
+    dw  WidgetBoxL
+    dw  WidgetBoxM
+    dw  WidgetBoxR
+    dw  WidgetChkOff
+    dw  WidgetChkOn
+    dw  WidgetRadOff
+    dw  WidgetRadOn
+    dw  WidgetSelArrow
+    dw  WidgetBoxLF
+    dw  WidgetBoxMF
+    dw  WidgetBoxRF
+    dw  WidgetChkOffF
+    dw  WidgetChkOnF
+    dw  WidgetRadOffF
+    dw  WidgetRadOnF
 
 ; resources/up.png -> 8x5 MSX pixels. DrawDownArrow reuses this by reading
 ; rows in reverse (DrawBitmapReverse), so no separate down-arrow bitmap.
@@ -8471,8 +19322,24 @@ IconUpArrow:
 ; Mutable state (initialised by InitState).
 Focus:          db 0
 Busy:           db 0
+; Phase marker the openMSX TCL polls to time the load->render pipeline.
+; Bumped at well-known points by NavigateToCurrentUrl / RemoteLoadFile /
+; PrintFileContent so an external observer can see "got status line"
+; vs "got body" vs "render done" without tracing every byte. Values:
+;   0 = idle
+;   1 = navigate started (UrlBuf locked in, Busy=1)
+;   2 = OK HTM header parsed (first useful bytes back from bridge)
+;   3 = body fully streamed into FileBuf
+;   4 = parser entered (PrintFileContent)
+;   5 = parser hit EOF (render done)
+;   6 = navigate done (toolbar repainted)
+LoadPhase:      db 0
 UrlLen:         db 0
-UrlBuf:         ds URL_MAX + 1          ; 96 chars + NUL
+UrlCursor:      db 0                    ; caret column inside UrlBuf, 0..UrlLen
+; UrlBuf, ChunkCmdBuf moved past FileEnd: (AX-370 size cap fix).
+; ChunkCmdBuf still holds "CHUNK <decimal-offset>\0" -- 6 + 5 + 1 = 12 B,
+; oversized to 16 -- before EnsureWindowRemote hands it to RemoteGet,
+; which prepends "GET " and appends CRLF on the wire.
 
 ; Mouse state -- driven by PSG reg 14/15 via ports 0xA0/0xA1/0xA2. Port A
 ; (joyporta on openMSX) is used; the GetMouse routine adapts the technique
@@ -8485,26 +19352,188 @@ MouseBtnNow:    db 0
 MouseBtnPrev:   db 0
 MouseRaw:       db 0                    ; raw button byte from last GetMouse
 
-; Cursor rendering state -- VRAM save/restore so we can paint an 8x8 black
-; square on top of whatever's under the mouse, and put it back before the
-; next frame / UI redraw.
+; Cursor rendering state. With the V9938 hardware-sprite cursor we
+; only need to track the last-painted position for callers that read
+; CursorX/Y; the per-row scratch and save buffer the software cursor
+; used are gone.
 CursorX:        dw 0                    ; pixel X of the currently-drawn cursor
 CursorY:        db 0                    ; pixel Y of the currently-drawn cursor
 CursorVisible:  db 0
-CursorBg:       ds 16                   ; 2 bytes * 8 rows VRAM backup
-CursorByteCol:  db 0                    ; scratch (byte col during erase/draw)
-CursorRowY:     db 0                    ; scratch (current y during loops)
-CursorBgPtr:    dw 0                    ; scratch (pointer into CursorBg)
 EntrySP:        dw 0                    ; SP at Main entry (restored on Shutdown)
 
 ; File I/O and navigation state.
-Fcb:            ds 37                   ; MSX-DOS 1 FCB (36 bytes + 1 pad)
-FileLen:        dw 0                    ; bytes actually loaded (clamped to buffer)
-ScrollLine:     db 0                    ; first visible line (0 = top of file)
-TotalLines:     db 0                    ; LF count in loaded file (for thumb math)
+
+; File-load streaming (file_load_architecture, phased rollout).
+;
+; The renderer walks FileBuf[0..WindowLen) -- a *window* into a
+; possibly larger document. Today (Phase 1) the window covers the
+; whole document up to FILE_BUF_SIZE bytes; later phases will slide
+; it on demand to support docs larger than the window.
+;
+;   DocOffset = document offset of FileBuf[0]
+;   WindowLen = how many bytes of FileBuf are populated
+;
+; Pre-streaming code path (still the only one):
+;   DocOffset = 0
+;   WindowLen = min(file_size, FILE_BUF_SIZE)
+;
+; Once Phase 5 (sliding window) lands, scroll-driven loads can shift
+; DocOffset forward and refetch FileBuf so target lines stay inside
+; [DocOffset, DocOffset + WindowLen). DocSize is left for a later
+; phase: the local FCB carries the file's total size and the bridge
+; reports it via the "<bytes> <page>/<total>" frame, but no consumer
+; needs it yet.
+;
+WindowLen:      dw 0                    ; bytes currently in the FileBuf window
+; 24-bit byte offsets so docs past 64 KB (real Wikipedia articles,
+; long blog posts, etc.) work end-to-end. Stored as 3 bytes lo /
+; mid / hi -- low word at +0..+1 is the same layout `ld hl,
+; [DocOffset]` would give a 16-bit read, so old code that only cares
+; about the bottom 16 bits keeps working unchanged. New 24-bit math
+; sites read the high byte separately at +2.
+DocOffset:      db 0, 0, 0              ; FileBuf[0] = byte DocOffset of doc
+DocSize:        db 0, 0, 0              ; total document length in bytes; set
+                                        ; from FCB+16 at LoadFile / from
+                                        ; SerialLen on the first remote
+                                        ; frame (best-effort there). Read by
+                                        ; EnsureWindowLocal to decide
+                                        ; whether a forward slide has any
+                                        ; bytes left to fetch.
+
+; Restart-point cache (file_load_architecture Phases 3 + 4).
+;
+; During the initial-render pass (HtmlLineSkip == 0) the parser populates
+; LineCache[i] = (line_number, doc_offset, parser_state) at every safe
+; EmitNewline. Phase 5 will read the cache to jump to a target line
+; without replaying the whole document; today the cache is still
+; write-only -- the snapshot half of the pair is in place but no
+; consumer calls LineCacheRestore yet.
+;
+; Entry policy: append until the cache is full (LineCacheCount ==
+; LineCacheMax), then stop. Later phases swap this for a sampled /
+; evicting policy that distributes entries across the full document.
+;
+; Reset policy: LoadFile / RemoteLoadFile zero LineCacheCount because a
+; new document invalidates every prior offset.
+;
+; Safe-state predicate (Phase 4): an EmitNewline boundary is safe to
+; cache only when every "currently open scope" counter sits at its
+; default value -- no <table>, no <script>, no <font> color, no form
+; widget, no <a>, no <b>/<i>/<u>/<s>, no pending list bullet, not
+; PlainTextMode, and not mid-heading (ScaleY == 1). Inside any of
+; those scopes the parser carries hidden state in the line buffer
+; (LineGlyph attrs, ArBuf shaping, table-cell positions, form-input
+; cursors, ...) that LineCacheRestore can't reconstruct from an
+; 8-byte slot. Skip and try again at the next line.
+;
+; Snapshot slot layout (LineCacheState[i], 8 bytes):
+;   +0: HtmlScaleY     +4: HtmlAlign
+;   +1: HtmlListKind   +5: HtmlDir
+;   +2: HtmlOlCounter  +6: HtmlFg
+;   +3: HtmlIndent     +7: reserved
+;
+; The slot is sized to 8 even though only 7 fields are live so the
+; per-slot stride is a clean shift instead of a multiply, and so
+; future state additions don't grow the cache footprint.
+LineCacheMax     equ 32
+LineCacheStateSz equ 8                  ; bytes per snapshot slot
+LineCacheCount: db 0
+; Ring-buffer head (oldest entry index, 0..LineCacheMax-1). Only
+; consulted when LineCacheCount has reached LineCacheMax: the next
+; append overwrites slot[head] and advances head modulo Max. Reset
+; alongside LineCacheCount on every fresh load. Pre-fill state
+; (count < max) doesn't use head -- new entries land at slot[count]
+; and head stays at 0.
+LineCacheHead:  db 0
+; Stride sampling state. LineCacheStride starts at 1 (cache every
+; safe line); LineCacheMaybeAppend doubles it whenever the cache
+; fills (calling LineCacheDecimate to keep every 2nd entry). After
+; the initial pass on a long doc the cache ends up with
+; LineCacheMax/2 .. LineCacheMax entries spread evenly across the
+; doc, so PageDown to ANY line (early or late) finds a cached
+; entry within stride-1 lines. Without this, ring-eviction left
+; the cache full of late lines and PageDown 1/2 missed the cache
+; entirely, falling back to the slow byte-0 walk.
+LineCacheStride:    db 1
+LineCacheLastLine:  dw 0
+; LineCacheLineNo / LineCacheDocOff / LineCacheState moved past FileEnd:.
+
+; LineCacheLookupOffset scratch (Phase 7 fix). Lives in RAM so the
+; lookup loop's bookkeeping doesn't have to juggle stack pushes
+; through 16-bit comparisons. Only touched while the routine runs;
+; nobody reads these afterwards.
+LcloBestOff:    db 0, 0, 0              ; best entry doc_offset so far (24-bit)
+
+; SlideTarget: 24-bit byte_offset the next EnsureWindow{Local,Remote}
+; should slide to. Caller (SlideForwardLocal etc.) computes it via
+; 24-bit math and stashes it here; the EnsureWindow routines read it
+; back. Putting it in RAM avoids the stack-juggling that an A:HL
+; register-pair convention would force across the BDOS / serial calls
+; that fall in the slide path.
+SlideTarget:    db 0, 0, 0
+LcloBestIdx:    db 0xFF                 ; best entry slot, or 0xFF = none
+
+; LineCacheLookupLine scratch (mirrors Lclo* but indexed by line_no).
+; Only touched while the routine runs.
+LcllTarget:     dw 0
+LcllBestLine:   dw 0
+LcllBestIdx:    db 0xFF
+
+; Slide -> render parser-state hand-off (Phase 7 fix). When a slide
+; aligns its target to a cached safe boundary, we save the slot
+; index here. PrintFileContent reads it after its reset block and
+; calls LineCacheRestore to rebuild persistent parser state
+; (HtmlListKind, HtmlIndent, HtmlAlign, HtmlDir, HtmlOlCounter,
+; HtmlFg) so the first lines of the new chunk render with the
+; right scope context instead of the reset block's defaults.
+;
+; 0xFF = no pending restore (initial / consumed).
+PendingRestoreSlot: db 0xFF
+
+ScrollLine:     dw 0                    ; first visible line (0 = top of file)
+TotalLines:     dw 0                    ; rendered line count for thumb math
 ThumbTop:       db THUMB_Y0             ; current thumb top y (set by ComputeThumb)
 ThumbHeight:    db THUMB_Y1 - THUMB_Y0 + 1
-AboutOpen:      db 0                    ; 1 while the About popup is on screen
+; quick_screen_draw: paint the thumb dark-gray on the FIRST DrawScrollbar
+; in RefreshAfterScroll (the moment the user pressed Space) and black
+; again on the SECOND one (after PrintFileContent finishes). Visually
+; cues the user that the app is busy paging and is going to ignore
+; keys until the new viewport lands.
+ThumbBusy:      db 0
+ThumbCapByte:   db 0xFD                 ; written per draw based on ThumbBusy
+AboutOpen:      db 0                    ; 1 while the Help popup is on screen
+SaveOpen:       db 0                    ; 1 while the Save-file popup is on screen
+SaveFilename:   ds 13                   ; 8.3 DOS filename + NUL terminator
+SaveByteCount:  dw 0                    ; size in bytes if known, 0 = unknown
+SaveBytesWritten: dw 0                  ; bytes streamed to dest during DoSave
+SaveStatus:     db 0                    ; SaveStatus_Idle / Saving / Done / Failed
+SaveStatusBuf:  ds 24                   ; scratch for "Progress: XX.X KB" etc.
+; 24-bit DocOffset snapshot taken at OpenSaveFromTitlebar. Streaming
+; save uses EnsureWindowRemote (GET CHUNK) to walk the doc from
+; offset 0, which trashes the current display window. CloseSave
+; refetches from this offset to put the user back where they were.
+SaveResumeOffset: db 0, 0, 0
+; Stream cursor (24-bit byte offset into the source doc) used by the
+; DoSave chunk-loop. Mirrors SlideTarget's role for the scroll path
+; but kept separate so a cancelled save doesn't strand SlideTarget.
+SaveStreamOff:    db 0, 0, 0
+; Popup-modal focus save: any popup-open zeroes the visible focus
+; (FOC_* sentinel 0xFF doesn't match any button), so chrome paints
+; with no focused frame (address bar reverts to its DGRAY unfocused
+; border, etc.). CloseAbout / CloseSave restore the prior focus.
+; Only one popup is open at a time, so a single byte suffices.
+PopupFocusBefore: db 0
+ShowImages:     db 1                    ; 0 = strip <img> on render and skip
+                                        ; remote img fetches; 1 = render
+                                        ; local images + ask the bridge for
+                                        ; remote PCX handles. Toggled from
+                                        ; the Help popup checkbox.
+                                        ; Default flipped to 1 so the Help
+                                        ; checkbox starts checked and the
+                                        ; first RemoteLoadFile sends IMG ON
+                                        ; -- the new bridge defaults its
+                                        ; images flag the same way, so the
+                                        ; two ends agree without a toggle.
 
 ; Text cursor for DrawCharFast-based rendering.
 TextX:          dw 0
@@ -8517,17 +19546,46 @@ FastFontByte:   db 0
 FastRowsLeft:   db 0
 
 ; Step 3: HTML parser state.
-HtmlEnd:        dw 0                    ; end-of-buffer sentinel (FileBuf+FileLen)
+HtmlEnd:        dw 0                    ; end-of-buffer sentinel (FileBuf+WindowLen)
 HtmlInHead:     db 0                    ; 1 while inside <head>...</head>
 HtmlInTitle:    db 0                    ; 1 while inside <title>...</title>
 HtmlStyleFlags: db 0                    ; STYLE_BOLD / STYLE_ITALIC / etc.
 HtmlWsPending:  db 0                    ; 1 = emit a space before next non-ws char
 HtmlLineEmpty:  db 1                    ; 1 = cursor at start of a line (trim leading ws)
+HtmlLineHasWidget: db 0                 ; 1 = current line contains a form widget; bumps
+                                        ; next EmitNewline pitch so the widget's 3-px
+                                        ; foot doesn't crash into the next line's head.
 HtmlIsClose:    db 0                    ; scratch: 1 inside a closing tag
 HtmlTitleSeen:  db 0                    ; 1 once <title>..</title> has resolved
 HtmlTitleLen:   db 0                    ; bytes stored in HtmlTitleBuf
-HtmlLineSkip:   db 0                    ; rendered lines still to skip (scroll)
-HtmlLineCount:  db 0                    ; total rendered lines (for thumb math)
+HtmlLineSkip:   dw 0                    ; rendered lines still to skip (scroll)
+HtmlLineCount:  dw 0                    ; total rendered lines (for thumb math)
+; quick_screen_draw / lesson #3 follow-up: set to 1 once a render run
+; has walked to natural EOF (consumed == WindowLen at .eof) so we
+; know HtmlLineCount holds the exact rendered line count of the
+; window. ExtrapolateHtmlLineCountIfShort + the snap-back path read
+; this to avoid re-inflating an already-exact count -- without it,
+; every viewport-full short-circuit would re-extrapolate, fighting
+; the snap-back's correction and causing PageDown/PageUp jitter.
+; Cleared on a fresh file load so a window slide / new doc starts
+; the estimate cycle over.
+HtmlLineCountAccurate: db 0
+; Accurate HtmlLineCount value, snapshotted whenever HtmlLineCountAccurate
+; latches to 1 (initial-pass natural EOF or RefreshAfterScroll snap-back).
+; Scrolled renders bail at .eof as soon as the viewport fills, so the
+; live HtmlLineCount they leave behind is just the partial visible-page
+; count. PrintFileContent.eof restores from this snapshot when accurate
+; is set so PageDown's clamp keeps seeing the doc-wide line total.
+HtmlLineCountSaved: dw 0
+; quick_screen_draw: when the parser fills the visible viewport on
+; an initial-load pass, we DON'T short-circuit out of the loop; we
+; set HtmlNoDraw=1 instead so the parser keeps walking to natural
+; EOF (giving an exact HtmlLineCount + TotalLines) but LineFlush
+; stops emitting cells to VRAM. Without this byte, off-screen
+; rendered lines either overdraw the last visible row or wrap
+; their TextY into the chrome. Reset to 0 at PrintFileContent
+; entry.
+HtmlNoDraw:        db 0
 HtmlScaleY:     db 1                    ; 1 = normal glyph height, 2 = H1/H2
 HtmlInAnchor:   db 0                    ; 1 while inside an <a>..</a>
 HtmlFocusLink:  db 0xFF                 ; index of Tab-focused link (0xFF = none)
@@ -8538,24 +19596,95 @@ HtmlOlCounter:  db 0                    ; next <li> number in an <ol>
 HtmlIndent:     db 0                    ; left indent in pixels for new lines
 HtmlInTable:    db 0                    ; 1 while inside <table>
 HtmlTableCol:   db 0                    ; current cell index within a row
+HtmlTableColCount: db 5                 ; cell count in first <tr> (1..5); set by
+                                        ; MeasureTableCols at <table> open and
+                                        ; consumed by SetTableColLayout +
+                                        ; DrawTableVerticals. Default 5 keeps
+                                        ; the historical icon-layout if a tag
+                                        ; somehow renders before TagTableTag.
 HtmlTableFirst: db 0                    ; 1 if this is the very first row of the table
 HtmlRowTopY:    db 0                    ; TextY at the top of the current row (for vertical rules)
+ParserCursor:   dw 0                    ; saved parser HL at DispatchTag entry;
+                                        ; points just past the tag's '>'. Used by
+                                        ; lookahead-style handlers (currently
+                                        ; only TagTableTag's column prescan).
 HtmlSavedBold:  db 0                    ; scratch: STYLE_BOLD state before <th>
 HtmlFg:         db 3                    ; current text fg palette index (default BLACK=3)
-HtmlFgStack:    ds 4                    ; <font> stack of previous fg values
 HtmlFgDepth:    db 0                    ; current <font> nesting depth
 CurrentFontLUT: dw FontLUT              ; pointer to active LUT (updated by <font>)
 HtmlCurHrefLen: db 0                    ; length of the current href being captured
-HtmlCurHref:    ds LINK_URL_MAX + 1     ; NUL-terminated href of the *open* <a>
+HtmlImgWidth:   dw 0                    ; <img width="…"> in pixels (0 = unset)
+HtmlImgHeight:  dw 0                    ; <img height="…"> in pixels (0 = unset)
+HtmlImgOriginY: db 0                    ; TextY at TagImg entry (image-map origin)
+
+; Form-element scratch. HtmlInputType holds the first two uppercased
+; chars of the most recent <input type="..."> value; TagInput
+; dispatches on those. 'T' = text (default), 'P' = password,
+; 'S' = submit, 'C' = checkbox, 'RA' = radio, 'RE' = reset,
+; 'H' = hidden, 'I' = image, 'B' = button (rendered as submit).
+HtmlInputType:  db 'T', 'X'             ; default = text
+; HtmlSkipBody is non-zero between <select>...</select> and
+; <textarea>...</textarea>; EmitSink drops everything written while
+; it's set, so OPTION text and TEXTAREA initial content don't bleed
+; into the document flow as plain text.
+HtmlSkipBody:   db 0
+; HtmlInScript is non-zero between <script>...</script> and
+; <style>...</style>. Same semantics as HtmlSkipBody (EmitSink drops
+; bytes) but a dedicated slot so it can't collide with a <select> or
+; <textarea> nested inside the doc flow. Wikipedia ships several KB
+; of inline JS and CSS in <head>; without this, paginated chunk 3+
+; of large pages painted that source code as document text.
+HtmlInScript:   db 0
+; HtmlChecked is set by ScanHrefAttr when it sees a value-less
+; CHECKED attribute on the current tag. TagInput's checkbox / radio
+; branches read it to pick WG_CHK_ON / WG_RAD_ON over the _OFF variant.
+HtmlChecked:    db 0
+; HtmlSelectFound is reset by TagSelect at open and set by the first
+; <option> seen inside the select. While the flag is 0 the next OPTION
+; tag opens with HtmlSkipBody=0 so its label flows through into the
+; select's box; once set, all later options stay suppressed. This is a
+; pragmatic stand-in for honouring <option selected> properly (we'd
+; need a 2-pass scan to do that without rolling back already-emitted
+; cells). For now: first option = the visible one.
+HtmlSelectFound: db 0
+; HtmlOptCurIdx counts <option>s visited in the current <select>
+; during parse. HtmlOptCapturing gates whether EmitSink should mirror
+; emitted chars into FormValue[HtmlSelectSlot] so submit carries the
+; currently-shown option's text.
+HtmlOptCurIdx:   db 0
+HtmlOptCapturing: db 0
+
+; ---------------------------------------------------------------------------
+; Form-field slot table. One slot per <input> we want to remember after
+; parsing -- text / password / submit / checkbox / radio. Filled by
+; TagInput as the page renders; consumed by:
+;   - the text/pass renderer (so value chars appear inside the box)
+;   - Tab focus cycling (see HtmlFormFocus)
+;   - keyboard typing (appends to the focused slot's value)
+;   - submit-click -> SerialWriteZ (URL-encoded query string)
+;
+; FORM_NAME_MAX/VALUE_MAX are NOT including the trailing NUL.
+; ---------------------------------------------------------------------------
+FORM_MAX        equ 20
+FORM_NAME_MAX   equ 12
+FORM_VALUE_MAX  equ 18                       ; matches TI_TEXT_DEFAULT_W
+
+FormCount:      db 0                         ; live slots in [0..FormCount)
+HtmlFormFocus:  db 0xFF                      ; slot index, or 0xFF = none
+
+; HtmlNameAttr is captured by ScanHrefAttr from a NAME=... attribute
+; on the current tag. TagInput then copies it into FormName[slot] when
+; allocating a form slot.
+
+; Image-map scratch. `<map>` begins a block of `<area>` rects; their
+; coords are page-local (relative to the chunk's top-left). When the
+; following `<img>` renders, AttachPendingAreas translates every
+; pending area into a Link table entry anchored at the image's
+; on-screen origin.
+MAP_AREA_MAX    equ 8
+AreaCoords:     dw 0, 0, 0, 0           ; x1, y1, x2, y2 from coords="…"
+PendingAreaCount: db 0
 LinkCount:      db 0                    ; number of live link rects
-LinkStartX:     ds 2 * LINK_MAX
-LinkStartY:     ds LINK_MAX
-LinkEndX:       ds 2 * LINK_MAX
-LinkEndY:       ds LINK_MAX
-LinkUrls:       ds (LINK_URL_MAX + 1) * LINK_MAX
-HtmlTitleBuf:   ds TITLE_BUF_MAX + 1    ; NUL-terminated
-HtmlTagName:    ds 8                    ; up to 7 chars + NUL
-HtmlEntityName: ds 6                    ; up to 5 chars + NUL
 FastCgSlot:     db 0                    ; cached CGPNT[0] for ExtractFont
 
 ; Multi-step back/forward history. Ring buffer of HISTORY_MAX URL slots.
@@ -8566,7 +19695,6 @@ FastCgSlot:     db 0                    ; cached CGPNT[0] for ExtractFont
 HISTORY_MAX     equ 8                   ; must be a power of two (for `and` mask)
 HISTORY_SLOT    equ URL_MAX + 1         ; bytes per slot
 
-HistoryBuf:     ds HISTORY_SLOT * HISTORY_MAX
 HistoryOldest:  db 0
 HistoryCount:   db 0
 HistoryCursor:  db 0
@@ -8578,7 +19706,6 @@ On404:          db 0                    ; 1 while the synthetic 404 page is in v
 ; IsoJoin != 0 here; on any boundary char (or newline) the buffer is
 ; shape-resolved and emitted reversed to EmitRaw.
 AR_BUF_MAX      equ 32
-ArBuf:          ds AR_BUF_MAX
 ArLen:          db 0
 ArCurr:         db 0                    ; ShapePick scratch: byte being shaped
 ArCurrFlags:    db 0                    ; ShapePick scratch: curr's IsoJoin flags
@@ -8597,8 +19724,6 @@ CELL_NEUTRAL    equ 0x02                ; space/punct — direction from context
 CELL_FG_SHIFT   equ 4
 CELL_FG_MASK    equ 0x30
 LineLen:        db 0
-LineGlyph:      ds LINE_BUF_MAX
-LineAttr:       ds LINE_BUF_MAX
 ; 0xFF = "compute start column from HtmlAlign/HtmlIndent". Anything else
 ; pins LineDrawCells to that byte column for the next flush, used by
 ; table cells that need to land at a specific column X regardless of the
@@ -8617,8 +19742,6 @@ BorderHeight:   db 0
 LineLastSpace:  db 0xFF
 ; Scratch used by SmartWrap to hold the trailing word that gets carried
 ; over to the next line when we backtrack to the last space.
-TailGlyph:      ds LINE_BUF_MAX
-TailAttr:       ds LINE_BUF_MAX
 TailLen:        db 0
 EmitCellAttr:   db 0                    ; attr byte EmitRaw applies to next cell
 HtmlAlign:      db 0                    ; 0=left, 1=right, 2=center
@@ -8627,6 +19750,8 @@ HtmlDefaultAlign: db 0                  ; inherited default (set by <html>/<body
 HtmlDefaultDir:   db 0                  ; inherited default (set by <html>/<body>)
 HtmlNextAlign:  db 0xFF                 ; scratch: align= parsed on current tag (0xFF = unset)
 HtmlNextDir:    db 0xFF                 ; scratch: dir= parsed on current tag
+HtmlNextBorder: db 0                    ; scratch: border= parsed on current tag (0 = no border)
+HtmlTableBorder: db 0                   ; live border flag for the open <table>
 
 ; ISO-8859-6 -> MSX font mapping + joining flags. Generated from
 ; `ISO-8859-6 font mapping/ISO-8859-6-font-mapping.csv` by
@@ -8634,12 +19759,171 @@ HtmlNextDir:    db 0xFF                 ; scratch: dir= parsed on current tag
 ; machine-derived and can be regenerated without touching this source.
     include "iso8859_6.inc"
 
-; FileBuf and FontBuf both live in free TPA memory past the .COM image.
-; Declaring them as pure label equates avoids emitting any bytes, so the disk
-; binary stays small; at runtime we read/write into the free RAM that
-; MSX-DOS leaves above the program.
-FileBuf         equ $
-FontBuf         equ FileBuf + FILE_BUF_SIZE
-; 128-byte DMA scratch used by the streaming external-image loaders
-; (SC6/PCX/BMP). Sits above the font cache in TPA.
-ImgBuf          equ FontBuf + 2048
+; Emit the .COM to disk. The saved range stops at the last emitted byte
+; (FileEnd); FileBuf and friends below live in free TPA memory past
+; the .COM image and are pinned at a fixed runtime address so further
+; code growth doesn't shift them into whatever page of memory the
+; MSX-DOS BDOS or a shadowed slot secretly cares about.
+
+FileEnd:
+    SAVEBIN "dist/mwbro.com", 0x0100, FileEnd - 0x0100
+
+; ──────────────────────────────────────────────────────────────────
+; Runtime RAM region (post-SAVEBIN reservations).
+;
+; These `Label: ds N` blocks were previously interleaved through the
+; assembled image; SjASMPlus emits zero bytes for each `ds`, so the
+; .COM ended up carrying ~17 KB of zero padding -- enough to push
+; the binary well past the AX-370's ~15565 byte TPA cap (CLAUDE.md)
+; and produce a "DI; HALT detected" hang on boot.
+;
+; Moving them past FileEnd: keeps every label's runtime address
+; intact (the assembler's PC advances normally over `ds`) but takes
+; them out of the SAVEBIN range, so the .COM file stops carrying
+; the zero bytes. Each consumer already writes before reading, so
+; "uninitialised" is the right semantic.
+;
+; Source order matches the original placement so a regression diff
+; against the pre-move layout is straightforward to read.
+
+RuntimeRamBase:
+RmbLabelBuf:        ds 31
+BmpPal16:           ds 16
+ImgNameBuf:         ds IMG_NAME_MAX + 1
+ExtImgRemap:        ds 256
+FormScreenX:        ds FORM_MAX * 2
+FormScreenY:        ds FORM_MAX
+FormScreenW:        ds FORM_MAX * 2
+TitleDrawBuf:       ds TITLE_BUF_MAX + 1
+UrlBuf:             ds URL_MAX + 1
+ChunkCmdBuf:        ds 16
+Fcb:                ds 37
+SaveDestFcb:        ds 37                ; dest FCB for the Save popup's source-copy
+LineCacheLineNo:    ds LineCacheMax * 2
+LineCacheDocOff:    ds LineCacheMax * 3   ; 24-bit per slot for doc_offsets
+LineCacheState:     ds LineCacheMax * LineCacheStateSz
+LineCacheWriteSlot: ds 1                ; slot index LineCacheSnapshot
+                                         ; should write to (set by
+                                         ; LineCacheMaybeAppend; was
+                                         ; LineCacheCount before ring
+                                         ; eviction landed)
+HtmlFgStack:        ds 4
+HtmlCurHref:        ds LINK_URL_MAX + 1
+HtmlFormAction:     ds FORM_ACTION_MAX + 1
+FormSelectIdx:      ds FORM_MAX
+FormOptCount:       ds FORM_MAX
+FormType:           ds FORM_MAX
+FormWidth:          ds FORM_MAX
+FormName:           ds FORM_MAX * (FORM_NAME_MAX + 1)
+FormValue:          ds FORM_MAX * (FORM_VALUE_MAX + 1)
+HtmlNameAttr:       ds FORM_NAME_MAX + 1
+PendingAreaX1:      ds 2 * MAP_AREA_MAX
+PendingAreaY1:      ds MAP_AREA_MAX
+PendingAreaX2:      ds 2 * MAP_AREA_MAX
+PendingAreaY2:      ds MAP_AREA_MAX
+PendingAreaUrl:     ds MAP_AREA_MAX * (LINK_URL_MAX + 1)
+LinkStartX:         ds 2 * LINK_MAX
+LinkStartY:         ds LINK_MAX
+LinkEndX:           ds 2 * LINK_MAX
+LinkEndY:           ds LINK_MAX
+LinkUrls:           ds (LINK_URL_MAX + 1) * LINK_MAX
+HtmlTitleBuf:       ds TITLE_BUF_MAX + 1
+HtmlTagName:        ds 12
+HtmlEntityName:     ds 6
+HistoryBuf:         ds HISTORY_SLOT * HISTORY_MAX
+ArBuf:              ds AR_BUF_MAX
+LineGlyph:          ds LINE_BUF_MAX
+LineAttr:           ds LINE_BUF_MAX
+TailGlyph:          ds LINE_BUF_MAX
+TailAttr:           ds LINE_BUF_MAX
+RuntimeRamEnd:
+
+; ──────────────────────────────────────────────────────────────────
+; FileBuf / FontBuf / ImgBuf are runtime-only RAM regions placed
+; ABOVE the runtime-RAM block (and therefore ABOVE the .COM image
+; loaded from disk). Declared via `equ` so no bytes are emitted to
+; the .COM -- every consumer writes before reading:
+;     FileBuf  -> LoadFile / RemoteLoadFile / TryFetchMore
+;     FontBuf  -> ExtractFont (called once at startup)
+;     ImgBuf   -> ImgStream (DMA scratch, written before each read)
+;
+; Bug history: pre-move, `ORG 0x6800 / ds FILE_BUF_SIZE / ...` mixed
+; FileBuf into the same address space as the inline `ds` globals.
+; Moving the globals past FileEnd: (and switching FileBuf-friends
+; to `equ`) eliminates the overlap risk and shrinks the .COM by the
+; ~17 KB of zero bytes the inline `ds` blocks were emitting.
+
+FILEBUF_BASE   equ (RuntimeRamEnd + 0xFF) & 0xFF00
+                                       ; first 256-aligned byte past
+                                       ; the runtime RAM block; moves
+                                       ; up automatically as that block
+                                       ; grows.
+
+FileBuf        equ FILEBUF_BASE
+; FontBuf is PINNED, not auto-computed from FileBuf+FILE_BUF_SIZE.
+; History: when FontBuf floated up to 0xC300 (because BSS additions
+; pushed FILEBUF_BASE to 0xA200) HB-F1XD froze at boot with "DI; HALT
+; detected" -- ExtractFont's 2 KB write into 0xC300..0xCB00 happens
+; to trip the disk BIOS / slot 3 expansion into a state where IFF
+; never re-enables. 0xC200 has been the working address since the
+; fix_char_corruption work (commit 370d6fb); pinning it guarantees
+; future BSS / code growth doesn't accidentally walk into the haunted
+; page boundary.
+;
+; The price: FILE_BUF_SIZE is now whatever fits between FILEBUF_BASE
+; and 0xC200 (currently 0x2000 = 8 KB). The bridge already chunks
+; pages larger than that via GET CHUNK <offset>, so the cap on
+; in-memory page size is enforced upstream.
+FontBuf        equ 0xC200
+ImgBuf         equ FontBuf + FONT_BUF_SIZE
+
+; Build-time guard: FileBuf must end at or before FontBuf -- otherwise
+; ExtractFont's 2 KB write into FontBuf would clobber the FileBuf
+; tail. The auto-computed FILEBUF_BASE shifts up as BSS grows; if it
+; grows past FontBuf-FILE_BUF_SIZE this assert catches it. The fix is
+; to shrink FILE_BUF_SIZE; do NOT raise FontBuf (the address is
+; pinned for hardware reasons, see the comment block above).
+    ASSERT FILEBUF_BASE + FILE_BUF_SIZE <= FontBuf
+
+; quick_screen_draw / lesson #1: bifurcated page-aligned glyph LUT.
+; FastLutHi[font_byte] = high VRAM byte (left 4 px); FastLutLo[font_byte]
+; = low VRAM byte (right 4 px). Indexed by H = page, L = font_byte so
+; the inner emit collapses to `ld a,(hl); out (c),a; inc h; ld a,(hl);
+; out (c),a` -- no multiplication, no add. Built once at startup by
+; BuildFastLut from the 16-entry FontLUT (BLACK fg variant only).
+; <font color> swaps still go through the slow EmitStyledByte path.
+FAST_LUT_PAGE_BASE equ ((ImgBuf + 128 + 0xFF) & 0xFF00)
+FastLutHi          equ FAST_LUT_PAGE_BASE
+FastLutLo          equ FAST_LUT_PAGE_BASE + 0x100
+FastLutEnd         equ FastLutLo + 0x100
+    ASSERT (FastLutHi & 0xFF) == 0
+
+; quick_screen_draw / lesson #3: row-first transposed font. Layout
+; is `byte r of all 256 chars contiguous in row r's page`, so
+; reading char C's byte for row R is `H = base_page + R, L = C,
+; ld a,(hl)` (7 T, no multiplication). Eight pages = 2 KB at a
+; page-aligned base. Indexed alongside FastLutHi/Lo by the
+; row-major fast lane in LineDrawCells.
+TransposedFontBuf  equ FastLutEnd
+TransposedFontEnd  equ TransposedFontBuf + 8 * 0x100
+    ASSERT (TransposedFontBuf & 0xFF) == 0
+    ASSERT TransposedFontEnd <= 0xD500
+
+; Build-time guards.
+;   * FileEnd <= FILEBUF_BASE: catches the FileBuf-vs-globals overlap
+;     by failing the build if the .COM ever grows past the pinned
+;     buffer base.
+;   * ImgBuf+128 <= 0xD500: caps the top buffer well below both
+;     MSX-DOS 1.03's runtime HIMEM (~0xDF94 on Sony HB-F1XD) and
+;     the .COM's initial SP (~0xDDC8). The 0xD500 cap leaves ~2 KB
+;     of stack headroom, which is plenty for our deepest call chain
+;     (Print->Tag->EmitNewline->ArFlush->Bidi->LineDraw->DrawCharFast
+;     ~12 frames worst case = ~50 bytes), with margin for both
+;     interrupt handlers and BIOS calls.
+;
+; If you hit either assert with a sane FILE_BUF_SIZE, the right move
+; is to shrink FILE_BUF_SIZE -- not to raise the upper cap. The cap
+; protects against silent corruption from DOS scratch (above HIMEM)
+; or stack collisions (below SP).
+    ASSERT FileEnd <= FILEBUF_BASE
+    ASSERT ImgBuf + 128 <= 0xD500

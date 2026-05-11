@@ -1,0 +1,2 @@
+# Keeps the bridge root in git so the directory exists on fresh clones.
+# Files added here are served by web_bridge at http://127.0.0.1:8080/.
