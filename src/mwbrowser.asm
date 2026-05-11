@@ -252,12 +252,14 @@ Main:
     ld      a, 6
     CALLBIOS BIOS_CHGMOD                    ; Screen 6
 
+    call    Force212Lines               ; some BIOSes leave R#9 LN=0
+
     call    ExtractFont                 ; pull BIOS font into FontBuf (once)
     call    BuildFastLut                ; populate FastLutHi/Lo from FontLUT
     call    BuildTransposedFont         ; row-major mirror of FontBuf
     call    SetPalette
     call    SetBorder
-    call    DisableSprites              ; hide the uninitialised sprite plane
+    call    InitCursorSprite            ; mouse cursor = V9938 hardware sprite 0
     call    ClearContent                ; VRAM all white (colour 0)
     call    BindFnKeys                  ; make F1 inject 0xF1 on DIRIN
     call    InitState
@@ -1678,23 +1680,118 @@ SetBorder:
     ei
     ret
 
-; DisableSprites: write R8 with SPD=1 (sprite plane disable). The
-; V9938's default sprite attribute table after CHGMOD 6 leaves
-; uninitialised sprites scattered across the screen with mode-2
-; "transparent index 0" rules that randomly hide bitmap pixels at
-; the rows where sprite Y values happen to land. We don't use
-; sprites; just turn the plane off.
+; Force212Lines: set R#9 LN=1 so the V9938 displays 212 rows.
 ;
-; R8 bits: 7=MS 6=LP 5=TP 4=CB 3=VR 2=0 1=SPD 0=BW
-; Set SPD=1; keep VR=1 (V9938 64 KB VRAM default).
-DisableSprites:
+; HB-F1XD's BIOS leaves R#9 = 0x80 after CHGMOD 6 (LN=1, NT=0). The
+; AX-370's BIOS leaves it as 0x02 (LN=0, NT=1) -- capping visible
+; output at 192 lines, so the bottom 20 rows of MWBRO's content area
+; never reach the screen on AX-370 (and on PAL HB-F700D, where the
+; default is similar).
+;
+; R#9 itself is write-only on the V9938, but the BIOS keeps a mirror
+; at 0xFFE8 (RG9SAV). Read that, preserve NT (PAL/NTSC), force LN=1,
+; write back to both the chip and the mirror so subsequent BIOS code
+; that rewrites R#9 (e.g. on slot switches) keeps the same value.
+Force212Lines:
+    ld      a, [0xFFE8]                  ; RG9SAV (R#9 mirror)
+    and     0x02                         ; preserve only NT (PAL/NTSC) bit
+    or      0x80                         ; OR in LN=1 (212-line mode)
+    ld      [0xFFE8], a                  ; update the BIOS mirror
     di
-    ld      a, 0x0A                      ; VR=1 (bit 3) + SPD=1 (bit 1)
     out     (VDP_CMD), a
-    ld      a, 0x80 | 8                  ; R#8
+    ld      a, 0x80 | 9
     out     (VDP_CMD), a
     ei
     ret
+
+; InitCursorSprite: program V9938 sprite engine to render the mouse
+; pointer as hardware sprite 0. Replaces the original software
+; save/paint cursor, which raced the NTSC raster at low Y (cursor's
+; row band scanned out while EraseCursor was still mid-restore, so
+; the bottom rows of the pointer disappeared for ~1/60 s of every
+; few frames -> visible flicker that vanished under PAL's wider
+; vblank window).
+;
+; We pin SAT/SPT/colour-table locations explicitly so we don't
+; inherit whatever R5/R6/R11 the BIOS's CHGMOD 6 left behind:
+;   R5  = 0xEC -> SAT at VRAM 0x07600
+;   R6  = 0x0F -> SPT at VRAM 0x07800
+;   R11 = 0x00 -> SAT high bits clear
+;   colour table is implicitly at SAT - 0x200 = 0x07400.
+; All three sit in the off-screen tail of page 0 (Screen 6 display
+; ends at 0x06A00 = row 212 * 128). Page 1 shares the sprite tables
+; -- the V9938 sprite engine reads them from a fixed absolute VRAM
+; address regardless of which bitmap page R2 is displaying, so the
+; cursor follows the user across the page-flip in RefreshAfterScroll.
+;
+; Screen 6 sprites are doubled horizontally on display (one sprite
+; pixel covers two screen pixels), so the 8-wide pattern below
+; renders as ~14 screen pixels at its widest -- close to the old
+; software arrow's 7-pixel width but recognisably the same shape.
+InitCursorSprite:
+    di
+    ld      a, 0xEC                      ; R5 = SAT high bits
+    out     (VDP_CMD), a
+    ld      a, 0x80 | 5
+    out     (VDP_CMD), a
+    ld      a, 0x0F                      ; R6 = SPT high bits
+    out     (VDP_CMD), a
+    ld      a, 0x80 | 6
+    out     (VDP_CMD), a
+    xor     a                            ; R11 = 0
+    out     (VDP_CMD), a
+    ld      a, 0x80 | 11
+    out     (VDP_CMD), a
+    ld      a, 1                         ; R14 = segment 1 (0x4000..0x7FFF)
+    out     (VDP_CMD), a
+    ld      a, 0x80 | 14
+    out     (VDP_CMD), a
+    ei
+
+    ; --- 8 pattern bytes at 0x07800 (= 0x3800 within segment 1) ---
+    ld      hl, 0x3800
+    call    VdpSetWriteAddr
+    ld      hl, CursorSpritePattern
+    ld      b, 8
+.ptn:
+    ld      a, [hl]
+    out     (VDP_DATA), a
+    inc     hl
+    djnz    .ptn
+
+    ; --- 8 colour bytes at 0x07400 -- palette slot 3 (black), no flags ---
+    ld      hl, 0x3400
+    call    VdpSetWriteAddr
+    ld      a, 0x03
+    ld      b, 8
+.col:
+    out     (VDP_DATA), a
+    djnz    .col
+
+    ; --- SAT[0] hidden; SAT[1].Y = 0xD8 terminates the sprite list ---
+    ld      hl, 0x3600
+    call    VdpSetWriteAddr
+    ld      a, 0xD9                      ; Y >= 0xD9 hides the sprite
+    out     (VDP_DATA), a
+    xor     a
+    out     (VDP_DATA), a                ; X
+    out     (VDP_DATA), a                ; pattern number
+    out     (VDP_DATA), a                ; reserved (mode-2 colour lives elsewhere)
+    ld      a, 0xD8
+    out     (VDP_DATA), a                ; SAT[1].Y = end-of-list marker
+    ret
+
+CursorSpritePattern:
+    ; Source: resources/mouse_pointer_2.png (8x8). Each sprite pixel
+    ; covers 2 screen pixels horizontally in Screen 6.
+    db      0xC0     ; ##......     row 0
+    db      0xA0     ; #.#.....     row 1
+    db      0x90     ; #..#....     row 2
+    db      0x88     ; #...#...     row 3
+    db      0xB8     ; #.###...     row 4
+    db      0xF0     ; ####....     row 5
+    db      0x38     ; ..###...     row 6
+    db      0x18     ; ...##...     row 7
 
 ; ============================================================================
 ; VDP primitives (direct I/O; no BIOS)
@@ -1979,6 +2076,14 @@ VdpSetR14:
 ; 1 = page 1 (R2 = 0x3F -- bit 5 selects the higher 32 KB region).
 ;   A = 0 or 1.
 VdpSetDisplayPage:
+    ; A on return is contract-preserved: RefreshAfterScroll's phase-6
+    ; idle-state setup reuses it as `ld [WritesToPage], a`. Without
+    ; the push/pop below we'd clobber A with the 0x80|2 R#2 write
+    ; byte, store 0x82 into WritesToPage, and VdpSetR14 would then
+    ; route every subsequent paint to R14 = (0x82*2 + b) mod 4 -- the
+    ; *back* page -- so popups (DrawAboutPopup) and any FillRect
+    ; redraw would land off-screen after the first PageDown.
+    push    af
     ld      [DisplayedPage], a
     or      a
     ld      a, 0x1F                      ; page 0
@@ -1990,6 +2095,7 @@ VdpSetDisplayPage:
     ld      a, 0x80 | 2
     out     (VDP_CMD), a
     ei
+    pop     af
     ret
 
 ; CopyChromeToBack: replicate the titlebar + toolbar bands (rows
@@ -2936,38 +3042,97 @@ PaintAddressBar:
     jp      DrawString
 
 ; ============================================================================
-; Text rendering via BIOS GRPPRT
-;   GRPPRT (0x008D) draws A at graphic cursor (GRPACX, GRPACY) using FORCLR/
-;   BAKCLR. CALSLT is invoked via .CALLBIOS.
+; Text rendering -- direct VRAM blit via DrawCharFast
+;
+; Was BIOS GRPPRT (0x008D) until the lesson-4 page-flip in
+; RefreshAfterScroll exposed GRPPRT's fatal flaw: it ALWAYS writes to
+; page 0 (its addressing is Y*128 + X/4 against absolute VRAM, no R2
+; or R14 indirection). When DisplayedPage flips to page 1, any DrawString
+; renders to the off-screen buffer -- popup body text and toolbar URL
+; just vanish.
+;
+; The DrawCharFast loop below honours WritesToPage via SetVramWritePos
+; -> VdpSetR14, so chrome text follows the page flip correctly. We keep
+; FORCLR/BAKCLR writes for any code still reading them, but the actual
+; render path no longer uses them.
 ; ============================================================================
 
 FORCLR          equ 0xF3E9
 BAKCLR          equ 0xF3EA
-GRPACX          equ 0xFCB7
-GRPACY          equ 0xFCB9
 
-; DrawString(DE=x pixel, C=y pixel, HL=NUL-terminated string).
+; DrawString(DE=pixel X, C=pixel Y, HL=NUL-terminated string).
+; Renders left-to-right via DrawCharFast. Each glyph is 8 px wide
+; (2 byte cols). Caller is expected to have called SetTextColours
+; first so CurrentFontLUT points at the right colour pair.
 DrawString:
-    ld      [GRPACX], de
-    ld      a, c
-    ld      [GRPACY], a
-    xor     a
-    ld      [GRPACY + 1], a
+    ; byte_col = pixel_X / 4. Pixel X is 16-bit (chrome+content goes
+    ; up to 511), so handle high byte.
+    push    hl
+    ex      de, hl
+    srl     h
+    rr      l
+    srl     h
+    rr      l
+    ld      a, l                        ; A = byte_col (low byte; X/4 <= 127 fits)
+    pop     hl                          ; HL = string ptr
+    ld      b, a                        ; B = byte_col for DrawCharFast
 .loop:
     ld      a, [hl]
     or      a
     ret     z
     push    hl
-    CALLBIOS BIOS_GRPPRT
+    push    bc
+    call    DrawCharFast                ; A=char, B=byte_col, C=row_y; clobbers C
+    pop     bc
     pop     hl
+    inc     b
+    inc     b                           ; advance 8 px = 2 byte cols
     inc     hl
     jr      .loop
 
-; SetTextColours(A=fg, L=bg).
+; SetTextColours(A=fg palette index 0..3, L=bg palette index 0..3).
+; Updates FORCLR/BAKCLR (legacy) AND picks the matching CurrentFontLUT
+; so the next DrawString / DrawCharFast renders with the requested
+; colour pair. Combos covered:
+;   (BLACK,WHITE) -> FontLUT
+;   (BLACK,LGRAY) -> FontLUT_BlackOnLgray
+;   (DGRAY,WHITE) -> FontLUT_DGray
+;   (DGRAY,LGRAY) -> FontLUT_DGrayOnLgray
+;   (LGRAY,WHITE) -> FontLUT_LGray
+;   anything else -> FontLUT (default)
 SetTextColours:
     ld      [FORCLR], a
+    push    af
     ld      a, l
     ld      [BAKCLR], a
+    pop     af                          ; A = fg, L = bg
+
+    cp      COL_BLACK
+    jr      z, .fgBlack
+    cp      COL_DGRAY
+    jr      z, .fgDgray
+    cp      COL_LGRAY
+    jr      z, .fgLgray
+    ld      hl, FontLUT
+    jr      .stash
+.fgBlack:
+    ld      a, l
+    cp      COL_LGRAY
+    ld      hl, FontLUT_BlackOnLgray
+    jr      z, .stash
+    ld      hl, FontLUT
+    jr      .stash
+.fgDgray:
+    ld      a, l
+    cp      COL_LGRAY
+    ld      hl, FontLUT_DGrayOnLgray
+    jr      z, .stash
+    ld      hl, FontLUT_DGray
+    jr      .stash
+.fgLgray:
+    ld      hl, FontLUT_LGray
+.stash:
+    ld      [CurrentFontLUT], hl
     ret
 
 ; ============================================================================
@@ -3008,6 +3173,10 @@ FontLUT_DGray:                          ; fg = DGRAY (pair 00)
 FontLUT_BlackOnLgray:                   ; fg = BLACK (pair 11), bg = LGRAY (pair 01)
     db  0x55, 0x57, 0x5D, 0x5F, 0x75, 0x77, 0x7D, 0x7F
     db  0xD5, 0xD7, 0xDD, 0xDF, 0xF5, 0xF7, 0xFD, 0xFF
+
+FontLUT_DGrayOnLgray:                   ; fg = DGRAY (pair 00), bg = LGRAY (pair 01)
+    db  0x55, 0x54, 0x51, 0x50, 0x45, 0x44, 0x41, 0x40
+    db  0x15, 0x14, 0x11, 0x10, 0x05, 0x04, 0x01, 0x00
 
 ; ExtractFont: copy the 2 KB font into FontBuf using the live CGPNT pointer.
 ; CGPNT[0]   = slot specifier holding the font
@@ -14553,150 +14722,68 @@ GetMouseNibble:
     ei
     ret
 
-; EraseCursor: if the cursor is currently visible, restore the 16 VRAM bytes
-; under it from CursorBg and clear the visible flag. Safe to call any time.
+; EraseCursor: hide the cursor sprite. Kept for the keypress-redraw
+; call site in MainLoop -- hardware sprites don't actually need
+; erasing before bitmap redraws (they composite on top), but parking
+; the sprite below screen during long repaints keeps the pointer
+; from sitting on top of half-drawn dialogs.
+;
+; In the old software-cursor version this routine restored 16 saved
+; VRAM bytes under the cursor; now it just writes Y = 0xD9 to SAT[0].
 EraseCursor:
     ld      a, [CursorVisible]
     or      a
     ret     z
-
-    ld      hl, [CursorX]
-    srl     h
-    rr      l
-    srl     h
-    rr      l                           ; HL = CursorX / 4
-    ld      a, l
-    ld      [CursorByteCol], a
-    ld      a, [CursorY]
-    ld      [CursorRowY], a
-    ld      hl, CursorBg
-    ld      [CursorBgPtr], hl
-
-    ld      e, 8                        ; 8 rows
-.rowLoop:
-    ld      a, [CursorByteCol]
-    ld      b, a
-    ld      a, [CursorRowY]
-    ld      c, a
-    push    de
-    call    SetVramWritePos
-    pop     de
-    ld      hl, [CursorBgPtr]
-    ld      a, [hl]
+    di
+    ld      a, 1                         ; R14 = segment 1
+    out     (VDP_CMD), a
+    ld      a, 0x80 | 14
+    out     (VDP_CMD), a
+    ei
+    ld      hl, 0x3600                   ; SAT[0].Y
+    call    VdpSetWriteAddr
+    ld      a, 0xD9
     out     (VDP_DATA), a
-    inc     hl
-    ld      a, [hl]
-    out     (VDP_DATA), a
-    inc     hl
-    ld      [CursorBgPtr], hl
-
-    ld      a, [CursorRowY]
-    inc     a
-    ld      [CursorRowY], a
-    dec     e
-    jr      nz, .rowLoop
-
     xor     a
     ld      [CursorVisible], a
     ret
 
-; DrawCursor: save VRAM under (MouseX, MouseY), then paint an 8x8 black
-; square there. Assumes the cursor is NOT already visible (EraseCursor is
-; idempotent and safe to call first).
+; DrawCursor: position hardware sprite 0 at (MouseX, MouseY).
+;
+; Screen 6 sprites use 8-bit X with one sprite pixel = two screen
+; pixels, so X_sprite = MouseX / 2. The sprite "Y" coordinate is the
+; line ABOVE the first painted row, so we subtract 1 from MouseY.
+; The sprite engine renders entirely in hardware -- no raster race,
+; no VRAM save/restore, no vblank deadline.
 DrawCursor:
-    call    EraseCursor                 ; ensure clean state
+    di
+    ld      a, 1                         ; R14 = segment 1
+    out     (VDP_CMD), a
+    ld      a, 0x80 | 14
+    out     (VDP_CMD), a
+    ei
+    ld      hl, 0x3600                   ; SAT[0]
+    call    VdpSetWriteAddr
 
-    ; Record the position we're drawing at so EraseCursor restores correctly.
+    ld      a, [MouseY]
+    dec     a                            ; sprite Y = pixel Y - 1
+    out     (VDP_DATA), a
+    ld      hl, [MouseX]
+    srl     h
+    rr      l                            ; HL = MouseX / 2 (0..255)
+    ld      a, l
+    out     (VDP_DATA), a
+    xor     a
+    out     (VDP_DATA), a                ; pattern = 0
+
+    ; Track the painted position for any code that still reads CursorX/Y.
     ld      hl, [MouseX]
     ld      [CursorX], hl
     ld      a, [MouseY]
     ld      [CursorY], a
-
-    ld      hl, [MouseX]
-    srl     h
-    rr      l
-    srl     h
-    rr      l
-    ld      a, l
-    ld      [CursorByteCol], a
-    ld      a, [MouseY]
-    ld      [CursorRowY], a
-
-    ; --- Save 2 VRAM bytes * 8 rows into CursorBg ---
-    ld      hl, CursorBg
-    ld      [CursorBgPtr], hl
-    ld      e, 8
-.saveLoop:
-    ld      a, [CursorByteCol]
-    ld      b, a
-    ld      a, [CursorRowY]
-    ld      c, a
-    push    de
-    call    SetVramReadPos
-    pop     de
-    in      a, (VDP_DATA)
-    ld      hl, [CursorBgPtr]
-    ld      [hl], a
-    inc     hl
-    in      a, (VDP_DATA)
-    ld      [hl], a
-    inc     hl
-    ld      [CursorBgPtr], hl
-
-    ld      a, [CursorRowY]
-    inc     a
-    ld      [CursorRowY], a
-    dec     e
-    jr      nz, .saveLoop
-
-    ; --- Paint 2 bytes per row: new = saved_bg OR cursor_mask.
-    ld      a, [MouseY]
-    ld      [CursorRowY], a
-    ld      ix, CursorBg
-    ld      iy, CursorMask
-    ld      e, 8
-.drawLoop:
-    ld      a, [CursorByteCol]
-    ld      b, a
-    ld      a, [CursorRowY]
-    ld      c, a
-    push    de
-    call    SetVramWritePos
-    pop     de
-
-    ld      a, [ix + 0]
-    or      [iy + 0]
-    out     (VDP_DATA), a
-    ld      a, [ix + 1]
-    or      [iy + 1]
-    out     (VDP_DATA), a
-
-    inc     ix
-    inc     ix
-    inc     iy
-    inc     iy
-    ld      a, [CursorRowY]
-    inc     a
-    ld      [CursorRowY], a
-    dec     e
-    jr      nz, .drawLoop
-
-    ld      a, 2
+    ld      a, 1
     ld      [CursorVisible], a
     ret
-
-; CursorMask: 8 rows x 2 bytes. Each byte has 11-pair for opaque pixels, 00
-; elsewhere. OR'd with saved bg to produce the final cursor row. Shape from
-; resources/mouse_pointer.bmp (top-left anchored arrow, 8x8 MSX pixels).
-CursorMask:
-    db  0xF0, 0x00
-    db  0xFC, 0x00
-    db  0xFF, 0xC0
-    db  0xFF, 0xF0
-    db  0xFF, 0xFC
-    db  0xFC, 0x00
-    db  0xF0, 0x00
-    db  0xC0, 0x00
 
 ; PollMouse: called every main-loop iteration. Reads mouse, clamps position,
 ; detects a press edge (prev=0 -> now=1) and dispatches to HandleClick.
@@ -15079,11 +15166,9 @@ DrawAboutPopup:
     call    DrawString
 
     ; Centre "MSX WBrowser" (12 glyphs * 8 px = 96 px) and render it
-    ; bold via DrawCharFast. FontLUT_BlackOnLgray matches the popup's
-    ; LGRAY background; HtmlStyleFlags=STYLE_BOLD makes DrawCharFast
-    ; OR each glyph row with itself shifted right one pixel.
-    ld      hl, FontLUT_BlackOnLgray
-    ld      [CurrentFontLUT], hl
+    ; bold via DrawCharFast. SetTextColours(BLACK, LGRAY) above already
+    ; pointed CurrentFontLUT at FontLUT_BlackOnLgray; just flip on the
+    ; STYLE_BOLD bit so DrawCharFast ORs each row with itself shifted.
     ld      a, STYLE_BOLD
     ld      [HtmlStyleFlags], a
     ld      b, (ABOUT_X + (ABOUT_W - 96) / 2) / 4    ; byte col = pixel/4
@@ -15105,8 +15190,8 @@ DrawAboutPopup:
 .apmDone:
     xor     a
     ld      [HtmlStyleFlags], a
-    ld      hl, FontLUT
-    ld      [CurrentFontLUT], hl
+    ; Leave CurrentFontLUT pointing at FontLUT_BlackOnLgray for the
+    ; body lines below; DrawString picks it up unchanged.
 
     ; Centre the Arabic tagline: 23 glyphs * 8 px = 184 px wide.
     ld      de, ABOUT_X + (ABOUT_W - 184) / 2
@@ -17624,15 +17709,13 @@ MouseBtnNow:    db 0
 MouseBtnPrev:   db 0
 MouseRaw:       db 0                    ; raw button byte from last GetMouse
 
-; Cursor rendering state -- VRAM save/restore so we can paint an 8x8 black
-; square on top of whatever's under the mouse, and put it back before the
-; next frame / UI redraw.
+; Cursor rendering state. With the V9938 hardware-sprite cursor we
+; only need to track the last-painted position for callers that read
+; CursorX/Y; the per-row scratch and save buffer the software cursor
+; used are gone.
 CursorX:        dw 0                    ; pixel X of the currently-drawn cursor
 CursorY:        db 0                    ; pixel Y of the currently-drawn cursor
 CursorVisible:  db 0
-CursorByteCol:  db 0                    ; scratch (byte col during erase/draw)
-CursorRowY:     db 0                    ; scratch (current y during loops)
-CursorBgPtr:    dw 0                    ; scratch (pointer into CursorBg)
 EntrySP:        dw 0                    ; SP at Main entry (restored on Shutdown)
 
 ; File I/O and navigation state.
@@ -18051,7 +18134,6 @@ FormScreenW:        ds FORM_MAX * 2
 TitleDrawBuf:       ds TITLE_BUF_MAX + 1
 UrlBuf:             ds URL_MAX + 1
 ChunkCmdBuf:        ds 16
-CursorBg:           ds 16
 Fcb:                ds 37
 LineCacheLineNo:    ds LineCacheMax * 2
 LineCacheDocOff:    ds LineCacheMax * 3   ; 24-bit per slot for doc_offsets

@@ -98,7 +98,6 @@ proc type_page {} {
 }
 
 after time 23 { shot dos-ready }
-after time 24 { type "MWBRO\r" }
 # Bumped to t=34 -- MWBRO.COM is now ~37 KB and the MSX-DOS 1 disk
 # load takes about 8 emulated seconds, so an earlier shot caught
 # the prompt mid-load and any keystrokes hit DOS instead of the
