@@ -18780,6 +18780,8 @@ RemoteImgOpen:
     ld      a, [SerialKind]
     cp      2                            ; PCX
     jr      z, .rioOk
+    cp      3                            ; BMP
+    jr      z, .rioOk
     cp      4                            ; SC6
     jr      nz, .rioFail
 .rioOk:
