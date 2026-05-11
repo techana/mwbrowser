@@ -15712,6 +15712,16 @@ SAVE_BTN2_X     equ SAVE_X + SAVE_W - SAVE_BTN_W - 32             ; "Cancel"
 ; the "[]" titlebar glyph. Source tag = 0 (saving the currently
 ; displayed page/image).
 OpenSaveFromTitlebar:
+    ; The Save popup only handles remote (web-bridge) URLs. Local
+    ; disk paths ("a:foo.htm") are silently no-op'd: the user can
+    ; just COPY in MSX-DOS, and the FileBuf-only save path was a
+    ; foot-gun if a >FILE_BUF_SIZE local file were saved after a
+    ; disk swap (we'd read past the end of FileBuf from a disk
+    ; that isn't even in the drive anymore).
+    ld      hl, UrlBuf
+    call    IsLocalUrl
+    ret     z                             ; local -> silently no-op
+
     xor     a
     ld      [SaveSource], a
     ld      [SaveStatus], a               ; SaveStatus_Idle
