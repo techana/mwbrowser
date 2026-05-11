@@ -54,7 +54,6 @@ VDP_PAL        equ 0x9A
 ;   call CALSLT      ; 3 B   (CALSLT pages the BIOS slot into page 0)
 BIOS_CHGMOD    equ 0x005F      ; change screen mode (A = mode)
 BIOS_RDSLT     equ 0x000C      ; read byte from a slot
-BIOS_GRPPRT    equ 0x008D      ; print char on graphics screen
 CALSLT         equ 0x001C      ; inter-slot call target
 EXPTBL         equ 0xFCC0      ; main BIOS slot table (read by CALSLT)
 
@@ -2317,8 +2316,6 @@ ClearContent:
     ld      a, COL_WHITE
     jp      FillRect
 
-VdpSetR14Zero:
-    xor     a
 VdpSetR14:
     ; quick_screen_draw / lesson #4: when WritesToPage is set,
     ; add 2 to the front-page R14 base so VRAM writes land in the
@@ -9321,179 +9318,18 @@ TagArea:
 ; from TagImg's tail: if PendingAreaCount = 0 it's a no-op, which is
 ; the normal case for <img>s that aren't image-maps.
 ;
-; TODO: the conversion loop below is currently disabled -- it still
-; has a state-corruption bug that inflates LinkCount across page
-; loads. The <map> / <area> / <img usemap> PARSING works end-to-end
-; (verified via PendingAreaCount=1 after an <area> tag), but the
-; attach step scrambles LinkCount in a way I haven't yet tracked
-; down. Until that's diagnosed, <area> rects are captured and
-; silently dropped -- pages render cleanly, hotspots just aren't
-; clickable yet.
+; Currently a stub: the <map> / <area> / <img usemap> PARSING works
+; end-to-end (verified via PendingAreaCount > 0 after an <area> tag),
+; but the attach step had a state-corruption bug that inflated
+; LinkCount across page loads. The conversion loop was removed
+; while we work on a clean rewrite; <area> rects are captured by
+; the parser and silently dropped here so pages still render
+; cleanly. Re-add when the LinkCount bug is diagnosed.
 AttachPendingAreas:
     xor     a
     ld      [PendingAreaCount], a
     ret
-    ld      a, [PendingAreaCount]
-    or      a
-    ret     z
-    ld      [ApRemaining], a
-    xor     a
-    ld      [ApIndex], a
-.apLoop:
-    ld      a, [LinkCount]
-    cp      LINK_MAX
-    jp      nc, .apDone                 ; link table full -> drop rest
 
-    ld      a, [ApIndex]
-    ld      e, a
-    ld      d, 0
-
-    ; Compute screen X1 = HtmlIndent + PendingAreaX1[i] (16-bit).
-    ld      hl, PendingAreaX1
-    add     hl, de
-    add     hl, de
-    ld      a, [hl]
-    inc     hl
-    ld      h, [hl]
-    ld      l, a                        ; HL = ax1
-    ld      a, [HtmlIndent]
-    ld      b, 0
-    ld      c, a
-    add     hl, bc                      ; HL = ax1 + indent
-
-    ; Stash as the link's StartX.
-    ld      a, [LinkCount]
-    push    af
-    ld      e, a
-    ld      d, 0
-    push    hl
-    ld      hl, LinkStartX
-    add     hl, de
-    add     hl, de
-    pop     bc                          ; BC = screen x1
-    ld      [hl], c
-    inc     hl
-    ld      [hl], b
-
-    ; Screen Y1 = HtmlImgOriginY + PendingAreaY1[i].
-    ld      a, [ApIndex]
-    ld      e, a
-    ld      d, 0
-    ld      hl, PendingAreaY1
-    add     hl, de
-    ld      a, [hl]
-    ld      b, a                        ; B = ay1
-    ld      a, [HtmlImgOriginY]
-    add     a, b
-    ld      b, a                        ; B = screen y1
-
-    pop     af                          ; A = LinkCount
-    ld      e, a
-    ld      d, 0
-    ld      hl, LinkStartY
-    add     hl, de
-    ld      [hl], b
-
-    ; Screen X2 = HtmlIndent + PendingAreaX2[i] (16-bit).
-    ld      a, [ApIndex]
-    ld      e, a
-    ld      d, 0
-    ld      hl, PendingAreaX2
-    add     hl, de
-    add     hl, de
-    ld      a, [hl]
-    inc     hl
-    ld      h, [hl]
-    ld      l, a
-    ld      a, [HtmlIndent]
-    ld      b, 0
-    ld      c, a
-    add     hl, bc
-
-    ld      a, [LinkCount]
-    push    af
-    ld      e, a
-    ld      d, 0
-    push    hl
-    ld      hl, LinkEndX
-    add     hl, de
-    add     hl, de
-    pop     bc
-    ld      [hl], c
-    inc     hl
-    ld      [hl], b
-
-    ; Screen Y2 = HtmlImgOriginY + PendingAreaY2[i].
-    ld      a, [ApIndex]
-    ld      e, a
-    ld      d, 0
-    ld      hl, PendingAreaY2
-    add     hl, de
-    ld      a, [hl]
-    ld      b, a
-    ld      a, [HtmlImgOriginY]
-    add     a, b
-    ld      b, a
-
-    pop     af                          ; A = LinkCount
-    ld      e, a
-    ld      d, 0
-    ld      hl, LinkEndY
-    add     hl, de
-    ld      [hl], b
-
-    ; Copy the href from PendingAreaUrl[i] into LinkUrls[LinkCount].
-    ; Both use the same per-slot stride (LINK_URL_MAX + 1).
-    ld      a, [ApIndex]
-    call    .apSlotOff                  ; HL = offset into url table
-    ld      de, PendingAreaUrl
-    add     hl, de
-    ld      b, h
-    ld      c, l                        ; BC = source
-
-    ld      a, [LinkCount]
-    call    .apSlotOff                  ; HL = offset for dest
-    ld      de, LinkUrls
-    add     hl, de
-    ex      de, hl                      ; DE = dest
-    ld      h, b
-    ld      l, c                        ; HL = source
-    ld      b, low(LINK_URL_MAX + 1)
-.apCopy:
-    ld      a, [hl]
-    ld      [de], a
-    inc     hl
-    inc     de
-    or      a
-    jr      z, .apCopyDone
-    djnz    .apCopy
-.apCopyDone:
-
-    ld      a, [LinkCount]
-    inc     a
-    ld      [LinkCount], a
-    ld      a, [ApIndex]
-    inc     a
-    ld      [ApIndex], a
-    ld      a, [ApRemaining]
-    dec     a
-    ld      [ApRemaining], a
-    jp      nz, .apLoop
-.apDone:
-    xor     a
-    ld      [PendingAreaCount], a
-    ret
-
-; Helper: A -> HL = A * (LINK_URL_MAX + 1) = A * 256. Matches the
-; stride used by TagA's url copy (see LINK_URL_MAX definition).
-.apSlotOff:
-    ld      h, a
-    ld      l, 0                        ; HL = idx * 256
-    ret
-
-ApIndex:     db 0
-ApRemaining: db 0
-ApTrace:     db 0
 ExtPcx:          db ".pcx", 0
 ExtBmp:          db ".bmp", 0
 
@@ -11707,7 +11543,6 @@ ColorTable:
 ; pixel budget.
 ; ----------------------------------------------------------------------------
 
-TABLE_LEFT_PAD  equ 4
 TABLE_ROW_GAP   equ 2                   ; vertical pixels between rule and text
 
 TagTableTag:
@@ -16137,7 +15972,6 @@ OpenSaveFromTitlebar:
     ret     z                             ; local -> silently no-op
 
     xor     a
-    ld      [SaveSource], a
     ld      [SaveStatus], a               ; SaveStatus_Idle
     ld      [SaveBytesWritten], a
     ld      [SaveBytesWritten + 1], a
@@ -16209,14 +16043,6 @@ OpenSaveFromTitlebar:
     jr      OpenSave
 
 BridgeSizeCmd: db "SIZE", 0
-
-; Entry point for the future link-click-on-unrecognised-file path.
-; Source tag = 1.  Caller is expected to have populated SaveFilename
-; and (optionally) SaveByteCount first.
-OpenSaveFromLink:
-    ld      a, 1
-    ld      [SaveSource], a
-    ; fall through
 
 OpenSave:
     call    PopupSaveFocusAndUnfocusChrome
@@ -16951,9 +16777,6 @@ SaveAsLabel:         db "Save as: ", 0
 SavePathPrefix:      db "A:", 0
 SaveBtnSaveMsg:      db "Save", 0
 SaveBtnCancelMsg:    db "Cancel", 0
-; Phase 1 placeholder filename used by OpenSaveFromTitlebar until
-; Phase 2 parses UrlBuf into a real 8.3 name.
-SaveStubName:        db "PAGE    .HTM", 0    ; 12 chars + NUL = 13
 
 DrawAboutPopup:
     ; Shared frame: LGRAY body + black border + title row + X close.
@@ -19183,7 +19006,6 @@ WG_CHK_OFFF     equ 0x0C                    ; focused checkbox variants
 WG_CHK_ONF      equ 0x0D
 WG_RAD_OFFF     equ 0x0E                    ; focused radio variants
 WG_RAD_ONF      equ 0x0F
-WG_FIRST        equ 0x01
 WG_LAST         equ 0x0F
 
 WG_HEIGHT       equ 14
@@ -19640,7 +19462,6 @@ LineCacheLastLine:  dw 0
 ; lookup loop's bookkeeping doesn't have to juggle stack pushes
 ; through 16-bit comparisons. Only touched while the routine runs;
 ; nobody reads these afterwards.
-LcloTarget:     db 0, 0, 0              ; saved target_doc_offset (24-bit)
 LcloBestOff:    db 0, 0, 0              ; best entry doc_offset so far (24-bit)
 
 ; SlideTarget: 24-bit byte_offset the next EnsureWindow{Local,Remote}
@@ -19682,8 +19503,6 @@ ThumbBusy:      db 0
 ThumbCapByte:   db 0xFD                 ; written per draw based on ThumbBusy
 AboutOpen:      db 0                    ; 1 while the Help popup is on screen
 SaveOpen:       db 0                    ; 1 while the Save-file popup is on screen
-SaveSource:     db 0                    ; 0 = titlebar [] (save current view),
-                                        ; 1 = link click to unrecognised file
 SaveFilename:   ds 13                   ; 8.3 DOS filename + NUL terminator
 SaveByteCount:  dw 0                    ; size in bytes if known, 0 = unknown
 SaveBytesWritten: dw 0                  ; bytes streamed to dest during DoSave

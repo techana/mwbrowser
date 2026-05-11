@@ -4045,55 +4045,6 @@ def _history_options(ip):
     return "".join(opts)
 
 
-def _detect_legacy_os(user_agent):
-    """Detect if the client is running a legacy OS that needs CP-1256.
-    Returns a short OS name string or empty string if not legacy."""
-    if not user_agent:
-        return ""
-    ua = user_agent.lower()
-    if "win16" in ua or "windows 3." in ua:
-        return "Windows 3.x"
-    if "windows 95" in ua or "win95" in ua:
-        return "Windows 95"
-    if "windows 98" in ua or "win98" in ua:
-        return "Windows 98"
-    if "windows nt 4" in ua:
-        return "Windows NT 4.0"
-    if "windows nt 5.0" in ua or "windows 2000" in ua:
-        return "Windows 2000"
-    if "windows ce" in ua:
-        return "Windows CE"
-    if "mac_powerpc" in ua or "macintosh" in ua:
-        # Classic Mac OS (pre-OS X) or early OS X
-        if "os x" not in ua and "macos" not in ua:
-            return "Mac OS Classic"
-    return ""
-
-
-def _is_arabic_page(url):
-    """Heuristic: does the URL likely serve Arabic content?"""
-    u = url.lower()
-    # Arabic TLDs / known Arabic sites
-    arabic_hints = (
-        ".sa/", ".sa?", ".ae/", ".ae?", ".eg/", ".eg?",
-        ".kw/", ".kw?", ".qa/", ".qa?", ".bh/", ".bh?",
-        ".om/", ".om?", ".jo/", ".jo?", ".lb/", ".lb?",
-        ".iq/", ".iq?", ".sy/", ".sy?", ".ps/", ".ps?",
-        ".ly/", ".ly?", ".tn/", ".tn?", ".dz/", ".dz?",
-        ".ma/", ".ma?", ".sd/", ".sd?", ".ye/", ".ye?",
-        "/ar/", "/ar?", "/arabic", "arabic.",
-        "aljazeera", "alarabiya", "bbc.com/arabic",
-        "alburaq", "misbar",
-    )
-    for hint in arabic_hints:
-        if hint in u:
-            return True
-    # Check for Arabic percent-encoded chars (%D8, %D9 are Arabic UTF-8 lead bytes)
-    if "%d8" in u or "%d9" in u or "%D8" in u or "%D9" in u:
-        return True
-    return False
-
-
 # ── Landing page logo (generated once at startup) ────────────────────────
 _LOGO_GIF = b""  # populated by _generate_logo() -- still kept for callers
                  # outside the MSX path; the MSX landing page uses _LOGO_PCX.
