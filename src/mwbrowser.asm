@@ -15759,7 +15759,31 @@ OpenSaveFromTitlebar:
     ; target before clicking Save.
     call    DestFcbToSaveFilename
 
-    ld      hl, [WindowLen]
+    ; Snapshot 24-bit DocOffset so CloseSave can refetch the user's
+    ; original window after the chunk-loop trashed FileBuf.
+    ld      hl, [DocOffset]
+    ld      [SaveResumeOffset], hl
+    ld      a, [DocOffset + 2]
+    ld      [SaveResumeOffset + 2], a
+
+    ; Size estimate = SerialPageTotal * SERIAL_CHUNK_RANGE_BYTES
+    ; (0x1800 = 6 KB). 16-bit product; saturates at 0xFFFF for very
+    ; large docs -- the live progress counter is exact, the headline
+    ; "Size:" is only ever an estimate.
+    ld      a, [SerialPageTotal]
+    or      a
+    jr      nz, .ostHaveTotal
+    inc     a                               ; 0 -> 1 (defensive)
+.ostHaveTotal:
+    ld      h, a
+    ld      l, 0                            ; HL = total * 256
+    add     hl, hl                          ; * 512
+    add     hl, hl                          ; * 1024
+    add     hl, hl                          ; * 2048
+    ld      d, h
+    ld      e, l                            ; DE = total * 2048
+    add     hl, hl                          ; HL = total * 4096
+    add     hl, de                          ; HL = total * 6144 (mod 16-bit)
     ld      [SaveByteCount], hl
     jr      OpenSave
 
@@ -15780,30 +15804,58 @@ OpenSave:
     jp      DrawSavePopup
 
 CloseSave:
-    ; Phase 2 will: if a transfer is mid-flight, abort + delete the
-    ; partial file here. Phase 1 has nothing in flight to clean up.
+    ; If DoSave's chunk-loop reached the wire (SaveStatus left Idle),
+    ; FileBuf no longer holds the user's original window. Refetch it
+    ; from SaveResumeOffset before we paint chrome back, so the page
+    ; the user sees afterwards is the page they were looking at when
+    ; they opened the popup.
+    ld      a, [SaveStatus]
+    or      a                               ; SaveStatus_Idle == 0
+    jr      z, .csNoRefetch
+    ld      hl, [SaveResumeOffset]
+    ld      [SlideTarget], hl
+    ld      a, [SaveResumeOffset + 2]
+    ld      [SlideTarget + 2], a
+    call    EnsureWindowRemote
+    ; If the refetch fails we leave FileBuf as-is; the user can hit
+    ; Refresh to recover. Don't fail-close the popup over it.
+.csNoRefetch:
     xor     a
     ld      [SaveOpen], a
     call    PopupRestoreFocusAndPaintChrome
     jp      RestorePopupBg              ; HMMM-blit the bg back
 
-; DoSave: write FileBuf[0..WindowLen] to disk via BDOS sequential
-; F_WRITE (function 0x15). Records the byte count live to the popup
-; status row, and polls Esc between records so the user can cancel
-; mid-stream (closes + deletes the partial dest).
+; DoSave: stream the remote source from offset 0 to the dest FCB
+; via the web bridge, 6 KB chunks at a time.
 ;
-; Caveats (deferred):
-;   * Sources from FileBuf, which only holds the current window
-;     (FILE_BUF_SIZE = 6.5 KB). Files larger than that get silently
-;     truncated to FILE_BUF_SIZE bytes. The proper fix is a
-;     dual-FCB source-copy loop (open UrlBuf's file, F_READ ->
-;     F_WRITE), but a first cut of that turned up FCB-area
-;     corruption that needs more investigation (TODO Phase 3.5).
-;   * Image-mode (.SC6/.PCX/.BMP) saves still write stale FileBuf
-;     content; the image bytes were streamed straight to VRAM and
-;     aren't in FileBuf. Same source-copy fix would address this.
-;   * File size rounded up to the next 128-byte record boundary
-;     (MSX-DOS 1 has no byte-granular write).
+; Each chunk:
+;   1. Set SlideTarget to the current SaveStreamOff (24-bit).
+;   2. EnsureWindowRemote -- issues "GET CHUNK <hex_offset>" and
+;      drains the response body into FileBuf, updating WindowLen
+;      with the byte count received (clamped to FILE_BUF_SIZE; the
+;      bridge serves SERIAL_CHUNK_RANGE_BYTES = 6 KB so a full
+;      response fits with ~512 B headroom).
+;   3. Zero-fill the trailing partial record so MSX-DOS doesn't
+;      flush FileBuf garbage past EOF (only matters on the final
+;      short chunk; full 6 KB chunks are already multiple of 128).
+;   4. DOS_WRITE the WindowLen bytes in 128-B records, polling Esc
+;      between records for user-cancel.
+;   5. Stop when WindowLen == 0 (bridge returned empty body) or
+;      when WindowLen < SERIAL_CHUNK_RANGE_BYTES (short = last
+;      chunk).
+;
+; FileBuf is trashed by the time DoSave returns; CloseSave refetches
+; the user's original window via SaveResumeOffset so the page they
+; were viewing comes back when the popup closes.
+;
+; Notes:
+;   * MSX-DOS 1 writes whole 128-B records, so the dest file size
+;     gets rounded up to the next record boundary. The bridge
+;     stream byte count itself is exact.
+;   * Local URLs are gated off at OpenSaveFromTitlebar (use DOS
+;     COPY); DoSave only runs for web-bridge sources.
+SERIAL_CHUNK_RANGE_BYTES equ 6 * 1024
+
 DoSave:
     ; If the previous save already completed, Save button is showing
     ; "OK" -- treat a click on it the same as Cancel / X / Esc.
@@ -15816,11 +15868,37 @@ DoSave:
     xor     a
     ld      [SaveBytesWritten], a
     ld      [SaveBytesWritten + 1], a
+    ld      [SaveStreamOff], a
+    ld      [SaveStreamOff + 1], a
+    ld      [SaveStreamOff + 2], a
     call    PaintSaveSizeProgress
 
-    ; --- Zero-fill the trailing partial record so we don't write
-    ;     FileBuf garbage past EOF.
+    ; --- F_CREATE the dest once, up front. ---
+    call    ResetSaveDestFcbTail
+    ld      de, SaveDestFcb
+    ld      c, DOS_CREATE
+    call    BDOS_ENTRY
+    or      a
+    jp      nz, .dsFailed
+
+.dsChunk:
+    ; Fetch next 6 KB chunk into FileBuf.
+    ld      hl, [SaveStreamOff]
+    ld      [SlideTarget], hl
+    ld      a, [SaveStreamOff + 2]
+    ld      [SlideTarget + 2], a
+    call    EnsureWindowRemote
+    or      a
+    jp      nz, .dsFailedClose
+
+    ; If WindowLen == 0 the bridge has no more bytes for us; close out.
     ld      hl, [WindowLen]
+    ld      a, h
+    or      l
+    jp      z, .dsCloseAndDone
+
+    ; Zero-fill the trailing partial record (only nonzero work when
+    ; WindowLen isn't a multiple of 128 -- i.e. the last chunk).
     ld      a, l
     and     0x7F
     jr      z, .dsNoFill
@@ -15838,19 +15916,8 @@ DoSave:
     djnz    .dsZF
 .dsNoFill:
 
-    ; --- F_CREATE the dest. ---
-    call    ResetSaveDestFcbTail
-    ld      de, SaveDestFcb
-    ld      c, DOS_CREATE
-    call    BDOS_ENTRY
-    or      a
-    jp      nz, .dsFailed
-
-    ; --- Compute record count: (WindowLen + 127) / 128. ---
+    ; B = record count = (WindowLen + 127) / 128.
     ld      hl, [WindowLen]
-    ld      a, h
-    or      l
-    jr      z, .dsCloseAndDone
     ld      bc, 127
     add     hl, bc
     ld      a, h
@@ -15860,9 +15927,8 @@ DoSave:
     rlca
     and     1
     add     a, b
-    ld      b, a                          ; B = record count
+    ld      b, a
 
-    ; --- Write loop ---
     ld      hl, FileBuf
 .dsLoop:
     ; Esc-cancel poll between records.
@@ -15895,20 +15961,39 @@ DoSave:
     ld      de, 128
     add     hl, de
 
-    ; Bump byte counter and maybe repaint progress (every 16 records).
+    ; Bump byte counter and repaint progress every 8 records (1 KB).
     push    bc
     push    hl
     ld      hl, [SaveBytesWritten]
     ld      bc, 128
     add     hl, bc
     ld      [SaveBytesWritten], hl
-    ld      a, h
-    and     0x07
-    or      l
+    ld      a, l
+    and     0x03                            ; multiple of 4*128 = 512 B
+    or      h
     call    z, PaintSaveSizeProgress
     pop     hl
     pop     bc
     djnz    .dsLoop
+
+    ; Chunk drained. Was it short (< 6 KB) -> last chunk -> done.
+    ld      hl, [WindowLen]
+    ld      de, SERIAL_CHUNK_RANGE_BYTES
+    or      a
+    sbc     hl, de
+    jp      c, .dsCloseAndDone              ; WindowLen < 6 KB
+
+    ; Advance stream offset by SERIAL_CHUNK_RANGE_BYTES (24-bit).
+    ld      hl, [SaveStreamOff]
+    ld      de, SERIAL_CHUNK_RANGE_BYTES
+    add     hl, de
+    ld      [SaveStreamOff], hl
+    jr      nc, .dsNoHi
+    ld      a, [SaveStreamOff + 2]
+    inc     a
+    ld      [SaveStreamOff + 2], a
+.dsNoHi:
+    jp      .dsChunk
 
 .dsCloseAndDone:
     ld      de, SaveDestFcb
@@ -15916,11 +16001,9 @@ DoSave:
     call    BDOS_ENTRY
     or      a
     jp      nz, .dsFailed
-    ; Force Progress == Size for the final paint (the per-record bump
-    ; rounds up to 128, so the count could overshoot the real source
-    ; size on the last record).
-    ld      hl, [SaveByteCount]
-    ld      [SaveBytesWritten], hl
+    ; Match Size to the exact byte total so Progress hits 100 %.
+    ld      hl, [SaveBytesWritten]
+    ld      [SaveByteCount], hl
     ld      a, SaveStatus_Done
     ld      [SaveStatus], a
     call    PaintSaveSizeProgress
@@ -19156,6 +19239,15 @@ SaveByteCount:  dw 0                    ; size in bytes if known, 0 = unknown
 SaveBytesWritten: dw 0                  ; bytes streamed to dest during DoSave
 SaveStatus:     db 0                    ; SaveStatus_Idle / Saving / Done / Failed
 SaveStatusBuf:  ds 24                   ; scratch for "Progress: XX.X KB" etc.
+; 24-bit DocOffset snapshot taken at OpenSaveFromTitlebar. Streaming
+; save uses EnsureWindowRemote (GET CHUNK) to walk the doc from
+; offset 0, which trashes the current display window. CloseSave
+; refetches from this offset to put the user back where they were.
+SaveResumeOffset: db 0, 0, 0
+; Stream cursor (24-bit byte offset into the source doc) used by the
+; DoSave chunk-loop. Mirrors SlideTarget's role for the scroll path
+; but kept separate so a cancelled save doesn't strand SlideTarget.
+SaveStreamOff:    db 0, 0, 0
 ; Popup-modal focus save: any popup-open zeroes the visible focus
 ; (FOC_* sentinel 0xFF doesn't match any button), so chrome paints
 ; with no focused frame (address bar reverts to its DGRAY unfocused
