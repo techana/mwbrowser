@@ -13895,11 +13895,18 @@ CopyHrefToUrlBuf:
 ; NavigateAndFocusContent: load UrlBuf then shift focus to the content
 ; area so the user can scroll immediately. Used by Enter in the address
 ; bar, Refresh button, link clicks, and Enter on a Tab-focused link.
+;
+; Focus = FOC_CONTENT must be set BEFORE NavigateToCurrentUrl runs:
+; NavigateToCurrentUrl now paints the toolbar and prerenders the next
+; page (which mirrors current chrome onto the back page) before
+; returning. If Focus is still FOC_ADDRESS at those paint/mirror
+; moments, the back page captures an address-bar-focused chrome and
+; every PageDown fast-flip reveals that stale focus frame even though
+; Focus actually moved on.
 NavigateAndFocusContent:
-    call    NavigateToCurrentUrl
     ld      a, FOC_CONTENT
     ld      [Focus], a
-    jp      PaintToolbar
+    jp      NavigateToCurrentUrl
 
 ; NavigateToCurrentUrl: load whatever is in UrlBuf and, on success, push
 ; it onto the ring-buffered history. Uses Busy to flip the toolbar to
