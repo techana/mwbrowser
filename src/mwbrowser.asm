@@ -515,28 +515,34 @@ OnAddress:
     call    NavigateAndFocusContent
     jp      MainLoop
 NotAddrEnter:
+    ; URL-edit hot path: typing, backspace, cursor arrows, clear --
+    ; none of these change the focused element, the button glyphs,
+    ; or the busy state, so a full PaintToolbar redraw is wasted
+    ; work AND introduces a per-keystroke flicker on Back / Refresh
+    ; / Forward. Repaint just the address bar via the focused
+    ; shortcut.
     cp      KEY_BACKSPACE
     jr      nz, NotBackspace
     call    UrlBackspace
-    call    PaintToolbar
+    call    PaintAddressBarFocused
     jp      MainLoop
 NotBackspace:
     cp      KEY_LEFT
     jr      nz, NotAddrLeft
     call    UrlCursorLeft
-    call    PaintToolbar
+    call    PaintAddressBarFocused
     jp      MainLoop
 NotAddrLeft:
     cp      KEY_RIGHT
     jr      nz, NotAddrRight
     call    UrlCursorRight
-    call    PaintToolbar
+    call    PaintAddressBarFocused
     jp      MainLoop
 NotAddrRight:
     cp      KEY_CLS                     ; Ctrl+L / MSX CLS
     jr      nz, NotCls
     call    UrlClear
-    call    PaintToolbar
+    call    PaintAddressBarFocused
     jp      MainLoop
 NotCls:
     ; Accept Latin printable (0x20..0x7E) plus the high-half ISO-8859-6
@@ -554,7 +560,7 @@ NotCls:
     cp      0xFF
     jp      z, MainLoop
     call    UrlInsert
-    call    PaintToolbar
+    call    PaintAddressBarFocused
     jp      MainLoop
 
 OnContent:
@@ -2153,41 +2159,19 @@ RectH:        db 0
 ; Pages split at 0x4000 because R#14 does not auto-increment past the 14-bit
 ; internal VRAM pointer; each 16 KB slab is filled separately.
 ClearContent:
+    ; HMMV via FillRect: hardware fills the full 512x212 visible
+    ; bitmap in a single command (~10 ms). No R14 juggling, no
+    ; VdpBlank/Unblank dance, no visible black flash on boot --
+    ; the original lesson-#2 blank-during-fill trick mattered when
+    ; we were CPU-OUT-streaming 27 KB through the data port; HMMV
+    ; arbitrates VRAM access internally so the display can keep
+    ; scanning out without slowing the fill.
+    ld      b, 0                            ; x byte col
+    ld      c, 0                            ; y
+    ld      d, WIDTH / 4                    ; width in byte cols (= 128)
+    ld      e, 212                          ; height (full visible bitmap)
     ld      a, COL_WHITE
-    call    PackColour
-    ld      [PackedColour], a
-
-    ; Blank the display so the VDP arbiter hands 100 % of VRAM
-    ; bandwidth to the Z80 for the 27 KB fill. The screen flashes
-    ; black only briefly (~200 ms total) and the saving is real --
-    ; VdpFill at 24 T/byte vs ~64 T/byte under active-raster wait
-    ; states (~2.7x). See lesson #2 in research/zero-latency
-    ; screen6/LESSONS.md.
-    call    VdpBlank
-
-    ; Screen 6's visible 212 lines × 128 bytes = 27 136 bytes = 0x6A00
-    ; sit at VRAM 0x00000..0x06A00. The first 16 KB (rows 0..127) live
-    ; in R14=0's window (A14..A16=000 -> 0x00000..0x03FFF); the trailing
-    ; 10 752 bytes (rows 128..211) sit in R14=1's window (A14..A16=001
-    ; -> 0x04000..0x07FFF). Earlier code wrote the second pass with
-    ; R14=2 (== 0x08000..0x0BFFF, off-screen scratch), which left the
-    ; bottom half of the canvas in whatever state VDP had after CHGMOD 6
-    ; -- the visible "gray bottom half on startup" bug.
-    call    VdpSetR14Zero                   ; R14 = 0 -> 0x00000..0x03FFF
-    ld      hl, 0x0000
-    ld      de, 0x4000
-    ld      a, [PackedColour]
-    call    VdpFill
-
-    ld      a, 1                            ; R14 = 1 -> 0x04000..0x07FFF
-    call    VdpSetR14
-    ld      hl, 0x0000
-    ld      de, 212 * 128 - 0x4000          ; 0x2A00 -> rows 128..211
-    ld      a, [PackedColour]
-    call    VdpFill
-
-    call    VdpSetR14Zero
-    jp      VdpUnblank
+    jp      FillRect
 
 VdpSetR14Zero:
     xor     a
@@ -3069,6 +3053,19 @@ DrawBitmap:
     dec     e
     jr      nz, .nextRow
     ret
+
+; PaintAddressBarFocused: address-bar-only repaint shortcut for the
+; URL-typing hot path. The full PaintToolbar redraws the Back /
+; Refresh / Forward buttons + address bar; when the user is just
+; editing the URL we don't need to touch the buttons, and skipping
+; them eliminates the visible per-keystroke toolbar flicker.
+; Reachable only from the OnAddress dispatch (Focus is FOC_ADDRESS by
+; definition), so the focused-border path is the only one needed --
+; set ButtonState directly to BTN_FOCUSED.
+PaintAddressBarFocused:
+    ld      a, BTN_FOCUSED
+    ld      [ButtonState], a
+    ; fall through
 
 ; PaintAddressBar: white interior + focus-coloured border + URL text.
 ; Uses [ButtonState] for focus bit.
