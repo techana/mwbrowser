@@ -332,6 +332,59 @@ Main:
     ld      a, [UrlBuf]
     or      a
     jp      z, MainLoop
+
+    ; A bare filename (no ':' at all) should load from the current
+    ; MSX-DOS drive, not the web bridge. Drive-letter URLs ("a:foo")
+    ; and scheme URLs ("http://x") both contain a ':', so a single
+    ; "any colon in UrlBuf" scan handles both cases. Bare ".../IP"
+    ; literals are now also treated as local; type the explicit
+    ; "http://1.2.3.4" if you want the bridge.
+    ld      hl, UrlBuf
+    ld      e, 0                           ; E = length counter
+.cmdScanColon:
+    ld      a, [hl]
+    or      a
+    jr      z, .cmdBareName
+    cp      ':'
+    jp      z, .cmdNavigate                ; found ':' -> leave UrlBuf alone
+    inc     hl
+    inc     e
+    jr      .cmdScanColon
+
+.cmdBareName:
+    ; Cap E so the shifted copy fits: E + 2 (prefix) + 1 (NUL) <= URL_MAX + 1.
+    ld      a, e
+    cp      URL_MAX - 2
+    jr      c, .cmdLenOk
+    ld      e, URL_MAX - 2
+    ld      hl, UrlBuf + URL_MAX - 2
+    ld      [hl], 0                        ; force terminator before shift
+.cmdLenOk:
+    ; memmove UrlBuf right 2 bytes via LDDR. Source last byte =
+    ; UrlBuf + E (NUL terminator), dest last byte = UrlBuf + E + 2,
+    ; count = E + 1 bytes (whole string including NUL).
+    ld      a, e                           ; save original length
+    ld      d, 0
+    ld      hl, UrlBuf
+    add     hl, de                         ; HL = UrlBuf + E
+    ld      d, h
+    ld      e, l
+    inc     de
+    inc     de                             ; DE = UrlBuf + E + 2
+    ld      c, a
+    ld      b, 0
+    inc     bc                             ; BC = E + 1
+    lddr
+
+    ; Get current MSX-DOS drive: function 0x19, returns A = 0=A,1=B,...
+    ld      c, 0x19
+    call    BDOS_ENTRY
+    add     a, 'A'
+    ld      [UrlBuf], a
+    ld      a, ':'
+    ld      [UrlBuf + 1], a
+
+.cmdNavigate:
     call    NavigateAndFocusContent
 
 MainLoop:
