@@ -2018,35 +2018,68 @@ SetVramReadPos:
 
 ; FillRect(B=x/4, C=y, D=w/4, E=h, A=colour). Byte-aligned.
 ;
-; TODO: replace this CPU-loop with a V9938 HMMV command (see the
-; VdpCmd block near line 1880). Biggest single CPU win in the
-; codebase: ClearContentArea is a ~100-150 ms FillRect per scroll;
-; HMMV does the same in ~5-10 ms with the CPU free to do other
-; work meanwhile.
+; Hardware path: kicks off a V9938 HMMV (high-speed move-VRAM-value)
+; rectangle fill via the command engine and waits for completion.
+; ~10x faster than the old CPU `out` loop for big rectangles
+; (ClearContentArea drops from ~150 ms to ~15 ms per scroll); a wash
+; or slight overhead for single-row rectangles, which we accept since
+; they're rare and the code path is much simpler than maintaining two
+; implementations.
+;
+; The destination page is taken from WritesToPage so the lesson-4
+; page-flip + prerender still target the back buffer correctly.
 FillRect:
     push    bc
-    call    PackColour
+    call    PackColour                       ; A = packed colour byte
     pop     bc
-    ld      [PackedColour], a
-.nextRow:
-    push    bc
-    push    de
-    call    SetVramWritePos
-    pop     de
-    push    de
-    ld      a, [PackedColour]
-    ld      b, d
-.rowLoop:
-    out     (VDP_DATA), a
-    djnz    .rowLoop
-    pop     de
-    pop     bc
-    inc     c
-    dec     e
-    jr      nz, .nextRow
-    ret
+    ld      [PackedColour], a                ; kept for ClearContent's bulk VdpFill
+    ld      [FillRectCmd + 12], a            ; HMMV CLR
 
-PackedColour:  db 0
+    ; DX = x_byte_col * 4 (convert to pixel-X).
+    push    bc
+    ld      l, b
+    ld      h, 0
+    add     hl, hl
+    add     hl, hl
+    ld      [FillRectCmd + 4], hl
+
+    ; DY = y + 256 * WritesToPage (10-bit page-aware Y).
+    pop     bc
+    ld      l, c
+    ld      a, [WritesToPage]
+    ld      h, a
+    ld      [FillRectCmd + 6], hl
+
+    ; NX = w_byte_col * 4 (pixel width).
+    ld      l, d
+    ld      h, 0
+    add     hl, hl
+    add     hl, hl
+    ld      [FillRectCmd + 8], hl
+
+    ; NY = h.
+    ld      l, e
+    ld      h, 0
+    ld      [FillRectCmd + 10], hl
+
+    ld      hl, FillRectCmd
+    call    VdpCmd
+    jp      VdpCmdWait
+
+; HMMV register block. SX/SY unused for fills; CLR / DX / DY / NX / NY
+; patched per call. ARG = 0 (forward direction, no source page bits).
+FillRectCmd:
+    dw      0                                ; +0..1   SX (unused)
+    dw      0                                ; +2..3   SY (unused)
+    dw      0                                ; +4..5   DX  <- patched
+    dw      0                                ; +6..7   DY  <- patched
+    dw      0                                ; +8..9   NX  <- patched
+    dw      0                                ; +10..11 NY  <- patched
+    db      0                                ; +12     CLR <- patched
+    db      0                                ; +13     ARG
+    db      0xC0                             ; +14     CMD = HMMV
+
+PackedColour:  db 0                          ; ClearContent's bulk fill reads this
 
 DrawHLine:
     ld      e, 1
