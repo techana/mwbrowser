@@ -4295,6 +4295,10 @@ UrlIsBinary:
     sub     e
     dec     a                               ; subtract the '.' itself
     jr      z, .uibBinary                   ; trailing dot ("foo.") -> binary
+    cp      2
+    jr      c, .uibNoDot                    ; 1-char ext (IP literal's
+                                            ; ".1", our own ".2" save-
+                                            ; bumps, etc.) -> displayable
     ld      [UibExtLen], a
     inc     de                              ; DE -> first ext char
     ld      hl, DisplayableExts
@@ -9478,9 +9482,16 @@ ImgStreamRefill:
 ; ImgStreamByte: returns A = next byte, CF=1 on EOF. Remote session
 ; pulls from the UART instead of the FCB.
 ImgStreamByte:
-    ld      a, [IsRemoteSession]
-    or      a
-    jp      nz, RemoteImgByte
+    ; Always drain from ImgBuf first, regardless of session type.
+    ; The BMP renderer's .bmpInBuf branch pre-positions ImgReadPtr at
+    ; the first pixel byte (e.g. ImgBuf + 118 for the standard 4 bpp
+    ; header) with the right residual ImgReadLen so the leading bytes
+    ; that are already in the 128-byte peek don't get re-fetched.
+    ; The earlier "jp nz, RemoteImgByte" shortcut skipped that
+    ; setup entirely and clipped the bottom-most row of remote BMPs
+    ; by ImgBuf - pixel_offset bytes (= 10 bytes / 20 pixels at
+    ; standard headers), cascading the shift through every later
+    ; row as the per-row counter ran out before EOF.
     ld      a, [ImgReadLen]
     or      a
     jr      z, .isbRefill
@@ -9493,7 +9504,7 @@ ImgStreamByte:
     or      a
     ret
 .isbRefill:
-    call    ImgStreamRefill
+    call    ImgStreamRefill                 ; dispatches by IsRemoteSession
     ret     c
     jr      ImgStreamByte
 
@@ -9554,12 +9565,13 @@ RenderSc6File:
     call    ImgStreamOpenName
     jp      c, .rsfOpenFail             ; file not found -> let caller fallback
 
-    ; Lesson #2: blank the display for the duration of the bulk
-    ; pixel transfer so the V9938 arbiter doesn't steal VRAM cycles.
-    ; All exit paths below jump to .rsfDone or .rsfNoTy -- both are
-    ; routed through the .rsfFinish epilogue that re-enables the
-    ; display. (.rsfOpenFail can't reach here.)
-    call    VdpBlank
+    ; Earlier we VdpBlank'd here (lesson #2) to free the V9938
+    ; arbiter from background fetches and shave ~3 ms off a 5 KB
+    ; render. The visible side effect on MSX2 is a full-screen
+    ; striped flash (R1.BL=0 in Screen 6 reveals the underlying
+    ; pattern table) that lasts long enough to be jarring. The
+    ; saving isn't worth the ugly transition; keep the display
+    ; lit for the whole render.
 
     ; Commit any pending text line now so both the fast-path and the
     ; streaming decoder start at a clean Y cursor. LineFlush is also
@@ -9642,7 +9654,6 @@ RenderSc6File:
 .rsfFastLC:
     ld      [HtmlLineCount], hl
     call    ImgStreamClose
-    call    VdpUnblank                  ; balance VdpBlank at entry
     scf                                 ; image "handled"
     ret
 
@@ -9759,7 +9770,6 @@ RenderSc6File:
 .rsfTyOk:
     ld      [TextY], a
 .rsfNoTy:
-    call    VdpUnblank                  ; balance VdpBlank at entry
     scf                                 ; CF=1 -> image was handled
     ret
 
@@ -10344,7 +10354,7 @@ RenderBmpFile:
     ld      b, a
     ld      a, [BmpPackIdx]
     ld      c, a
-    ld      a, 2
+    ld      a, 3
     sub     c
     add     a, a
     ld      c, a                        ; C = (3 - idx) * 2
@@ -10562,13 +10572,13 @@ BmpLumaToPalette:
     ld      a, 2                        ; white
     ret
 .bltBlack:
-    ld      a, 2
+    ld      a, 3                        ; black palette index 3
     ret
 .bltDgray:
     xor     a                           ; dgray palette index 0
     ret
 .bltLgray:
-    ld      a, 2
+    ld      a, 1                        ; lgray palette index 1
     ret
 
 ; PcxGetDecodedByte: returns A = next decoded PCX byte (after RLE
@@ -18779,6 +18789,8 @@ RemoteImgOpen:
     jr      c, .rioFail
     ld      a, [SerialKind]
     cp      2                            ; PCX
+    jr      z, .rioOk
+    cp      3                            ; BMP
     jr      z, .rioOk
     cp      4                            ; SC6
     jr      nz, .rioFail
