@@ -5255,21 +5255,37 @@ FlushPendingWs:
 ; lists. Preserves HL.
 EmitListBullet:
     push    hl
+    ; RTL list (<ul dir="rtl"> / <ol dir="rtl">): stamp CELL_RTL onto
+    ; EmitCellAttr while the marker cells go through EmitSink so the
+    ; bullet/digit cells join the surrounding Arabic run. Without
+    ; this, BiDi treats them as a separate LTR mini-run and strands
+    ; "N." on the visual LEFT of an otherwise right-aligned RTL line.
+    ; Saved + restored across the marker emit so the caller's
+    ; baseline attr (typically 0) is preserved for the item's text
+    ; cells that follow (their Arabic glyphs come back through
+    ; ArFlush which sets CELL_RTL on its own).
+    ld      a, [EmitCellAttr]
+    ld      [_lbSavedAttr], a
+    ld      a, [HtmlDir]
+    and     CELL_RTL
+    jr      z, .lbAttrReady              ; LTR: leave EmitCellAttr alone
+    ld      a, [EmitCellAttr]
+    or      CELL_RTL
+    ld      [EmitCellAttr], a
+.lbAttrReady:
     ld      a, [HtmlListKind]
     cp      1
     jr      z, .bul
     cp      2
     jr      z, .num
-    pop     hl
-    ret
+    jr      .lbDone
 
 .bul:
     ld      a, '*'
     call    EmitSink
     ld      a, ' '
     call    EmitSink
-    pop     hl
-    ret
+    jr      .lbDone
 
 .num:
     ld      a, [HtmlOlCounter]
@@ -5301,8 +5317,13 @@ EmitListBullet:
     call    EmitSink
     ld      a, ' '
     call    EmitSink
+.lbDone:
+    ld      a, [_lbSavedAttr]
+    ld      [EmitCellAttr], a
     pop     hl
     ret
+
+_lbSavedAttr:   db 0
 
 ; EmitSink: route the single character in A to wherever the current state
 ; says it should go -- title buffer, nowhere (inside <head>), or the canvas
@@ -9144,7 +9165,12 @@ ApplyDocAttrs:
     ld      a, [HtmlNextAlign]
     cp      0xFF
     jr      nz, .dadAlign
-    ld      a, 2
+    ; dir="rtl" with no explicit align= -> right-align. HtmlAlign
+    ; uses 0=left / 1=right / 2=center per LineDrawCells; was
+    ; mistakenly set to 2 (center), which on listtest.htm centered
+    ; the RTL <h2> heading and the RTL list rows around the canvas
+    ; midline instead of flushing them against the right edge.
+    ld      a, 1
     ld      [HtmlDefaultAlign], a
     ld      [HtmlAlign], a
 .dadAlign:
@@ -9196,7 +9222,10 @@ TagUl:
     ld      a, [HtmlIndent]
     add     a, 16
     ld      [HtmlIndent], a
-    ret
+    ; Inherit dir / align from the <ul ...> attributes so
+    ; <ul dir="rtl"> actually right-aligns its <li> rows (default
+    ; right-align comes from ApplyBlockAttrs's dir=rtl branch).
+    jp      ApplyBlockAttrs
 .close:
     xor     a
     ld      [HtmlListKind], a
@@ -9213,6 +9242,7 @@ TagUl:
     ld      a, [HtmlIndent]
     sub     16
     ld      [HtmlIndent], a
+    call    ResetBlockAttrs             ; revert dir/align that the open applied
     jp      EmitBlankLine
 
 ; <ol>: ordered list. Same as <ul> but bullet style 2 and a counter.
@@ -9228,7 +9258,7 @@ TagOl:
     ld      a, [HtmlIndent]
     add     a, 16
     ld      [HtmlIndent], a
-    ret
+    jp      ApplyBlockAttrs             ; pick up dir="rtl" / align=
 .close:
     xor     a
     ld      [HtmlListKind], a
@@ -9238,6 +9268,7 @@ TagOl:
     ld      a, [HtmlIndent]
     sub     16
     ld      [HtmlIndent], a
+    call    ResetBlockAttrs
     jp      EmitBlankLine
 
 ; <li>: newline, then tell EmitText to prepend a bullet / number to the
@@ -12538,12 +12569,16 @@ ApplyBlockAttrs:
     jr      z, .abaDirDone
     ld      [HtmlDir], a
     ; If no explicit align, dir=rtl defaults to right-align.
+    ; HtmlAlign uses 0=left / 1=right / 2=center; was mistakenly
+    ; set to 2 here so a per-block dir="rtl" centered the block
+    ; instead of right-aligning it (matched the document-level
+    ; ApplyDocAttrs bug fixed in the same hunk).
     or      a
     jr      z, .abaDirDone
     ld      a, [HtmlNextAlign]
     cp      0xFF
     jr      nz, .abaDirDone
-    ld      a, 2
+    ld      a, 1
     ld      [HtmlAlign], a
 .abaDirDone:
     ld      a, [HtmlNextAlign]
