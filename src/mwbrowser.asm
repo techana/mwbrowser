@@ -2610,9 +2610,6 @@ DrawScrollbar:
 ;   discovered the exact count via natural EOF or snap-back -- never
 ;   stomp it with the saturated default).
 ExtrapolateHtmlLineCountIfShort:
-    ld      a, [HtmlLineCountAccurate]
-    or      a
-    ret     nz                           ; already exact -> never extrapolate
     ld      hl, [ParserCursor]
     ld      de, FileBuf
     or      a
@@ -2623,17 +2620,79 @@ ExtrapolateHtmlLineCountIfShort:
     ld      de, [WindowLen]
     or      a
     sbc     hl, de
-    jr      c, .eaShort
-    ; consumed >= WindowLen: parser walked the whole doc, count is
-    ; now exact. Latch the flag so future renders skip extrapolation,
-    ; and lock TotalLines to the same exact value so the scroll
-    ; thumb sizes correctly.
+    jr      c, .eaCheckAccurate          ; consumed < WindowLen -> maybe extrapolate
+    ; consumed >= WindowLen: parser walked the whole window. The count
+    ; is exact for THIS window; latch HtmlLineCountAccurate so
+    ; subsequent re-renders of the same window don't extrapolate, and
+    ; refresh HtmlLineCountSaved + TotalLines unconditionally (a
+    ; SlideForward swaps the window underneath us so the previous
+    ; render's values are stale even when the accurate flag was
+    ; already set).
     ld      a, 1
     ld      [HtmlLineCountAccurate], a
     ld      hl, [HtmlLineCount]
-    ld      [TotalLines], hl
     ld      [HtmlLineCountSaved], hl
+    ; TotalLines = DocLinesBefore + HtmlLineCount * ratio, where
+    ; ratio = ceil((DocSize - DocOffset) / WindowLen) -- the number
+    ; of FILE_BUF-sized chunks needed to cover the rest of the doc
+    ; from the current window's start. For boot's first render this
+    ; extrapolates the line count of unrendered later chunks so the
+    ; thumb sees a doc-wide denominator from the very first paint;
+    ; for the final chunk it collapses to ratio=1 so the estimate
+    ; refines to (DocLinesBefore + HtmlLineCount) exact.
+    ;
+    ; 16-bit math: MSX-DOS files cap well below 64 KB so DocSize.high
+    ; and DocOffset.high are reliably 0 here. The .high bytes get
+    ; ignored, NOT zeroed -- a future >=64 KB local-file path would
+    ; need a 24-bit subtract instead.
+    push    hl                              ; save HtmlLineCount
+    ld      hl, [DocSize]
+    ld      de, [DocOffset]
+    or      a
+    sbc     hl, de                          ; HL = remaining bytes
+    ld      a, h
+    or      l
+    jr      z, .eaRatioOne                  ; degenerate (nothing left)
+    ld      de, [WindowLen]
+    ld      b, 0
+.eaRatioLoop:
+    ld      a, h
+    or      l
+    jr      z, .eaRatioDone                 ; remaining hit 0 → ratio = B
+    or      a
+    sbc     hl, de
+    inc     b
+    jr      c, .eaRatioDone                 ; underflow → last chunk is partial
+    jr      .eaRatioLoop
+.eaRatioOne:
+    ld      b, 1
+.eaRatioDone:
+    ; B = ratio (ceil of chunks remaining including current).
+    pop     hl                              ; HL = HtmlLineCount
+    ld      a, b
+    cp      1
+    jr      z, .eaRatioApply                ; ratio == 1 → skip multiply
+    ld      d, h
+    ld      e, l                            ; DE = HtmlLineCount
+    dec     b                               ; B = additional copies
+.eaMulLoop:
+    add     hl, de
+    jr      c, .eaTotalSat
+    djnz    .eaMulLoop
+.eaRatioApply:
+    ld      de, [DocLinesBefore]
+    add     hl, de
+    jr      c, .eaTotalSat
+    ld      [TotalLines], hl
     ret
+.eaTotalSat:
+    ld      hl, 0xFFFF
+    ld      [TotalLines], hl
+    ret
+.eaCheckAccurate:
+    ld      a, [HtmlLineCountAccurate]
+    or      a
+    ret     nz                           ; accurate already, don't re-extrapolate
 .eaShort:
     ; Pre-condition: HtmlLineCount holds the partial render count for
     ; THIS pass. Compute a TotalLines estimate for the scroll-thumb
@@ -2741,16 +2800,20 @@ CountTotalLines:
     ld      [TotalLines], de
     ret
 
-; ComputeThumb: set ThumbTop + ThumbHeight from ScrollLine and TotalLines.
+; ComputeThumb: set ThumbTop + ThumbHeight from EffectiveScroll and
+; TotalLines. EffectiveScroll = DocLinesBefore + ScrollLine -- the
+; doc-relative position so a SlideForward (which resets ScrollLine to
+; 0 in the new window) doesn't snap the thumb back to the track top.
 ;   If TotalLines <= TEXT_MAX_LINES, thumb fills track.
 ;   Else:
 ;     ThumbHeight = max(4, TEXT_MAX_LINES * TRACK_H / TotalLines)
-;     ThumbTop    = THUMB_Y0 + (ScrollLine * TRACK_H / TotalLines)
+;     ThumbTop    = THUMB_Y0 + (EffectiveScroll * TRACK_H / TotalLines)
 ;
-; TotalLines / ScrollLine are 16-bit; DivU16By8 only takes an 8-bit
-; divisor. Compute a common right-shift that collapses TotalLines into
-; 8 bits and apply it to ScrollLine too -- precision loss inside a
-; ~200 px scroll track is at worst one pixel, which is imperceptible.
+; TotalLines / EffectiveScroll are 16-bit; DivU16By8 only takes an
+; 8-bit divisor. Compute a common right-shift that collapses
+; TotalLines into 8 bits and apply it to EffectiveScroll too --
+; precision loss inside a ~200 px scroll track is at worst one
+; pixel, which is imperceptible.
 ComputeThumb:
     ld      hl, [TotalLines]
     ld      a, h
@@ -2760,8 +2823,14 @@ ComputeThumb:
     cp      TEXT_MAX_LINES + 1
     jp      c, .fullThumb
 .ctLong:
-    ; Scale TotalLines / ScrollLine so TotalLines fits in 8 bits.
+    ; Compute EffectiveScroll = DocLinesBefore + ScrollLine into DE
+    ; (the scale loop below works on HL=TotalLines / DE=position).
+    push    hl                          ; save TotalLines
+    ld      hl, [DocLinesBefore]
     ld      de, [ScrollLine]
+    add     hl, de
+    ex      de, hl                      ; DE = EffectiveScroll
+    pop     hl                          ; HL = TotalLines (restored)
     ld      b, 0                        ; B = shift count (debug only)
 .ctScale:
     ld      a, h
@@ -4005,13 +4074,16 @@ LoadFile:
     ; stale; clear the lock so the upcoming initial render's
     ; ExtrapolateHtmlLineCountIfShort can fire normally. Also reset
     ; TotalLines (the high-water-mark for the thumb denominator)
-    ; so the new doc starts from a clean estimate.
+    ; and DocLinesBefore (the cross-slide cumulative position) so
+    ; the new doc starts from a clean estimate.
     xor     a
     ld      [HtmlLineCountAccurate], a
     ld      [TotalLines], a
     ld      [TotalLines + 1], a
     ld      [HtmlLineCountSaved], a
     ld      [HtmlLineCountSaved + 1], a
+    ld      [DocLinesBefore], a
+    ld      [DocLinesBefore + 1], a
     ; URL shape routes the load:
     ;   "view:<path>"   -> hybrid bitmap pipeline (RemoteLoadView).
     ;                      The bridge renders the page as a Screen-6
@@ -4614,7 +4686,22 @@ EnsureWindowLocal:
     push    bc
     push    de
     push    hl
-    push    af
+    ; Note on register preservation: BC/DE/HL are saved and restored
+    ; below, but A is the function's RETURN VALUE (0 on success,
+    ; non-zero on FCB open / read failure) so it deliberately is
+    ; NOT preserved across the call. The previous shape stacked a
+    ; `push af` at entry / `pop af` at exit, which silently
+    ; restored the caller's A and dropped the actual return code on
+    ; the floor -- SlideForwardLocal's `or a; jr nz, .sflFail` then
+    ; fired off the caller's stale A (the slot index returned by
+    ; SlideAlignTarget, typically 0xFF for the no-cache-hit path)
+    ; and reported a slide failure even when the window had
+    ; successfully loaded. PageDown's slide ended up loading the
+    ; new window but never re-rendering it (.pdLocalSlide bails
+    ; on CF=1 before resetting ScrollLine), so the user got stuck
+    ; on the previously-displayed page no matter how many times
+    ; they pressed Space.
+    ;
     ; Fast-path: is SlideTarget already inside [DocOffset,
     ; DocOffset + WindowLen)? 24-bit subtract: target - DocOffset.
     ; Sign-extend WindowLen to 24 bits (high byte = 0). We carry
@@ -4668,7 +4755,6 @@ EnsureWindowLocal:
     pop     af
 
 .ewlExit:
-    pop     af
     pop     hl
     pop     de
     pop     bc
@@ -7387,19 +7473,30 @@ LineCacheLookupOffset:
     ld      d, 0
     ld      hl, LineCacheDocOff
     add     hl, de                       ; HL = &slot.doc_offset
-    ; slot <= target ?
+    ; slot <= target ?  Cmp24 documents that it clobbers B (the loop
+    ; counter for djnz here), so wrap each call in push/pop bc.
+    ; Without this, the first Cmp24 returns with B = SlideTarget's
+    ; high byte (zero for any reasonable local file), djnz wraps
+    ; through 256 iterations, C grows past LineCacheCount, and the
+    ; address calculation reads garbage from LineCacheState's
+    ; snapshot bytes -- producing a SlideTarget far beyond DocSize
+    ; (e.g. 0x010003 for an 11912-byte doc).
+    push    bc
     push    hl
     ld      de, SlideTarget
     call    Cmp24                        ; CF=1 -> slot<target; Z -> equal
     pop     hl
+    pop     bc
     jr      c, .lcloVsBest
     jr      nz, .lcloNext                ; slot > target -> skip
 .lcloVsBest:
     ; slot <= target. Update best iff slot > best.
+    push    bc
     push    hl
     ld      de, LcloBestOff
     call    Cmp24                        ; CF -> slot<best; Z -> equal
     pop     hl
+    pop     bc
     jr      c, .lcloNext                 ; slot < best -> skip
     jr      z, .lcloNext                 ; slot == best -> skip
     ; slot > best: copy slot's 3 bytes into LcloBestOff and remember
@@ -11560,13 +11657,26 @@ TagTableTag:
     or      a
     jr      nz, .close
 
-    ; Leading blank line + top rule + row-gap before the first cell text.
-    call    EmitBlankLine
+    ; Stamp "inside table" state BEFORE EmitBlankLine fires its
+    ; newline. EmitNewline -> LineCacheMaybeAppend gates appends on
+    ; IsLineCacheStateSafe, which requires HtmlInTable == 0. If we
+    ; set HtmlInTable AFTER the blank line (the old order), the
+    ; snapshot taken at this point stores the POST-<table> parser
+    ; cursor as "line N's safe restart point" -- and a later
+    ; PageDown that lands a LineCache fast-forward on line N
+    ; resumes parsing past the <table> tag, skipping the column-
+    ; layout setup, the HtmlInTable=2 write, and the top border.
+    ; <tr>/<td> handlers then run against stale layout pointers
+    ; with HtmlInTable=0, producing benchtx.htm's page-8 shifted-
+    ; cell corruption (May 2026 regression hunt).
     ld      a, 2
     ld      [HtmlInTable], a
     ld      [HtmlTableFirst], a
     xor     a
     ld      [HtmlTableCol], a
+
+    ; Leading blank line + top rule + row-gap before the first cell text.
+    call    EmitBlankLine
     ld      a, [HtmlNextBorder]
     ld      [HtmlTableBorder], a        ; latch for the duration of the table
 
@@ -15193,12 +15303,28 @@ PageDown:
     call    StoreTotalLinesWithPages
     ret
 .pdRemoteSlid:
+    ; Accumulate the old window's line count into DocLinesBefore so
+    ; the scroll thumb keeps growing monotonically across the slide
+    ; instead of resetting to 0 when ScrollLine drops back to top of
+    ; the new window. HtmlLineCount at this point still holds the
+    ; just-rendered window's total (set by the previous PFC pass);
+    ; the new render below overwrites it.
+    ld      hl, [HtmlLineCount]
+    ld      de, [DocLinesBefore]
+    add     hl, de
+    ld      [DocLinesBefore], hl
     ld      hl, 0
     ld      [ScrollLine], hl
     jp      RefreshAfterScroll
 .pdLocalSlide:
     call    SlideForwardLocal
     ret     c
+    ; Slide succeeded. Same DocLinesBefore bump as the remote-slid
+    ; path (see comment there).
+    ld      hl, [HtmlLineCount]
+    ld      de, [DocLinesBefore]
+    add     hl, de
+    ld      [DocLinesBefore], hl
     ld      hl, 0
     ld      [ScrollLine], hl
     jp      RefreshAfterScroll
@@ -19504,6 +19630,18 @@ PendingRestoreSlot: db 0xFF
 
 ScrollLine:     dw 0                    ; first visible line (0 = top of file)
 TotalLines:     dw 0                    ; rendered line count for thumb math
+DocLinesBefore: dw 0                    ; cumulative line count of chunks BEFORE
+                                        ; the current FileBuf window. Bumped by
+                                        ; HtmlLineCount on every successful
+                                        ; SlideForward, decremented on a
+                                        ; successful SlideBackward (which re-
+                                        ; renders the prior window to know its
+                                        ; line count). Scroll-thumb math reads
+                                        ; (DocLinesBefore + ScrollLine) as the
+                                        ; doc-relative position so the thumb
+                                        ; grows monotonically across slides
+                                        ; instead of resetting to 0 when the
+                                        ; window advances.
 ThumbTop:       db THUMB_Y0             ; current thumb top y (set by ComputeThumb)
 ThumbHeight:    db THUMB_Y1 - THUMB_Y0 + 1
 ; quick_screen_draw: paint the thumb dark-gray on the FIRST DrawScrollbar
