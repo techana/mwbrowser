@@ -10344,7 +10344,7 @@ RenderBmpFile:
     ld      b, a
     ld      a, [BmpPackIdx]
     ld      c, a
-    ld      a, 2
+    ld      a, 3
     sub     c
     add     a, a
     ld      c, a                        ; C = (3 - idx) * 2
@@ -10562,13 +10562,13 @@ BmpLumaToPalette:
     ld      a, 2                        ; white
     ret
 .bltBlack:
-    ld      a, 2
+    ld      a, 3                        ; black palette index 3
     ret
 .bltDgray:
     xor     a                           ; dgray palette index 0
     ret
 .bltLgray:
-    ld      a, 2
+    ld      a, 1                        ; lgray palette index 1
     ret
 
 ; PcxGetDecodedByte: returns A = next decoded PCX byte (after RLE
