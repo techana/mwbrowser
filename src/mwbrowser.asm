@@ -9482,9 +9482,16 @@ ImgStreamRefill:
 ; ImgStreamByte: returns A = next byte, CF=1 on EOF. Remote session
 ; pulls from the UART instead of the FCB.
 ImgStreamByte:
-    ld      a, [IsRemoteSession]
-    or      a
-    jp      nz, RemoteImgByte
+    ; Always drain from ImgBuf first, regardless of session type.
+    ; The BMP renderer's .bmpInBuf branch pre-positions ImgReadPtr at
+    ; the first pixel byte (e.g. ImgBuf + 118 for the standard 4 bpp
+    ; header) with the right residual ImgReadLen so the leading bytes
+    ; that are already in the 128-byte peek don't get re-fetched.
+    ; The earlier "jp nz, RemoteImgByte" shortcut skipped that
+    ; setup entirely and clipped the bottom-most row of remote BMPs
+    ; by ImgBuf - pixel_offset bytes (= 10 bytes / 20 pixels at
+    ; standard headers), cascading the shift through every later
+    ; row as the per-row counter ran out before EOF.
     ld      a, [ImgReadLen]
     or      a
     jr      z, .isbRefill
@@ -9497,7 +9504,7 @@ ImgStreamByte:
     or      a
     ret
 .isbRefill:
-    call    ImgStreamRefill
+    call    ImgStreamRefill                 ; dispatches by IsRemoteSession
     ret     c
     jr      ImgStreamByte
 
