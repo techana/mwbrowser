@@ -4295,6 +4295,10 @@ UrlIsBinary:
     sub     e
     dec     a                               ; subtract the '.' itself
     jr      z, .uibBinary                   ; trailing dot ("foo.") -> binary
+    cp      2
+    jr      c, .uibNoDot                    ; 1-char ext (IP literal's
+                                            ; ".1", our own ".2" save-
+                                            ; bumps, etc.) -> displayable
     ld      [UibExtLen], a
     inc     de                              ; DE -> first ext char
     ld      hl, DisplayableExts
