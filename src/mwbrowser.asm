@@ -9565,12 +9565,13 @@ RenderSc6File:
     call    ImgStreamOpenName
     jp      c, .rsfOpenFail             ; file not found -> let caller fallback
 
-    ; Lesson #2: blank the display for the duration of the bulk
-    ; pixel transfer so the V9938 arbiter doesn't steal VRAM cycles.
-    ; All exit paths below jump to .rsfDone or .rsfNoTy -- both are
-    ; routed through the .rsfFinish epilogue that re-enables the
-    ; display. (.rsfOpenFail can't reach here.)
-    call    VdpBlank
+    ; Earlier we VdpBlank'd here (lesson #2) to free the V9938
+    ; arbiter from background fetches and shave ~3 ms off a 5 KB
+    ; render. The visible side effect on MSX2 is a full-screen
+    ; striped flash (R1.BL=0 in Screen 6 reveals the underlying
+    ; pattern table) that lasts long enough to be jarring. The
+    ; saving isn't worth the ugly transition; keep the display
+    ; lit for the whole render.
 
     ; Commit any pending text line now so both the fast-path and the
     ; streaming decoder start at a clean Y cursor. LineFlush is also
@@ -9653,7 +9654,6 @@ RenderSc6File:
 .rsfFastLC:
     ld      [HtmlLineCount], hl
     call    ImgStreamClose
-    call    VdpUnblank                  ; balance VdpBlank at entry
     scf                                 ; image "handled"
     ret
 
@@ -9770,7 +9770,6 @@ RenderSc6File:
 .rsfTyOk:
     ld      [TextY], a
 .rsfNoTy:
-    call    VdpUnblank                  ; balance VdpBlank at entry
     scf                                 ; CF=1 -> image was handled
     ret
 
