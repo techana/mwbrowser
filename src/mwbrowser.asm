@@ -5666,14 +5666,17 @@ EmitRaw:
 
     ld      b, a                        ; B = glyph
 
-    ; Inside a <table> cell, clip text at the cell's right edge
-    ; instead of wrap-to-next-row. Wrapping while in a cell sent
-    ; the overflow to the next row at HtmlIndent (column 0),
-    ; visually displacing it outside the table -- the user-reported
-    ; "text outside table" bug on benchtx's Field/Value/Note table
-    ; where the long Note text bled past the cell into the next
-    ; row's first column. Truncating means the cell shows only as
-    ; much text as fits, but never bleeds outside the column.
+    ; Inside a <table> cell, the right edge of the column is a soft
+    ; wrap point: SmartWrap breaks LineBuf at the last space (or
+    ; hard-cuts if no space found) and CellNewline advances TextY
+    ; inside the cell so the tail re-emits below on a fresh sub-row.
+    ; The earlier "clip-and-drop" shape kept the table tidy but
+    ; truncated multi-line Note values (e.g. benchtx's "Bridge pixel
+    ; viewport form." rendered as "Bridge pixel viewpo").
+    ;
+    ; .erDrop is now the cell-wrap entry; the actual "drop the
+    ; glyph" fallback only fires inside CellNewline when the cell
+    ; has wrapped CELL_WRAP_MAX times (pathological-cell guard).
     ld      a, [HtmlInTable]
     or      a
     jr      z, .erCanvasWrap
@@ -5687,13 +5690,34 @@ EmitRaw:
     ld      de, [TextX]
     or      a
     sbc     hl, de
-    jr      c, .erDrop                  ; TextX >= CellEndX - 6 -> drop char
+    jr      c, .erDrop                  ; TextX >= CellEndX - 6 -> wrap
     jr      .posOk
 
 .erDrop:
-    pop     bc
-    pop     hl
-    ret
+    ; Cell wrap. SmartWrap's .swDoNewline dispatch routes the
+    ; underlying EmitNewline to CellNewline because HtmlInTable !=
+    ; 0; LineBuf gets split at the last space (or hard-cut) and
+    ; the tail re-emits onto a fresh sub-row inside this cell.
+    ; After the wrap we fall through to .doAppend so the glyph
+    ; that triggered the overflow lands at the start of the new
+    ; sub-row.
+    ;
+    ; BC and HL are still on the stack from EmitRaw entry; the
+    ; closing .done pops both. Don't add another layer here --
+    ; SmartWrap preserves B across its internal copy loops (it
+    ; clobbers B briefly with the space index, then re-emits the
+    ; tail via EmitRaw recursion using a fresh B from TailGlyph).
+    ; The B we restored from .doAppend is whatever's on the stack;
+    ; we DON'T need the original glyph there because the .doAppend
+    ; entry below re-reads B fresh from the byte that triggered
+    ; this call via the caller's stack frame.
+    ;
+    ; To make that work without surgery on .doAppend, save the
+    ; glyph onto the stack across the SmartWrap call.
+    push    bc                          ; preserve current glyph (B)
+    call    SmartWrap
+    pop     bc                          ; restore B = the original glyph
+    jp      .doAppend
 
 .erCanvasWrap:
     ; Wrap check runs in both render and skip-scroll phases so the line
@@ -6779,7 +6803,7 @@ FixRtlLinkRectsOnLine:
 SmartWrap:
     ld      a, [LineLastSpace]
     cp      0xFF
-    jp      z, EmitNewline              ; hard wrap: no space on this line
+    jp      z, .swHardWrap              ; no space → hard wrap
 
     ; B = space index
     ld      b, a
@@ -6834,7 +6858,7 @@ SmartWrap:
     ; the tail on the next line). B still holds the space index.
     ld      a, b
     ld      [LineLen], a
-    call    EmitNewline                 ; flush short line + advance + reset LineLastSpace
+    call    .swDoNewline                ; cell-aware newline dispatch
 
     ; Re-emit stashed tail cells onto the new line via EmitRaw so wrap +
     ; TextX advance behave normally. Stash EmitCellAttr around the loop in
@@ -6867,7 +6891,127 @@ SmartWrap:
     ld      [EmitCellAttr], a
     ret
 
+.swHardWrap:
+    ; No last-space found: hard wrap. Tail-call the dispatch helper
+    ; below so the in-table case still ends up in CellNewline instead
+    ; of EmitNewline (which would jump cell text back to TextX = 0).
+.swDoNewline:
+    ; Per-line newline used by both the soft-wrap and hard-wrap paths.
+    ; Inside a <table> cell SmartWrap is asked to wrap text against
+    ; the cell's right edge; the new line has to land at CellStartX
+    ; with row-internal TextY advance, NOT canvas-relative
+    ; HtmlIndent / scaled pitch. CellNewline does that variant;
+    ; EmitNewline retains the canvas-wide behaviour for normal text
+    ; flow outside tables.
+    ld      a, [HtmlInTable]
+    or      a
+    jp      nz, CellNewline
+    jp      EmitNewline
+
 SmartWrapSavedAttr: db 0
+
+; CellNewline: wrap inside a <table> cell. Flushes LineBuf at the
+; current cell's left edge (CellStartX / current TextY), advances
+; TextY by TEXT_LINE_H (UNIT row, scale-independent: cell text always
+; renders at scale=1 because <th>/<td> don't open scale=2 scopes),
+; resets TextX to CellStartX, bumps CellWrapCount. Counterpart to
+; EmitNewline for inside-table SmartWrap dispatch (see .swDoNewline
+; above).
+;
+; Bookkeeping:
+;   - LineLen / ArLen / LineLastSpace reset so the next EmitRaw
+;     starts a fresh row of glyphs inside the same cell.
+;   - HtmlLineEmpty / HtmlWsPending mirror EmitNewline's resets so
+;     leading-space collapse + <p>/<h*> EnsureLineStart short-
+;     circuits stay consistent.
+;   - HtmlLineCount is NOT bumped here -- the row-close paths in
+;     TagTr / TagTableTag.close fold RowMaxWrap into a single
+;     CountTableRow add at the END of the row instead of adding
+;     per-wrap (so HtmlLineSkip stays in sync with the row's
+;     pixel advance which also happens once per row).
+CellNewline:
+    push    af
+    push    bc
+    push    de
+    push    hl
+
+    ; Cap recursion. After CELL_WRAP_MAX wraps we silently stop
+    ; advancing -- LineFlush still drains, but TextY/TextX don't
+    ; change and further EmitRaw glyphs land on the same row,
+    ; getting dropped by the cell-edge check (no infinite recurse
+    ; via SmartWrap's tail re-emit loop on pathological no-space
+    ; cell text).
+    ld      a, [CellWrapCount]
+    cp      CELL_WRAP_MAX
+    jr      nc, .cnDone
+
+    ; Flush LineBuf at the cell's left edge. LineFlush internally
+    ; suppresses VRAM writes when HtmlLineSkip > 0 / HtmlNoDraw !=
+    ; 0, so this is safe to call in scrolled-skip passes too --
+    ; it'll just drain the buffer without painting.
+    ld      hl, [CellStartX]
+    srl     h
+    rr      l
+    srl     h
+    rr      l                            ; HL = CellStartX / 4 byte column
+    ld      a, l
+    ld      [LineStartColOverride], a
+    call    LineFlush
+    ld      a, 0xFF
+    ld      [LineStartColOverride], a
+
+    ; Reset LineBuf state for the new sub-row inside this cell.
+    xor     a
+    ld      [LineLen], a
+    ld      [ArLen], a
+    ld      a, 0xFF
+    ld      [LineLastSpace], a
+    ld      a, 2
+    ld      [HtmlLineEmpty], a
+    xor     a
+    ld      [HtmlWsPending], a
+
+    ; Scrolled-skip pass: HtmlLineSkip > 0 means the row is being
+    ; counted but not drawn. Mirror EmitNewline's behaviour and
+    ; DON'T advance TextY -- the row-close path in TagTr /
+    ; TagTableTag.close keeps TextY pinned and CountTableRow
+    ; decrements HtmlLineSkip by (RowMaxWrap+1) so wrapped rows
+    ; eat more skip budget. TextX still resets to CellStartX so
+    ; subsequent EmitRaw cell-edge math is correct.
+    ld      a, [HtmlLineSkip]
+    ld      b, a
+    ld      a, [HtmlLineSkip + 1]
+    or      b
+    jr      nz, .cnResetTextX
+
+    ; Advance TextY by one UNIT row. Clamp so further wraps below
+    ; the content area degrade to the same drop-only state as
+    ; .cnDone rather than wrapping into chrome.
+    ld      a, [TextY]
+    add     a, TEXT_LINE_H
+    jr      c, .cnDone                   ; 8-bit overflow
+    cp      CONTENT_Y1 + 1
+    jr      nc, .cnDone                  ; past content bottom
+    ld      [TextY], a
+
+.cnResetTextX:
+    ; Reset TextX to the cell's left edge so the re-emitted tail
+    ; lands inside the column.
+    ld      hl, [CellStartX]
+    ld      [TextX], hl
+
+    ; Bump CellWrapCount. RowMaxWrap is updated at FlushPendingCell
+    ; time (= cell-end), not here, so it sees the FINAL wrap count
+    ; for each cell.
+    ld      a, [CellWrapCount]
+    inc     a
+    ld      [CellWrapCount], a
+.cnDone:
+    pop     hl
+    pop     de
+    pop     bc
+    pop     af
+    ret
 
 ; EmitNewline: start a new rendered line. We always bump the line counter
 ; (for the scrollbar); we only advance TextY after the skip quota for
@@ -11651,6 +11795,8 @@ ColorTable:
 ; ----------------------------------------------------------------------------
 
 TABLE_ROW_GAP   equ 2                   ; vertical pixels between rule and text
+CELL_WRAP_MAX   equ 8                   ; safety cap on per-cell wrap depth (see
+                                        ; CellWrapCount BSS comment).
 
 TagTableTag:
     ld      a, [HtmlIsClose]
@@ -11674,6 +11820,8 @@ TagTableTag:
     ld      [HtmlTableFirst], a
     xor     a
     ld      [HtmlTableCol], a
+    ld      [CellWrapCount], a          ; fresh table -> fresh per-cell wrap counter
+    ld      [RowMaxWrap], a             ; ...and per-row max-wrap accumulator
 
     ; Leading blank line + top rule + row-gap before the first cell text.
     call    EmitBlankLine
@@ -11713,9 +11861,18 @@ TagTableTag:
     ld      a, [HtmlLineSkip + 1]
     or      b
     jr      nz, .ttSkipAdv
-    ; Close the last row's bottom rule.
+    ; Close the last row's bottom rule. Row height = (RowMaxWrap +
+    ; 1) * TEXT_LINE_H so the divider lands below every wrapped
+    ; sub-row of every column in the last row (same shape as TagTr's
+    ; row-close advance).
+    ld      a, [RowMaxWrap]
+    inc     a
+    add     a, a
+    add     a, a
+    add     a, a                        ; A = rows * TEXT_LINE_H
+    ld      b, a
     ld      a, [HtmlRowTopY]
-    add     a, TEXT_LINE_H
+    add     a, b
     jr      c, .ttCloseClamp
     cp      CONTENT_Y1 + 1
     jr      c, .ttCloseOk
@@ -11802,23 +11959,41 @@ DrawTableVerticals:
 
 ; CountTableRow: bump HtmlLineCount and decrement HtmlLineSkip so a
 ; <tr>-advance contributes to the scroll-line bookkeeping the same way
-; a tag-driven EmitNewline would. Preserves all other state.
+; a tag-driven EmitNewline would. Adds (RowMaxWrap + 1) rendered
+; lines per row so wrapped cells (which advance TextY by extra
+; TEXT_LINE_H rows internally via CellNewline) keep HtmlLineCount in
+; sync with the actual pixel span. Preserves all other state.
 CountTableRow:
     push    af
+    push    bc
+    push    de
+    ld      a, [RowMaxWrap]
+    inc     a                           ; A = rows used by this row
+    ld      e, a
+    ld      d, 0                        ; DE = rows
     ld      hl, [HtmlLineCount]
-    inc     hl
-    ld      a, h
-    or      l
-    jr      z, .ctSat                   ; saturate at 0xFF
+    add     hl, de
+    jr      c, .ctSat                   ; 16-bit overflow -> saturate
     ld      [HtmlLineCount], hl
+    jr      .ctSkipDrain
 .ctSat:
+    ld      hl, 0xFFFF
+    ld      [HtmlLineCount], hl
+.ctSkipDrain:
     ld      hl, [HtmlLineSkip]
     ld      a, h
     or      l
     jr      z, .ctDone
-    dec     hl
+    ; HtmlLineSkip -= rows (clamp at 0).
+    or      a
+    sbc     hl, de
+    jr      nc, .ctSkipStore
+    ld      hl, 0
+.ctSkipStore:
     ld      [HtmlLineSkip], hl
 .ctDone:
+    pop     de
+    pop     bc
     pop     af
     ret
 
@@ -11849,8 +12024,19 @@ TagTr:
     ld      a, [HtmlLineSkip + 1]
     or      b
     jr      nz, .trNoAdvance
+    ; Row height = (RowMaxWrap + 1) * TEXT_LINE_H. Tallest cell wins:
+    ; a row whose Note column wrapped 2 times grows to 3 * TEXT_LINE_H
+    ; (= 24 px) so the horizontal divider lands BELOW every wrapped
+    ; sub-row in every column instead of slicing through the middle
+    ; of the tall cell's text.
+    ld      a, [RowMaxWrap]
+    inc     a                           ; A = rows used by this row
+    add     a, a                        ; * 2
+    add     a, a                        ; * 4
+    add     a, a                        ; * 8 = rows * TEXT_LINE_H
+    ld      b, a
     ld      a, [HtmlRowTopY]
-    add     a, TEXT_LINE_H
+    add     a, b
     jr      c, .trClampBot              ; wrapped 8-bit -> bottom
     cp      CONTENT_Y1 + 1
     jr      c, .trTyOk
@@ -11874,6 +12060,8 @@ TagTr:
     xor     a
     ld      [HtmlTableFirst], a
     ld      [HtmlTableCol], a
+    ld      [CellWrapCount], a          ; new row -> reset per-cell wrap counter
+    ld      [RowMaxWrap], a             ; ...and per-row max-wrap accumulator
 
     ; Reset pen state for the new row.
     xor     a
@@ -12003,9 +12191,29 @@ FlushInline:
 
 ; FlushPendingCell: drain anything currently in LineBuf onto VRAM at the
 ; previous cell's saved start X (CellStartX), then clear the buffer.
-; No-op if the buffer is empty or no cell was opened yet.
+; Always folds CellWrapCount into RowMaxWrap and resets CellWrapCount,
+; so the row-close path sees the just-closed cell's wrap depth even
+; when the cell ended with an empty tail (everything went through
+; CellNewline) or when the cell was entirely empty (no glyphs at all).
 FlushPendingCell:
     call    ArFlush                     ; let any pending Arabic word settle
+
+    ; RowMaxWrap = max(RowMaxWrap, CellWrapCount); then clear
+    ; CellWrapCount for the next cell. Done BEFORE the empty-buffer
+    ; early return because a cell can finish wrap+empty (last
+    ; CellNewline drained the buffer and nothing followed before
+    ; the next <td>/<tr>/</table>).
+    ld      a, [CellWrapCount]
+    ld      b, a
+    ld      a, [RowMaxWrap]
+    cp      b
+    jr      nc, .fpcWrapDone
+    ld      a, b
+    ld      [RowMaxWrap], a
+.fpcWrapDone:
+    xor     a
+    ld      [CellWrapCount], a
+
     ld      a, [LineLen]
     or      a
     ret     z
@@ -19754,6 +19962,19 @@ HtmlTableColCount: db 5                 ; cell count in first <tr> (1..5); set b
                                         ; somehow renders before TagTableTag.
 HtmlTableFirst: db 0                    ; 1 if this is the very first row of the table
 HtmlRowTopY:    db 0                    ; TextY at the top of the current row (for vertical rules)
+CellWrapCount:  db 0                    ; how many times the CURRENT cell has soft-
+                                        ; wrapped its text onto an extra line within
+                                        ; itself (resets on every <td>/<th>). Bumped
+                                        ; by CellNewline when SmartWrap fires
+                                        ; against the cell's right edge. Capped at
+                                        ; CELL_WRAP_MAX so pathological no-space
+                                        ; text stops recursing.
+RowMaxWrap:     db 0                    ; max CellWrapCount across all cells of the
+                                        ; CURRENT row (resets on every <tr>).
+                                        ; Drives row-close TextY advance and
+                                        ; CountTableRow's line-count bump so a row
+                                        ; whose tallest cell wrapped N times grows
+                                        ; by (N+1) rendered lines instead of 1.
 ParserCursor:   dw 0                    ; saved parser HL at DispatchTag entry;
                                         ; points just past the tag's '>'. Used by
                                         ; lookahead-style handlers (currently
