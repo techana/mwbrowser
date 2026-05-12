@@ -9191,7 +9191,7 @@ TagUl:
     or      a
     jr      nz, .close
     call    EmitBlankLine
-    ld      a, 2
+    ld      a, 1                        ; kind 1 = bullet '*' (see EmitListBullet)
     ld      [HtmlListKind], a
     ld      a, [HtmlIndent]
     add     a, 16
@@ -9200,6 +9200,16 @@ TagUl:
 .close:
     xor     a
     ld      [HtmlListKind], a
+    ; Flush the last item's LineBuf at the CURRENT (un-decremented)
+    ; HtmlIndent before subtracting 16. LineDrawCells reads
+    ; HtmlIndent to compute the line's start byte-column, so if we
+    ; drop the indent first then EmitBlankLine's first EmitNewline
+    ; would LineFlush the last item at the OUTER indent (= 0 for a
+    ; top-level <ul>) -- the user-visible "last bullet flush left"
+    ; bug. EnsureLineStart only flushes when HtmlLineEmpty == 0
+    ; (i.e. the last item left text in LineBuf), so empty lists
+    ; pay no extra newline.
+    call    EnsureLineStart
     ld      a, [HtmlIndent]
     sub     16
     ld      [HtmlIndent], a
@@ -9222,6 +9232,9 @@ TagOl:
 .close:
     xor     a
     ld      [HtmlListKind], a
+    ; Last-item flush at the un-decremented HtmlIndent (see TagUl
+    ; .close comment).
+    call    EnsureLineStart
     ld      a, [HtmlIndent]
     sub     16
     ld      [HtmlIndent], a
@@ -9271,10 +9284,13 @@ TagDd:
     ld      [HtmlIndent], a
     jp      EmitNewline
 .close:
+    ; Flush at the wider <dd> indent BEFORE dropping it (same
+    ; ordering rationale as TagUl/TagOl/TagBlockquote close).
+    call    EnsureLineStart
     ld      a, [HtmlIndent]
     sub     16
     ld      [HtmlIndent], a
-    jp      EnsureLineStart
+    ret
 
 ; <pre>: preformatted block. Whitespace is preserved verbatim; LF drives a
 ; real newline in EmitText. Blank line above/below.
@@ -9302,6 +9318,10 @@ TagBlockquote:
     ld      [HtmlIndent], a
     ret
 .close:
+    ; Flush the buffered last line at the wider indent BEFORE
+    ; dropping HtmlIndent -- same shape as TagUl/TagOl close, see
+    ; that comment.
+    call    EnsureLineStart
     ld      a, [HtmlIndent]
     sub     32
     ld      [HtmlIndent], a

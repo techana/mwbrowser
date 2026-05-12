@@ -25,6 +25,9 @@ mcopy -i "$DISK" -o samples/test4.htm  ::/TEST4.HTM
 # count moved off the hardcoded 5.
 [ -f samples/rtltab.htm ] && \
     mcopy -i "$DISK" -o samples/rtltab.htm ::/RTLTAB.HTM 2>/dev/null || true
+# listtest.htm: LTR + RTL <ol>/<ul> list-alignment regression fixture.
+[ -f samples/listtest.htm ] && \
+    mcopy -i "$DISK" -o samples/listtest.htm ::/LISTTEST.HTM 2>/dev/null || true
 # BIGBENCH: ~30 KB local-only fixture for the file_load_architecture
 # Phase 5 forward-slide path. Larger than FILE_BUF_SIZE so PageDown
 # at the bottom of the first chunk has to slide the window forward.
