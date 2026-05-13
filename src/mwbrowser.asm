@@ -5133,6 +5133,13 @@ PrintFileContent:
     ; produce real newlines and spaces/tabs aren't collapsed.
     ld      a, [PlainTextMode]
     ld      [HtmlPre], a
+    ; Everything below must reset to 0. The previous version stored A
+    ; (= PlainTextMode, 2 for .TXT) into HtmlInTable / HtmlIndent /
+    ; HtmlListKind / etc., so loading any .TXT after an HTML page that
+    ; left CellStartX / CellEndX populated dropped the .TXT renderer
+    ; into the cell-wrap path with stale cell-edge coordinates — the
+    ; "narrow right-aligned column" BIG1.TXT-after-bridge-root bug.
+    xor     a
     ld      [HtmlLiPending], a
     ld      [HtmlListKind], a
     ld      [HtmlOlCounter], a
@@ -19165,13 +19172,13 @@ RemoteLoadFile:
     ld      hl, ImgOffCmd
 .rlfImgSend:
     call    RemoteGet
-    jr      c, .rlfFail
+    jp      c, .rlfFail
     ld      hl, UrlBuf
     call    RemoteGet
-    jr      c, .rlfFail
+    jp      c, .rlfFail
     ld      a, [SerialKind]
     cp      1
-    jr      nz, .rlfFail
+    jp      nz, .rlfFail
     ; DocOffset = 0 because every load starts at doc byte 0 today.
     ; WindowLen = min(SerialLen, FILE_BUF_SIZE) is the clamped working
     ; set in FileBuf. EnsureWindowRemote slides DocOffset forward via
