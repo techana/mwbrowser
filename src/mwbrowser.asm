@@ -16259,6 +16259,36 @@ SlideForwardRemote:
     ld      a, [DocOffset + 2]
     adc     a, 0
     ld      [SlideTarget + 2], a
+    ; Bail if SlideTarget >= DocSize (when DocSize is known, i.e.
+    ; the response was a non-paginated single-shot body and
+    ; RemoteLoadFile latched the full length). Without the check
+    ; the user-press at the end of a self-host text file pays a
+    ; full "GET CHUNK <past-end>" round-trip just to receive ERR
+    ; 404; the screen freezes for the duration. A zero DocSize
+    ; means "unknown" -- skip the check and let the network
+    ; surface the EOF.
+    ld      a, [DocSize]
+    ld      b, a
+    ld      a, [DocSize + 1]
+    or      b
+    ld      b, a
+    ld      a, [DocSize + 2]
+    or      b
+    jr      z, .sfrFetch                 ; DocSize == 0 -> unknown, try anyway
+    ld      hl, [SlideTarget]
+    ld      bc, [DocSize]
+    or      a
+    sbc     hl, bc
+    ld      a, [SlideTarget + 2]
+    ld      b, a
+    ld      a, [DocSize + 2]
+    ld      c, a
+    ld      a, b
+    sbc     a, c
+    jr      c, .sfrFetch                 ; SlideTarget < DocSize -> fetch
+    scf
+    ret
+.sfrFetch:
     call    SlideAlignTarget
     call    EnsureWindowRemote
     or      a
@@ -19151,6 +19181,24 @@ RemoteLoadFile:
     ld      [DocOffset], de
     xor     a
     ld      [DocOffset + 2], a          ; clear high byte of 24-bit DocOffset
+    ; Set DocSize from the response length when it was a non-paginated
+    ; "OK HTM" reply (SerialPageTotal stayed at the default 2/2; an
+    ; "OK HTMP" paginated reply would have overwritten SerialPageTotal
+    ; to whatever the bridge sent, typically 1/N). DocSize lets
+    ; SlideForwardRemote bail at the actual EOF without a wasted
+    ; "GET CHUNK <past-end>" round-trip; the user-visible "press Space
+    ; once at the end of /BIG1.TXT and the screen freezes for ~13 s"
+    ; symptom was this trip taking the long way around to a bridge
+    ; "ERR 404" that the MSX then dropped on the floor.
+    push    hl
+    ld      a, [SerialPageTotal]
+    cp      2
+    jr      nz, .rlfSkipDocSize
+    ld      [DocSize], hl
+    xor     a
+    ld      [DocSize + 2], a
+.rlfSkipDocSize:
+    pop     hl
     ld      de, FILE_BUF_SIZE
     push    hl
     and     a
