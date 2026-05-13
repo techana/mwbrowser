@@ -6327,10 +6327,11 @@ LSet_Glyph:
 ;   ASCII:  .  ,  :  ;  ?  !
 ;   ISO-8859-6 Arabic: 0xAC ,  0xBB ;  0xBF ?  (their post-IsoMap
 ;   glyph codes are 0x8C / 0x9B / 0x9F).
-; Also swaps the paired brackets "(" <-> ")" (and "[" <-> "]") because
-; an "open paren" written by an author for LTR reading is the RIGHT-
-; side bracket when the line reads right-to-left; mirroring matches
-; the BIDI_MIRRORED property without needing a dedicated reorder pass.
+;   Paired brackets: ()  []  {}  <>  -- both halves get CELL_RTL and
+;   the glyph is swapped to its mirror (the "open paren" the author
+;   typed for LTR reading is the RIGHT-side bracket when the line
+;   reads right-to-left, so we flip the glyph here instead of running
+;   a dedicated BIDI_MIRRORED pass in the reorder).
 ; Net effect for "<h2 dir=\"rtl\">7. ...</h2>": "7" stays a single-
 ; cell LTR atom and prints at the right edge; "." joins the RTL flow
 ; on its left. For body text like "0x7E، و" the Arabic comma now
@@ -6376,33 +6377,47 @@ RtlPunctClass:
     jr      z, .rpcTag
     cp      0x9F                         ; Arabic question mark (IsoMap[0xBF])
     jr      z, .rpcTag
-    ; Paired-bracket mirroring: "(" <-> ")" and "[" <-> "]".
+    ; Paired-bracket mirroring + CELL_RTL: "(" <-> ")", "[" <-> "]",
+    ; "{" <-> "}", "<" <-> ">". '<' and '>' only survive in body text
+    ; through &lt; / &gt; entities or inside <pre> / <code>; the rest
+    ; are typed literally.
     cp      '('
-    jr      z, .rpcMirrorParen
+    jr      z, .rpcMirror01
     cp      ')'
-    jr      z, .rpcMirrorParen
+    jr      z, .rpcMirror01
+    cp      '<'
+    jr      z, .rpcMirror02
+    cp      '>'
+    jr      z, .rpcMirror02
     cp      '['
-    jr      z, .rpcMirrorBracket
+    jr      z, .rpcMirror06
     cp      ']'
-    jr      z, .rpcMirrorBracket
+    jr      z, .rpcMirror06
+    cp      '{'
+    jr      z, .rpcMirror06
+    cp      '}'
+    jr      z, .rpcMirror06
     jr      .rpcNext
-.rpcMirrorParen:
-    ; A holds '(' (0x28) or ')' (0x29) -- XOR low bit flips between them.
+.rpcMirror01:
+    ; '(' (0x28) <-> ')' (0x29): XOR with 0x01.
     xor     0x01
     jr      .rpcWriteGlyph
-.rpcMirrorBracket:
-    ; A holds '[' (0x5B) or ']' (0x5D) -- difference is 2.
-    cp      '['
-    jr      nz, .rpcBracketClose
-    ld      a, ']'
+.rpcMirror02:
+    ; '<' (0x3C) <-> '>' (0x3E): XOR with 0x02.
+    xor     0x02
     jr      .rpcWriteGlyph
-.rpcBracketClose:
-    ld      a, '['
+.rpcMirror06:
+    ; '[' (0x5B) <-> ']' (0x5D) and '{' (0x7B) <-> '}' (0x7D) both
+    ; flip with XOR 0x06.
+    xor     0x06
 .rpcWriteGlyph:
     ld      b, a
     ld      a, [RPC_i]
     call    LSet_Glyph
-    jr      .rpcNext                     ; mirroring only; no CELL_RTL flip
+    jp      .rpcTag                      ; also tag CELL_RTL so BiDi
+                                         ; pulls the bracket into the
+                                         ; RTL flow with the rest of
+                                         ; the punctuation
 .rpcTag:
     ld      a, [RPC_i]
     push    af
