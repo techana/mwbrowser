@@ -12832,12 +12832,25 @@ TagHr:
 ; visually heavy enough.
 TagH1:
     ld      b, 2
-    ld      c, STYLE_BOLD
+    ld      c, 0                          ; no STYLE_BOLD -- the bold
+                                          ; OR-with-self-shifted-right-1 fills
+                                          ; the 1-px gaps in the font (e.g.
+                                          ; m's three stems) BEFORE the
+                                          ; vertical row-doubling runs, so
+                                          ; "bold + scale=2" comes out as a
+                                          ; solid black blob rather than three
+                                          ; visibly distinct stems. The 16x16
+                                          ; cell size itself (ScaleX=2,
+                                          ; ScaleY=2) already gives enough
+                                          ; visual weight for the heading.
     ld      d, 2
     jr      HxDispatch
 TagH2:
     ld      b, 2
-    ld      c, STYLE_BOLD
+    ld      c, 0                          ; same reason as TagH1; the 8x16
+                                          ; vertical-stretched cell stays
+                                          ; readable as long as bold doesn't
+                                          ; pre-fill the gaps.
     ld      d, 1
     jr      HxDispatch
 TagH3:
