@@ -3832,29 +3832,33 @@ DrawCharFast:
     call    EmitFontRow
     inc     c
 
-    ; ---- Scale 2x: output the same row again one pixel-row lower,
-    ; but paint the duplicate in light-gray (the dimmer FontLUT)
-    ; instead of the caller's normal palette. Solid pixel-double in
-    ; black turned glyphs with stacked horizontal strokes (Arabic
-    ; ق / م / ة, Latin m / w) into single black blobs because the
-    ; "duplicate" row's ink merged seamlessly with the next glyph
-    ; row's ink. Painting the duplicate one shade lighter gives a
-    ; CRT-scanline-style separation so adjacent dark rows stay
-    ; visually distinct without losing the doubled glyph height.
-    ; Save CurrentFontLUT, swap to FontLUT_LGray, emit, restore.
+    ; ---- Scale 2x: at VRAM y = N+1 (the "doubled" row), paint a
+    ; BLANK background-color row instead of repeating the ink-row
+    ; from y = N. Each glyph row then spans 2 VRAM rows -- 1 row of
+    ; ink, 1 row of paper -- so the doubled glyph keeps its 16-px
+    ; height but the internal white holes / counter-spaces of Arabic
+    ; م ه ف ق و ص ض ط ظ (and Latin m / w / e / o, etc.) stay
+    ; visible. Solid pixel-doubled ink merged the holes into the
+    ; surrounding ring; the lighter-LUT variant (commit c2dac99,
+    ; reverted by this hunk) made the strokes look denser instead.
+    ; EmitStyledByte with A = 0 writes the FontLUT's bg-pair entries
+    ; (0xAA for FontLUT = WHITE), which clears the row to the
+    ; content-area background regardless of which colour variant
+    ; the caller's CurrentFontLUT points at.
     ld      a, [HtmlScaleY]
     cp      2
     jr      nz, .rowDone
     push    bc
     call    SetVramWritePos
     pop     bc
-    ld      hl, [CurrentFontLUT]
-    push    hl
-    ld      hl, FontLUT_LGray
-    ld      [CurrentFontLUT], hl
-    call    EmitFontRow
-    pop     hl
-    ld      [CurrentFontLUT], hl
+    xor     a
+    call    EmitStyledByte               ; 2 bg bytes (= 8 px wide cell)
+    ld      a, [HtmlScaleX]
+    cp      2
+    jr      nz, .rowBlankDone
+    xor     a
+    call    EmitStyledByte               ; +2 more bytes for H1's 16-px cell
+.rowBlankDone:
     inc     c
 
 .rowDone:
