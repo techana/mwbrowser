@@ -5260,12 +5260,12 @@ EmitListBullet:
     ; bullet/digit cells join the surrounding Arabic run. Without
     ; this, BiDi treats them as a separate LTR mini-run and strands
     ; "N." on the visual LEFT of an otherwise right-aligned RTL line.
-    ; Saved + restored across the marker emit so the caller's
-    ; baseline attr (typically 0) is preserved for the item's text
-    ; cells that follow (their Arabic glyphs come back through
-    ; ArFlush which sets CELL_RTL on its own).
+    ; Push the baseline EmitCellAttr onto the stack and restore at
+    ; .lbDone so the caller's attr (typically 0) survives -- the
+    ; item's own text cells re-enter via the Arabic shaper which
+    ; sets CELL_RTL on its own.
     ld      a, [EmitCellAttr]
-    ld      [_lbSavedAttr], a
+    push    af                            ; save baseline attr
     ld      a, [HtmlDir]
     and     CELL_RTL
     jr      z, .lbAttrReady              ; LTR: leave EmitCellAttr alone
@@ -5291,7 +5291,12 @@ EmitListBullet:
     ld      a, [HtmlOlCounter]
     inc     a
     ld      [HtmlOlCounter], a
-    ; Print decimal digits (1..99 supported; higher shows as 2-digit mod).
+    ; Print decimal digits (1..99). RTL lists upcast each ASCII digit
+    ; to its Arabic-Indic counterpart in ISO-8859-6 (0xB0..0xB9 =
+    ; ASCII '0'..'9' | 0x80) so an <ol dir="rtl"> renders its markers
+    ; in the matching Arabic numerals. Period + trailing space stay
+    ; ASCII; BiDi reorders the neutrals onto the marker's visual
+    ; left anyway.
     cp      10
     jr      c, .num1
     push    af
@@ -5303,27 +5308,38 @@ EmitListBullet:
     jr      nc, .tens
     push    af
     ld      a, b
-    call    EmitSink
+    call    .lbDigit
     pop     af
     add     a, '0'
-    call    EmitSink
+    call    .lbDigit
     pop     bc
     jr      .numTail
 .num1:
     add     a, '0'
-    call    EmitSink
+    call    .lbDigit
 .numTail:
     ld      a, '.'
     call    EmitSink
     ld      a, ' '
     call    EmitSink
+    jr      .lbDone
+.lbDigit:
+    ; A = ASCII digit '0'..'9'. Upcast to Arabic-Indic ٠..٩ when the
+    ; surrounding paragraph is RTL. (HtmlDir's CELL_RTL bit is the
+    ; signal; ld a,B in the middle preserves the Z flag from AND.)
+    ld      b, a
+    ld      a, [HtmlDir]
+    and     CELL_RTL
+    ld      a, b
+    jr      z, .lbdAscii
+    or      0x80                         ; 0x30..0x39 -> 0xB0..0xB9
+.lbdAscii:
+    jp      EmitSink
 .lbDone:
-    ld      a, [_lbSavedAttr]
+    pop     af                            ; restore baseline attr
     ld      [EmitCellAttr], a
     pop     hl
     ret
-
-_lbSavedAttr:   db 0
 
 ; EmitSink: route the single character in A to wherever the current state
 ; says it should go -- title buffer, nowhere (inside <head>), or the canvas
