@@ -4712,11 +4712,24 @@ LoadFileChunk:
 ; ClampWindowLenToWordBoundary: when WindowLen == FILE_BUF_SIZE (a full
 ; chunk was loaded; the next byte after the buffer is still in the
 ; file), scan FileBuf backward from the buffer end for the last
-; whitespace cell and set WindowLen there. The bytes past the clamp
-; are kept in FileBuf (cheap memory) but the parser stops at the
-; clamp, so the visible viewport never tears a word in half across a
-; chunk-slide boundary. No-op when WindowLen < FILE_BUF_SIZE (last
-; chunk of file, the natural end-of-file boundary is fine).
+; BLOCK-LEVEL HTML tag opener and set WindowLen to its '<' position.
+; Net effect: chunks split on a block boundary (<p>, <h?>, <li>,
+; <table>, <ul>, <ol>, <center>, <hr>, <br>, <dl>, <dt>, <dd>,
+; <pre>, <blockquote>, <div>, <td>, <tr>, <th>, etc.) instead of
+; mid-paragraph. Chunk-1 ends at the tag-before; chunk-2 starts at
+; the tag itself, so the parser-state reset (no <p> open, no
+; <table> open) matches what the document actually said at that
+; byte. Without this clamp the parser cuts at a whitespace inside
+; a paragraph and the user sees the second half of the paragraph
+; flushed left on a fresh page -- a visual "new paragraph" that
+; the source HTML never asked for.
+;
+; No-op when WindowLen < FILE_BUF_SIZE (last chunk of file -- the
+; natural EOF boundary is fine) or when no block tag is found
+; within ~2 KB of the buffer end (very large paragraphs -- caller
+; falls back to whatever's there; we'd rather render the chunk
+; than discard ~30% of the buffer).
+;
 ; Clobbers A, BC, DE, HL.
 ClampWindowLenToWordBoundary:
     ld      hl, [WindowLen]
@@ -4724,40 +4737,74 @@ ClampWindowLenToWordBoundary:
     or      a
     sbc     hl, de
     ret     nz                          ; WindowLen != FILE_BUF_SIZE -> EOF, skip
-    ; Scan backward from FileBuf[FILE_BUF_SIZE-1] for whitespace.
-    ; Limit the scan to the last 1 KB so a chunk that's all one giant
-    ; cell (an SC6 dump or similar) doesn't waste the whole chunk.
-    ld      hl, FileBuf + FILE_BUF_SIZE - 1
-    ld      bc, 1024                    ; max scanback
+    ; Scan backward from FileBuf[FILE_BUF_SIZE-2] for "<X" where X is
+    ; a block-level tag start byte. Limit to last 2 KB so a chunk
+    ; that's all one giant cell doesn't waste the buffer.
+    ld      hl, FileBuf + FILE_BUF_SIZE - 2
+    ld      bc, 2048
 .cwbScan:
     ld      a, [hl]
-    cp      ' '
-    jr      z, .cwbFound
-    cp      0x0A
-    jr      z, .cwbFound
-    cp      0x09
-    jr      z, .cwbFound
-    cp      0x0D
-    jr      z, .cwbFound
+    cp      '<'
+    jr      nz, .cwbStep
+    ; Check the char immediately after '<'. If it's '/', we have a
+    ; close tag and have to look ONE byte further to see what's
+    ; being closed (</p> is block, </b> is inline). Otherwise the
+    ; char after '<' is the first letter of the tag name itself.
+    inc     hl
+    ld      a, [hl]
+    cp      '/'
+    jr      nz, .cwbOpen
+    inc     hl
+    ld      a, [hl]                      ; char after '</'
+    dec     hl
+.cwbOpen:
+    dec     hl                           ; restore HL to '<'
+    call    IsBlockStartChar
+    jr      nz, .cwbStep
+.cwbAccept:
+    ; HL points at the '<'. Set WindowLen = HL - FileBuf so the
+    ; parser stops just before the tag; chunk-2's SlideTarget will
+    ; equal that offset and (after 128-byte align + DropLeadOrphans
+    ; memmove) chunk-2's first byte is the '<' of this tag.
+    ld      de, FileBuf
+    or      a
+    sbc     hl, de
+    ld      [WindowLen], hl
+    ret
+.cwbStep:
     dec     hl
     dec     bc
     ld      a, b
     or      c
     jr      nz, .cwbScan
-    ret                                 ; no whitespace in 1 KB -> leave WindowLen
-.cwbFound:
-    ; HL points at the whitespace cell. Set WindowLen = (HL - FileBuf)
-    ; so the parser stops AT the whitespace (the whitespace itself is
-    ; the last emitted cell, neatly closing the line). Chunk-2's
-    ; SlideTarget = DocOffset + WindowLen then lands at the whitespace
-    ; -- the slide's 128-byte align in EnsureWindowLocal.ewlSlide
-    ; rounds it down toward FileBuf[whitespace], so the first byte of
-    ; chunk-2 is the next word's first letter (or the whitespace
-    ; itself; either way no mid-word tear on screen).
-    ld      de, FileBuf
-    or      a
-    sbc     hl, de
-    ld      [WindowLen], hl
+    ret                                 ; no block tag in 2 KB -> leave WindowLen
+
+; IsBlockStartChar: Z=1 if A is the first char of a block-level
+; HTML tag we want to chunk at (p, h, l, t, c, d, u, o). Treats
+; uppercase + lowercase identically (HTML is case-insensitive).
+; '<b' is intentionally left out -- it ambiguates between
+; <b>/<body> (skip) vs <blockquote>/<br> (accept), and the cheap
+; way out is to wait for the next <p / <h / etc. instead.
+; Clobbers A.
+IsBlockStartChar:
+    or      0x20                         ; lowercase fold ('A'..'Z' -> 'a'..'z')
+    cp      'p'
+    ret     z
+    cp      'h'
+    ret     z
+    cp      'l'
+    ret     z
+    cp      't'
+    ret     z
+    cp      'c'
+    ret     z
+    cp      'd'
+    ret     z
+    cp      'u'
+    ret     z
+    cp      'o'
+    ret     z
+    or      1                            ; force NZ for "not a block tag"
     ret
 
 ; ============================================================================
