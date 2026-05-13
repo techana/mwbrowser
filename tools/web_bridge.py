@@ -4170,7 +4170,7 @@ def _root_listing_html(rel_path=""):
     heading = "/" + rel if rel else root
     return ("<!DOCTYPE HTML PUBLIC \"-//IETF//DTD HTML 2.0//EN\">\n"
             "<html><head><title>Bridge root</title></head>\n"
-            "<body><h1>{}</h1>\n"
+            "<body><h2>{}</h2>\n"
             "<table border=\"0\" cellpadding=\"2\" cellspacing=\"0\">\n"
             "<tr><th align=\"left\">Name</th>"
             "<th align=\"left\">Size</th>"
