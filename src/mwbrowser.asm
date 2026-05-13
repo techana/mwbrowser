@@ -6291,10 +6291,25 @@ LineDrawCells:
     srl     a
     jr      .alHave
 .alRight:
+    ; Mirror HtmlIndent on the right edge so an RTL block inside a
+    ; <ul dir="rtl"> / <ol dir="rtl"> has the same gap from the
+    ; right margin that an LTR block has from the left -- without
+    ; this the left-indented LTR list and the right-aligned RTL
+    ; list looked asymmetric (left list 16 px gap, RTL list flush
+    ; against the scrollbar).
     ld      a, RIGHT_EDGE_COL
-    sub     c                           ; byte-col = 123 - width
+    sub     c                           ; byte-col = 122 - width
+    jr      c, .alRightClamp            ; width > canvas → clamp to 0
+    ld      b, a
+    ld      a, [HtmlIndent]
+    srl     a
+    srl     a                           ; A = indent / 4 byte-cols
+    ld      c, a                        ; (re-use C; restored below)
+    ld      a, b
+    sub     c                           ; A = start - indent
     jr      nc, .alHave
-    xor     a                           ; guard: if width > canvas, clamp
+.alRightClamp:
+    xor     a
     jr      .alHave
 .alCenter:
     ld      a, [HtmlIndent]
