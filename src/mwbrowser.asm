@@ -6002,6 +6002,7 @@ LineFlush:
 .lfSkipDraw:
     xor     a
     ld      [LineLen], a
+    ld      [LineWrapCont], a           ; one-shot: only the just-flushed line
     ret
 
 ; --- Per-cell accessors. A = index on entry (for Get) or index+value (Set). ---
@@ -6371,8 +6372,12 @@ LineDrawCells:
     jr      z, .alRight
     cp      2
     jr      z, .alCenter
-    ; Left: indent in pixels, convert to byte-cols.
+    ; Left: effective indent in pixels, convert to byte-cols. The
+    ; in-list wrap-continuation extra (LineWrapCont) is folded in so
+    ; wrapped <li> text starts past the bullet column.
     ld      a, [HtmlIndent]
+    ld      hl, LineWrapCont
+    add     a, [hl]
     srl     a
     srl     a
     jr      .alHave
@@ -6388,6 +6393,8 @@ LineDrawCells:
     jr      c, .alRightClamp            ; width > canvas → clamp to 0
     ld      b, a
     ld      a, [HtmlIndent]
+    ld      hl, LineWrapCont
+    add     a, [hl]                     ; + wrap-continuation extra
     srl     a
     srl     a                           ; A = indent / 4 byte-cols
     ld      c, a                        ; (re-use C; restored below)
@@ -6399,6 +6406,8 @@ LineDrawCells:
     jr      .alHave
 .alCenter:
     ld      a, [HtmlIndent]
+    ld      hl, LineWrapCont
+    add     a, [hl]
     srl     a
     srl     a
     ld      b, a                        ; B = indent byte-cols
@@ -6998,6 +7007,7 @@ SmartWrap:
     ld      a, b
     ld      [LineLen], a
     call    .swDoNewline                ; cell-aware newline dispatch
+    call    .swWrapContSetup            ; in-list wrap: indent the continuation
 
     ; Re-emit stashed tail cells onto the new line via EmitRaw so wrap +
     ; TextX advance behave normally. Stash EmitCellAttr around the loop in
@@ -7031,9 +7041,12 @@ SmartWrap:
     ret
 
 .swHardWrap:
-    ; No last-space found: hard wrap. Tail-call the dispatch helper
-    ; below so the in-table case still ends up in CellNewline instead
-    ; of EmitNewline (which would jump cell text back to TextX = 0).
+    ; No last-space found: hard wrap. Same as the soft-wrap tail except
+    ; there's no buffered tail to re-emit, so we run the in-list
+    ; continuation-indent hook ourselves and return to the caller (who
+    ; will then append the wrap-triggering glyph onto the fresh line).
+    call    .swDoNewline
+    jp      .swWrapContSetup
 .swDoNewline:
     ; Per-line newline used by both the soft-wrap and hard-wrap paths.
     ; Inside a <table> cell SmartWrap is asked to wrap text against
@@ -7047,7 +7060,36 @@ SmartWrap:
     jp      nz, CellNewline
     jp      EmitNewline
 
+; .swWrapContSetup: after a SmartWrap-induced newline, if we're inside a
+; <ul>/<ol>, flag LineDrawCells to indent the continuation line by
+; LIST_WRAP_INDENT pixels past HtmlIndent and bump TextX so the
+; re-emitted (or hard-wrap-triggering) glyph appends past the bullet
+; column. No-op outside lists and inside tables (the table cell wrap
+; path lands at CellStartX, which is independent of HtmlIndent).
+.swWrapContSetup:
+    ld      a, [HtmlInTable]
+    or      a
+    ret     nz
+    ld      a, [HtmlListKind]
+    or      a
+    ret     z
+    ld      a, LIST_WRAP_INDENT
+    ld      [LineWrapCont], a
+    ld      hl, [TextX]
+    ld      bc, LIST_WRAP_INDENT
+    add     hl, bc
+    ld      [TextX], hl
+    ret
+
 SmartWrapSavedAttr: db 0
+
+; LineWrapCont: extra horizontal indent (in pixels) added to the line
+; currently being buffered. SmartWrap sets it to LIST_WRAP_INDENT after
+; a wrap inside a <ul>/<ol> so the continuation line lands aligned with
+; the start of the bullet/number's text body (not flush with the
+; bullet/number column). One-shot: LineFlush clears it after draw.
+LineWrapCont:   db 0
+LIST_WRAP_INDENT equ 24                     ; 3 cell-widths past HtmlIndent
 
 ; CellNewline: wrap inside a <table> cell. Flushes LineBuf at the
 ; current cell's left edge (CellStartX / current TextY), advances
@@ -19510,7 +19552,7 @@ AboutLine4:     db "F1 Help  F2 Back  F3 Fwd", 0
 AboutLine5:     db "F4 Clear  F5 Reload  F6 Save", 0
 AboutLine6:     db "M/Space PgDn  N PgUp", 0
 AboutLine7:     db "Stop Halt  Esc Quit", 0
-AboutFooter:    db "v0.84 Demo", 0
+AboutFooter:    db "v0.85 Demo", 0
 
 ; Screen-6 icon bitmaps (4 px/byte, 11=black, 01=bg/lgray).
 
