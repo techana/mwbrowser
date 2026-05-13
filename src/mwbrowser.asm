@@ -1833,9 +1833,13 @@ PaletteData:
     db  0x00, 0x00      ; 3 = black       RGB(0,0,0)   (solid)
 
 ; R#7 = border colour byte. Screen 6 uses bits 1..0 as a 2-bit palette index.
+; COL_BLACK gives a solid black overscan around the active 512x212 frame
+; (previously COL_LGRAY made the border the same light grey as the
+; titlebar/toolbar, which let the chrome bleed visually into the
+; surrounding wall of grey on a CRT or large openMSX window).
 SetBorder:
     di
-    ld      a, COL_LGRAY
+    ld      a, COL_BLACK
     out     (VDP_CMD), a
     ld      a, 0x80 | 7
     out     (VDP_CMD), a
