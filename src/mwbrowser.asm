@@ -3832,14 +3832,29 @@ DrawCharFast:
     call    EmitFontRow
     inc     c
 
-    ; ---- Scale 2x: output the same row again one pixel-row lower ----
+    ; ---- Scale 2x: output the same row again one pixel-row lower,
+    ; but paint the duplicate in light-gray (the dimmer FontLUT)
+    ; instead of the caller's normal palette. Solid pixel-double in
+    ; black turned glyphs with stacked horizontal strokes (Arabic
+    ; ق / م / ة, Latin m / w) into single black blobs because the
+    ; "duplicate" row's ink merged seamlessly with the next glyph
+    ; row's ink. Painting the duplicate one shade lighter gives a
+    ; CRT-scanline-style separation so adjacent dark rows stay
+    ; visually distinct without losing the doubled glyph height.
+    ; Save CurrentFontLUT, swap to FontLUT_LGray, emit, restore.
     ld      a, [HtmlScaleY]
     cp      2
     jr      nz, .rowDone
     push    bc
     call    SetVramWritePos
     pop     bc
+    ld      hl, [CurrentFontLUT]
+    push    hl
+    ld      hl, FontLUT_LGray
+    ld      [CurrentFontLUT], hl
     call    EmitFontRow
+    pop     hl
+    ld      [CurrentFontLUT], hl
     inc     c
 
 .rowDone:
