@@ -5648,6 +5648,12 @@ ShapePick:
     ld      a, [hl]
     ld      [ArCurr], a
 
+    ; No diacritic short-circuit: diacritics use the same prev/next
+    ; scan as letters so a shadda sitting between two connecting
+    ; letters can still pick up its Middle form (0xFC) -- and the
+    ; preceding letter looks past the diacritic (.prevScan /
+    ; .nextScan below) when computing its own form.
+
     ; currFlags = IsoJoin[curr - 0x80]
     sub     0x80
     ld      h, 0
@@ -5655,27 +5661,29 @@ ShapePick:
     ld      de, IsoJoin
     add     hl, de
     ld      a, [hl]
-    ld      [ArCurrFlags], a            ; stash — prev-neighbor's `ld de, ArBuf` clobbers E
-    ld      e, a                        ; E = curr flags (JOIN_LEFT/RIGHT)
+    ld      [ArCurrFlags], a
 
-    ; --- prev neighbor ---------------------------------------------------
-    ;   prev connects if  (C > 0)
-    ;                && (curr & JOIN_RIGHT)
-    ;                && (IsoJoin[prev-0x80] & JOIN_LEFT).
-    ld      a, c
-    or      a
-    jr      z, .prevDone
-    ld      a, e
+    ; --- prev neighbor (skip diacritics) ---------------------------------
+    ld      a, [ArCurrFlags]
     and     JOIN_RIGHT
     jr      z, .prevDone
     ld      a, c
+    or      a
+    jr      z, .prevDone
     dec     a
+    ld      [SP_scan], a
+.prevScan:
+    ld      a, [SP_scan]
     ld      h, 0
     ld      l, a
-    ld      d, 0                        ; DE = ArBuf (already loaded above? no -- reload)
     ld      de, ArBuf
     add     hl, de
-    ld      a, [hl]                     ; prev byte
+    ld      a, [hl]                     ; ArBuf[scan]
+    cp      0xEB
+    jr      c, .prevLetterByte
+    cp      0xF3
+    jr      c, .prevSkipBack            ; diacritic: keep scanning back
+.prevLetterByte:
     sub     0x80
     ld      h, 0
     ld      l, a
@@ -5687,26 +5695,37 @@ ShapePick:
     ld      a, [ArConnect]
     or      SHAPE_MASK_PREV
     ld      [ArConnect], a
+    jr      .prevDone
+.prevSkipBack:
+    ld      a, [SP_scan]
+    or      a
+    jr      z, .prevDone                ; ran off the front
+    dec     a
+    ld      [SP_scan], a
+    jr      .prevScan
 .prevDone:
 
-    ; --- next neighbor ---------------------------------------------------
-    ;   next connects if  (C+1 < B)
-    ;                && (curr & JOIN_LEFT)
-    ;                && (IsoJoin[next-0x80] & JOIN_RIGHT).
-    ld      a, c
-    inc     a
-    cp      b
-    jr      nc, .nextDone
-    ld      a, [ArCurrFlags]            ; reload: E was clobbered by prev-neighbor branch
+    ; --- next neighbor (skip diacritics) ---------------------------------
+    ld      a, [ArCurrFlags]
     and     JOIN_LEFT
     jr      z, .nextDone
     ld      a, c
     inc     a
+    cp      b
+    jr      nc, .nextDone
+    ld      [SP_scan], a
+.nextScan:
+    ld      a, [SP_scan]
     ld      h, 0
     ld      l, a
     ld      de, ArBuf
     add     hl, de
-    ld      a, [hl]                     ; next byte
+    ld      a, [hl]
+    cp      0xEB
+    jr      c, .nextLetterByte
+    cp      0xF3
+    jr      c, .nextSkipFwd
+.nextLetterByte:
     sub     0x80
     ld      h, 0
     ld      l, a
@@ -5718,6 +5737,14 @@ ShapePick:
     ld      a, [ArConnect]
     or      SHAPE_MASK_NEXT
     ld      [ArConnect], a
+    jr      .nextDone
+.nextSkipFwd:
+    ld      a, [SP_scan]
+    inc     a
+    cp      b
+    jr      nc, .nextDone               ; ran off the end
+    ld      [SP_scan], a
+    jr      .nextScan
 .nextDone:
 
     ; --- map connect bits to form ---------------------------------------
@@ -5995,6 +6022,7 @@ LineFlush:
     or      a
     jr      nz, .lfSkipDraw
 
+    call    RtlPunctClass               ; "7." -> "7" + RTL "."
     call    LineResolveNeutrals
     call    LineBidiReorder
     call    LineDrawCells
@@ -6106,6 +6134,75 @@ LSet_Glyph:
     pop     de
     pop     hl
     ret
+
+; RtlPunctClass: inside an RTL paragraph, tag punctuation cells with
+; CELL_RTL so BiDi positions them in the RTL flow instead of trailing
+; whatever LTR atom (digit / Latin word) preceded them. Punctuation
+; covered:
+;   ASCII:  .  ,  :  ;  ?  !
+;   ISO-8859-6 Arabic: 0xAC ,  0xBB ;  0xBF ?  (their post-IsoMap
+;   glyph codes are 0x8C / 0x9B / 0x9F).
+; Net effect for "<h2 dir=\"rtl\">7. ...</h2>": "7" stays a single-
+; cell LTR atom and prints at the right edge; "." joins the RTL flow
+; on its left. For body text like "0x7E، و" the Arabic comma now
+; comes after the LTR "0x7E" atom in RTL reading order ("،" at the
+; left of the "0x7E" block in pixel order, then 0x7E reading LTR).
+;
+; This is broader than UAX#9 N1 -- in a strict BiDi sense an ASCII
+; "." between an EN and a WS resolves to EN, keeping the LTR atom
+; intact. We deliberately diverge so Arabic typography conventions
+; carry through the line.
+RtlPunctClass:
+    ld      a, [HtmlDir]
+    and     CELL_RTL
+    ret     z                            ; LTR para -> no-op
+    ld      a, [LineLen]
+    or      a
+    ret     z
+    xor     a
+    ld      [RPC_i], a
+.rpcLoop:
+    ld      a, [RPC_i]
+    ld      b, a
+    ld      a, [LineLen]
+    cp      b
+    ret     z
+    ld      a, [RPC_i]
+    call    LGet_Glyph
+    cp      '.'
+    jr      z, .rpcTag
+    cp      ','
+    jr      z, .rpcTag
+    cp      ':'
+    jr      z, .rpcTag
+    cp      ';'
+    jr      z, .rpcTag
+    cp      '?'
+    jr      z, .rpcTag
+    cp      '!'
+    jr      z, .rpcTag
+    cp      0x8C                         ; Arabic comma  (IsoMap[0xAC])
+    jr      z, .rpcTag
+    cp      0x9B                         ; Arabic semicolon (IsoMap[0xBB])
+    jr      z, .rpcTag
+    cp      0x9F                         ; Arabic question mark (IsoMap[0xBF])
+    jr      z, .rpcTag
+    jr      .rpcNext
+.rpcTag:
+    ld      a, [RPC_i]
+    push    af
+    call    LGet_Attr
+    or      CELL_RTL
+    ld      b, a
+    pop     af
+    call    LSet_Attr
+.rpcNext:
+    ld      a, [RPC_i]
+    inc     a
+    ld      [RPC_i], a
+    jr      .rpcLoop
+
+RPC_i:          db 0
 
 ; LineResolveNeutrals: each CELL_NEUTRAL cell adopts the direction of its
 ; surrounding strong (non-neutral) cells — if both sides agree, use that;
@@ -20410,6 +20507,7 @@ ArLen:          db 0
 ArCurr:         db 0                    ; ShapePick scratch: byte being shaped
 ArCurrFlags:    db 0                    ; ShapePick scratch: curr's IsoJoin flags
 ArConnect:      db 0                    ; ShapePick scratch: SHAPE_MASK_* accum
+SP_scan:        db 0                    ; ShapePick scratch: neighbour scan index
 PlainTextMode:  db 0                    ; 1 when current file is .txt (no HTML)
 
 ; Step 5B: per-line glyph buffer (BiDi reorder + alignment). EmitRaw appends
