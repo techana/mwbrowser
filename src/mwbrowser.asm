@@ -6173,7 +6173,23 @@ LineResolveNeutrals:
     ld      b, a
     ld      a, [LN_prev]
     cp      b
-    jr      z, .lnAdopt
+    jr      nz, .lnUseParaDir           ; mismatched neighbours -> paragraph dir
+    ; Same direction on both sides. Inherit, EXCEPT inside an RTL
+    ; paragraph when both neighbours are LTR: force the neutral to
+    ; the paragraph (RTL) direction so the LTR atoms either side
+    ; render as separate runs that LineBidiReorder.rtlPara can
+    ; position individually ("7." right of "MSX", each LTR-internal).
+    ; Without this the inner space would join the two LTR atoms into
+    ; one big LTR run and the heading would land with "X" at the
+    ; right edge instead of the Latin atoms tracking the RTL flow.
+    or      a                            ; A still = LN_prev (== B)
+    jr      nz, .lnAdopt                 ; both sides RTL -> keep RTL
+    ld      a, [HtmlDir]
+    and     CELL_RTL
+    jr      nz, .lnUseParaDir            ; RTL para + LTR-LTR neutrals -> split
+    xor     a                            ; LTR para: both LTR, inherit LTR
+    jr      .lnAdopt
+.lnUseParaDir:
     ld      a, [HtmlDir]
     and     CELL_RTL
 .lnAdopt:
@@ -6187,7 +6203,9 @@ LineResolveNeutrals:
     ld      b, a
     ld      a, [LN_i]
     cp      b
-    jr      z, .lnLoop                  ; done; LN_i already = e
+    jp      z, .lnLoop                  ; done; LN_i already = e (jp: my
+                                        ; expanded prev/next logic above
+                                        ; pushed .lnLoop out of jr range)
     ld      a, [LN_k]
     call    LGet_Attr
     ld      c, a
@@ -6215,16 +6233,14 @@ LN_dir:         db 0
 
 ; LineBidiReorder: UAX#9 L2 at a single level.
 ;   HtmlDir = 0 (LTR): reverse each contiguous CELL_RTL run.
-;   HtmlDir = 1 (RTL): reverse the whole line. Embedded Latin / digit
-;     sub-runs are intentionally LEFT in their post-reverse order so the
-;     paragraph reads consistently right-to-left at the cell level --
-;     "7. MSX foo" in an Arabic heading lands with "7" at the right
-;     edge and the Latin glyphs running leftward in logical order
-;     (Arabic readers encounter them in the same direction as the
-;     surrounding Arabic). Standard UAX#9 would un-reverse Latin runs
-;     to keep them visually LTR, but the in-line Arabic-typography
-;     convention this codebase targets keeps the whole heading
-;     RTL-flowing; see SECTION6_BUG.md for the user's worked example.
+;   HtmlDir = 1 (RTL): reverse the whole line, then re-reverse each
+;     non-RTL run so embedded Latin/digit atoms stay visually LTR
+;     ("MSX" reads M-S-X in pixel order). Atom-level positioning in
+;     the RTL flow is provided by LineResolveNeutrals: inside an RTL
+;     paragraph it forces spaces sitting between two LTR cells to
+;     adopt the paragraph direction, splitting "7. MSX" into the
+;     separate LTR atoms "7." and "MSX" so the slide reorders them
+;     individually instead of as one big LTR block.
 LineBidiReorder:
     ld      a, [HtmlDir]
     and     CELL_RTL
@@ -6271,14 +6287,52 @@ LineBidiReorder:
     jr      .ltrScan
 
 .rtlPara:
-    ; Reverse whole line and return. Latin / digit sub-runs do NOT get
-    ; un-reversed -- the entire RTL paragraph reads right-to-left at
-    ; cell granularity, including embedded Latin atoms.
+    ; Reverse whole line.
     xor     a
     ld      [BR_lo], a
     ld      a, [LineLen]
     ld      [BR_hi], a
-    jp      ReverseRangeStatic
+    call    ReverseRangeStatic
+    ; Re-reverse each non-RTL run so embedded Latin / digits keep
+    ; their LTR-internal pixel order.
+    xor     a
+    ld      [BR_i], a
+.rScan:
+    ld      a, [BR_i]
+    ld      b, a
+    ld      a, [LineLen]
+    cp      b
+    ret     z
+    ld      a, [BR_i]
+    call    LGet_Attr
+    and     CELL_RTL
+    jr      nz, .rAdv
+    ld      a, [BR_i]
+    ld      [BR_s], a
+.rFind:
+    ld      a, [BR_i]
+    inc     a
+    ld      [BR_i], a
+    ld      b, a
+    ld      a, [LineLen]
+    cp      b
+    jr      z, .rRev
+    ld      a, [BR_i]
+    call    LGet_Attr
+    and     CELL_RTL
+    jr      z, .rFind
+.rRev:
+    ld      a, [BR_s]
+    ld      [BR_lo], a
+    ld      a, [BR_i]
+    ld      [BR_hi], a
+    call    ReverseRangeStatic
+    jr      .rScan
+.rAdv:
+    ld      a, [BR_i]
+    inc     a
+    ld      [BR_i], a
+    jr      .rScan
 
 BR_i:           db 0
 BR_s:           db 0
