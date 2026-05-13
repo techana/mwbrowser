@@ -6142,6 +6142,10 @@ LSet_Glyph:
 ;   ASCII:  .  ,  :  ;  ?  !
 ;   ISO-8859-6 Arabic: 0xAC ,  0xBB ;  0xBF ?  (their post-IsoMap
 ;   glyph codes are 0x8C / 0x9B / 0x9F).
+; Also swaps the paired brackets "(" <-> ")" (and "[" <-> "]") because
+; an "open paren" written by an author for LTR reading is the RIGHT-
+; side bracket when the line reads right-to-left; mirroring matches
+; the BIDI_MIRRORED property without needing a dedicated reorder pass.
 ; Net effect for "<h2 dir=\"rtl\">7. ...</h2>": "7" stays a single-
 ; cell LTR atom and prints at the right edge; "." joins the RTL flow
 ; on its left. For body text like "0x7E، و" the Arabic comma now
@@ -6187,7 +6191,33 @@ RtlPunctClass:
     jr      z, .rpcTag
     cp      0x9F                         ; Arabic question mark (IsoMap[0xBF])
     jr      z, .rpcTag
+    ; Paired-bracket mirroring: "(" <-> ")" and "[" <-> "]".
+    cp      '('
+    jr      z, .rpcMirrorParen
+    cp      ')'
+    jr      z, .rpcMirrorParen
+    cp      '['
+    jr      z, .rpcMirrorBracket
+    cp      ']'
+    jr      z, .rpcMirrorBracket
     jr      .rpcNext
+.rpcMirrorParen:
+    ; A holds '(' (0x28) or ')' (0x29) -- XOR low bit flips between them.
+    xor     0x01
+    jr      .rpcWriteGlyph
+.rpcMirrorBracket:
+    ; A holds '[' (0x5B) or ']' (0x5D) -- difference is 2.
+    cp      '['
+    jr      nz, .rpcBracketClose
+    ld      a, ']'
+    jr      .rpcWriteGlyph
+.rpcBracketClose:
+    ld      a, '['
+.rpcWriteGlyph:
+    ld      b, a
+    ld      a, [RPC_i]
+    call    LSet_Glyph
+    jr      .rpcNext                     ; mirroring only; no CELL_RTL flip
 .rpcTag:
     ld      a, [RPC_i]
     push    af
@@ -15784,7 +15814,8 @@ MaybeSlideBackward:
     ld      hl, 0                        ; tiny window -> just show all of it
 .msbClampOk:
     ld      [ScrollLine], hl
-    jp      RefreshAfterScroll
+    call    RefreshAfterScroll
+    jp      KeyDrain
 
 ; SlideBackwardLocal: shift the FileBuf window one chunk backward
 ; through the open local file. target = max(0, DocOffset - FILE_BUF_SIZE).
@@ -15935,7 +15966,8 @@ PageDown:
     ld      [DocLinesBefore], hl
     ld      hl, 0
     ld      [ScrollLine], hl
-    jp      RefreshAfterScroll
+    call    RefreshAfterScroll
+    jp      KeyDrain
 .pdLocalSlide:
     call    SlideForwardLocal
     ret     c
@@ -15947,7 +15979,25 @@ PageDown:
     ld      [DocLinesBefore], hl
     ld      hl, 0
     ld      [ScrollLine], hl
-    jp      RefreshAfterScroll
+    call    RefreshAfterScroll
+    jp      KeyDrain
+
+; KeyDrain: consume any queued keystrokes via DOS_DIRIN until DOS_CONST
+; reports an empty buffer. Used at the end of a chunk-slide so the
+; user's Space-key auto-repeat (or impatient mash) doesn't immediately
+; fire a second PageDown over the freshly-slid-in viewport: by the
+; time the slow seek + read + render finishes (~13 s emulated on
+; AX-370), 6+ Space events have queued up; without drain, the next
+; mainloop poll picks the first one up and fast-flips to SL+21 before
+; the user can see the new chunk's SL=0 view.
+KeyDrain:
+    ld      c, DOS_CONST
+    call    BDOS_ENTRY
+    or      a
+    ret     z
+    ld      c, DOS_DIRIN
+    call    BDOS_ENTRY
+    jr      KeyDrain
 
 ; SlideForwardLocal: shift the FileBuf window one chunk forward
 ; through the open local file. Used by PageDown / ScrollDown when
