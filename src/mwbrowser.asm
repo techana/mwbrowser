@@ -3813,11 +3813,17 @@ DrawCharFast:
     ld      [FastFontByte], a
 
     ; ---- Output the styled row to VRAM ----
+    ; EmitFontRow does one row: at scale=1 a single EmitStyledByte
+    ; (8 mono pixels -> 2 VRAM bytes); at scale=2 the row is pixel-
+    ; doubled horizontally via SpreadTable (each nibble of the font
+    ; byte spreads to a full byte: bit_n -> bits 2n,2n+1) so two
+    ; EmitStyledByte calls land 4 VRAM bytes = 16 pixels in 2bpp.
+    ; Pairs with the scale-2 vertical re-emit below to render h1/h2
+    ; glyphs in a true 16x16 cell instead of an 8x16 stretched one.
     push    bc
     call    SetVramWritePos
     pop     bc
-    ld      a, [FastFontByte]
-    call    EmitStyledByte
+    call    EmitFontRow
     inc     c
 
     ; ---- Scale 2x: output the same row again one pixel-row lower ----
@@ -3827,8 +3833,7 @@ DrawCharFast:
     push    bc
     call    SetVramWritePos
     pop     bc
-    ld      a, [FastFontByte]
-    call    EmitStyledByte
+    call    EmitFontRow
     inc     c
 
 .rowDone:
@@ -3837,6 +3842,58 @@ DrawCharFast:
     ld      [FastRowsLeft], a
     jp      nz, .rowLoop
     ret
+
+; EmitFontRow: emit FastFontByte (the post-style 8 mono pixels) for the
+; current cell row. Scale=1 -> one EmitStyledByte = 2 VRAM bytes (8 px
+; in 2bpp). Scale=2 -> pixel-double horizontally via SpreadTable so the
+; row becomes 16 mono pixels, then two EmitStyledByte calls = 4 VRAM
+; bytes (16 px). The matching scale-2 vertical re-emit happens in the
+; caller's row loop. BC is preserved across the call (BC carries the
+; per-row VRAM byte-col + y that the caller passes to SetVramWritePos
+; on the next iteration).
+EmitFontRow:
+    push    bc
+    ld      a, [HtmlScaleY]
+    cp      2
+    jr      z, .efrDouble
+    ld      a, [FastFontByte]
+    call    EmitStyledByte
+    pop     bc
+    ret
+.efrDouble:
+    ld      a, [FastFontByte]
+    push    af                          ; save baseline byte across the calls
+    ; Left half: top nibble of FastFontByte spread to 8 mono pixels.
+    rrca
+    rrca
+    rrca
+    rrca
+    and     0x0F
+    ld      c, a
+    ld      b, 0
+    ld      hl, SpreadTable
+    add     hl, bc
+    ld      a, [hl]
+    call    EmitStyledByte
+    pop     af
+    ; Right half: bottom nibble.
+    and     0x0F
+    ld      c, a
+    ld      b, 0
+    ld      hl, SpreadTable
+    add     hl, bc
+    ld      a, [hl]
+    call    EmitStyledByte
+    pop     bc
+    ret
+
+; 4-bit -> 8-bit pixel-doubling lookup. bit n of input -> bits 2n,2n+1
+; of output. Consumed by EmitFontRow's scale=2 horizontal-double path.
+SpreadTable:
+    db      0b00000000, 0b00000011, 0b00001100, 0b00001111
+    db      0b00110000, 0b00110011, 0b00111100, 0b00111111
+    db      0b11000000, 0b11000011, 0b11001100, 0b11001111
+    db      0b11110000, 0b11110011, 0b11111100, 0b11111111
 
 ; EmitStyledByte: split A (= 2bpp pixel byte) into high/low nibble, map each
 ; through FontLUT, and send both bytes to the VDP data port. HL and A are
@@ -5869,7 +5926,16 @@ EmitRaw:
 
 .advance:
     ld      hl, [TextX]
-    ld      de, 8
+    ld      a, [HtmlScaleY]
+    add     a, a                        ; *2
+    add     a, a                        ; *4
+    add     a, a                        ; *8 = horizontal pitch (8 for
+                                         ; scale=1, 16 for scale=2 so h2
+                                         ; cells advance the pen by the
+                                         ; same 16 px width the doubled
+                                         ; glyph paints below).
+    ld      e, a
+    ld      d, 0
     add     hl, de
     ld      [TextX], hl
 
@@ -6291,10 +6357,20 @@ LineDrawCells:
     jp      .alHave
 
 .ldoDefault:
-    ; Width in byte-cols = len * 2 (each cell is 8 pixels = 2 byte-cols).
+    ; Width in byte-cols = len * 2 * ScaleY. Scale=1 cells are 8 px =
+    ; 2 byte-cols; scale=2 (h1/h2) cells pixel-double horizontally
+    ; via EmitFontRow's SpreadTable path so each cell occupies 16 px
+    ; = 4 byte-cols. Without the multiplier, right- and center-
+    ; aligned headings sized themselves against half-width and
+    ; landed left of where the cells actually paint.
     ld      a, [LineLen]
-    add     a, a
+    add     a, a                        ; LineLen * 2
     ld      c, a
+    ld      a, [HtmlScaleY]
+    cp      2
+    jr      nz, .ldoWidthOk
+    sla     c                           ; LineLen * 4 for scale=2
+.ldoWidthOk:
 
     ld      a, [HtmlAlign]
     cp      1
@@ -6399,11 +6475,21 @@ LineDrawCells:
     jp      SetLutFromPalette
 .dDraw:
 
-    ; byteCol = startCol + i * 2  (each cell is 2 byte-cols wide)
+    ; byteCol = startCol + i * 2 * ScaleY. Scale=1 cell is 2 byte-cols
+    ; wide (8 px); scale=2 cell is 4 byte-cols (16 px). Without the
+    ; multiplier the i-th scale=2 cell painted on top of the i/2-th
+    ; cell, smearing h1/h2 glyphs over each other.
     ld      a, [LineStartCol]
     ld      c, a
     ld      a, [LineDrawI]
-    add     a, a
+    add     a, a                        ; i * 2
+    ld      b, a
+    ld      a, [HtmlScaleY]
+    cp      2
+    ld      a, b
+    jr      nz, .ldcByteOk
+    add     a, a                        ; i * 4 for scale=2
+.ldcByteOk:
     add     a, c
     ld      b, a                        ; B = byteCol
 
@@ -6479,7 +6565,7 @@ LineDrawCells:
     ld      a, [LineDrawI]
     inc     a
     ld      [LineDrawI], a
-    jr      .dLoop
+    jp      .dLoop
 
 LineStartCol:   db 0
 LineDrawI:      db 0
@@ -20149,7 +20235,14 @@ FastCgSlot:     db 0                    ; cached CGPNT[0] for ExtractFont
 ; cursor+1 (after truncating any forward history) and roll out the oldest
 ; entry when the ring is full. HasPrev / HasNext are derived flags updated
 ; via HistoryUpdateFlags so the toolbar's enable logic keeps working.
-HISTORY_MAX     equ 8                   ; must be a power of two (for `and` mask)
+HISTORY_MAX     equ 4                   ; must be a power of two (for `and` mask).
+                                        ; Halved from 8 to free ~1 KB of BSS so
+                                        ; the FILEBUF_BASE + FILE_BUF_SIZE <=
+                                        ; FontBuf assert stays satisfied after
+                                        ; the scale=2 16x16 SpreadTable +
+                                        ; EmitFontRow additions; back/forward
+                                        ; still rings cleanly, just over 4
+                                        ; entries instead of 8.
 HISTORY_SLOT    equ URL_MAX + 1         ; bytes per slot
 
 HistoryOldest:  db 0
