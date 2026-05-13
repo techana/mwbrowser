@@ -3717,6 +3717,12 @@ DrawCharFast:
     ld      a, [HtmlScaleY]
     cp      2
     jr      z, .slowSetup
+    ld      a, [HtmlScaleX]              ; H1 sets ScaleX=2 even with no
+                                         ; vertical stretch; slow lane has
+                                         ; the EmitFontRow / SpreadTable
+                                         ; doubling logic, fast lane doesn't.
+    cp      2
+    jr      z, .slowSetup
     ld      a, [CurrentFontLUT]
     cp      LOW(FontLUT)
     jr      nz, .slowSetup
@@ -3853,7 +3859,11 @@ DrawCharFast:
 ; on the next iteration).
 EmitFontRow:
     push    bc
-    ld      a, [HtmlScaleY]
+    ; Horizontal pixel-double is gated on HtmlScaleX (H1 only), not
+    ; HtmlScaleY -- H2 keeps ScaleY=2 (vertical stretch) but
+    ; ScaleX=1 so its 8x16 cell continues to render with a single
+    ; EmitStyledByte per row.
+    ld      a, [HtmlScaleX]
     cp      2
     jr      z, .efrDouble
     ld      a, [FastFontByte]
@@ -4949,6 +4959,7 @@ PrintFileContent:
     ld      [HtmlLineSkip], hl
     ld      a, 1
     ld      [HtmlScaleY], a
+    ld      [HtmlScaleX], a
 
     ; Reset cursor to content top-left.
     xor     a
@@ -5926,11 +5937,12 @@ EmitRaw:
 
 .advance:
     ld      hl, [TextX]
-    ld      a, [HtmlScaleY]
+    ld      a, [HtmlScaleX]              ; horizontal scale (H1 = 2,
+                                         ; everything else including H2 = 1)
     add     a, a                        ; *2
     add     a, a                        ; *4
     add     a, a                        ; *8 = horizontal pitch (8 for
-                                         ; scale=1, 16 for scale=2 so h2
+                                         ; ScaleX=1, 16 for ScaleX=2 so H1
                                          ; cells advance the pen by the
                                          ; same 16 px width the doubled
                                          ; glyph paints below).
@@ -6364,12 +6376,12 @@ LineDrawCells:
     ; aligned headings sized themselves against half-width and
     ; landed left of where the cells actually paint.
     ld      a, [LineLen]
-    add     a, a                        ; LineLen * 2
+    add     a, a                        ; LineLen * 2 (= byte-cols at ScaleX=1)
     ld      c, a
-    ld      a, [HtmlScaleY]
+    ld      a, [HtmlScaleX]              ; H1's horizontal scale
     cp      2
     jr      nz, .ldoWidthOk
-    sla     c                           ; LineLen * 4 for scale=2
+    sla     c                           ; LineLen * 4 for H1 (16-px cells)
 .ldoWidthOk:
 
     ld      a, [HtmlAlign]
@@ -6482,13 +6494,13 @@ LineDrawCells:
     ld      a, [LineStartCol]
     ld      c, a
     ld      a, [LineDrawI]
-    add     a, a                        ; i * 2
+    add     a, a                        ; i * 2 (= byte-cols per ScaleX=1 cell)
     ld      b, a
-    ld      a, [HtmlScaleY]
+    ld      a, [HtmlScaleX]              ; H1's horizontal scale
     cp      2
     ld      a, b
     jr      nz, .ldcByteOk
-    add     a, a                        ; i * 4 for scale=2
+    add     a, a                        ; i * 4 for H1 (16-px cells)
 .ldcByteOk:
     add     a, c
     ld      b, a                        ; B = byteCol
@@ -6597,10 +6609,17 @@ IsLinePlain:
     ld      a, [HtmlStyleFlags]
     or      a
     ret     nz
-    ; HtmlScaleY must be 1.
+    ; HtmlScaleY AND HtmlScaleX must both be 1. H1 sets ScaleX=2 even
+    ; though its ScaleY is also 2; H2 sets only ScaleY=2. Either way,
+    ; the fast row-major lane (DrawPlainLineRowMajor) only handles the
+    ; un-scaled cell stride / single-row-per-cell case.
     ld      a, [HtmlScaleY]
     cp      2
+    jr      z, .ilpReject
+    ld      a, [HtmlScaleX]
+    cp      2
     jr      nz, .ilpScaleOk
+.ilpReject:
     or      a                            ; force NZ
     ret
 .ilpScaleOk:
@@ -12801,59 +12820,77 @@ TagHr:
 ; half-line gap, and clear only the style bits we turned on for this
 ; tag so nested styling survives.
 
-; Each heading loads (scale, style-mask) into (B, C) and falls into the
-; shared Hx dispatcher. The dispatcher handles open (set style bits +
-; scale), close (reset scale to 1, clear the same bits), and the
-; half-line gap above and below the block.
+; Each heading loads (ScaleY, style-mask, ScaleX) into (B, C, D) and
+; falls into the shared Hx dispatcher. ScaleY = vertical row repeat
+; (1 = 8 px tall, 2 = 16 px tall). ScaleX = horizontal pixel-double
+; (1 = 8 px wide normal cell, 2 = 16 px wide via DrawCharFast's
+; SpreadTable path so the glyph paints as a true 16x16 square).
+; H1 alone takes ScaleX=2 -- "the chunky one"; H2..H6 stay
+; ScaleX=1 so their scale=2 fans keep the original 8x16 stretched
+; cell (= h1 alone gets the 16x16 upgrade, H2 keeps its smaller
+; look). H1 also drops STYLE_UNDERLINE since the 16x16 cell is
+; visually heavy enough.
 TagH1:
     ld      b, 2
-    ld      c, STYLE_BOLD | STYLE_UNDERLINE
+    ld      c, STYLE_BOLD
+    ld      d, 2
     jr      HxDispatch
 TagH2:
     ld      b, 2
     ld      c, STYLE_BOLD
+    ld      d, 1
     jr      HxDispatch
 TagH3:
     ld      b, 1
     ld      c, STYLE_BOLD | STYLE_UNDERLINE
+    ld      d, 1
     jr      HxDispatch
 TagH4:
     ld      b, 1
     ld      c, STYLE_BOLD
+    ld      d, 1
     jr      HxDispatch
 TagH5:
     ld      b, 1
     ld      c, STYLE_ITALIC | STYLE_UNDERLINE
+    ld      d, 1
     jr      HxDispatch
 TagH6:
     ld      b, 1
     ld      c, STYLE_ITALIC
+    ld      d, 1
 HxDispatch:
     ld      a, [HtmlIsClose]
     or      a
     jp      nz, .hxClose
     ; Open: blank above, then set scale + style bits.
     push    bc
+    push    de
     call    EnsureLineStart
     call    EmitHalfLineGap
     call    ApplyBlockAttrs
+    pop     de
     pop     bc
     ld      a, [HtmlStyleFlags]
     or      c
     ld      [HtmlStyleFlags], a
     ld      a, b
     ld      [HtmlScaleY], a
+    ld      a, d
+    ld      [HtmlScaleX], a
     ret
 .hxClose:
-    ; Close: end the line (at the heading's scale), reset scale to 1
-    ; so the half-line gap and following paragraph use normal text
-    ; pitch -- otherwise EmitNewline keeps stamping 16-px rows for
-    ; the rest of the document and content gets pushed onto extra
-    ; pages with visibly stretched line spacing.
+    ; Close: end the line (at the heading's scale), reset both
+    ; scales to 1 so the half-line gap and following paragraph use
+    ; normal text pitch + width -- otherwise EmitNewline keeps
+    ; stamping 16-px rows and EmitRaw keeps treating cells as 16-px-
+    ; wide, pushing the rest of the document onto extra pages with
+    ; visibly stretched line spacing and horizontal blow-up.
     push    bc
     call    EmitNewline
     ld      a, 1
     ld      [HtmlScaleY], a
+    ld      [HtmlScaleX], a
     call    EmitHalfLineGap
     call    ResetBlockAttrs
     pop     bc
@@ -20117,6 +20154,13 @@ HtmlLineCountSaved: dw 0
 ; entry.
 HtmlNoDraw:        db 0
 HtmlScaleY:     db 1                    ; 1 = normal glyph height, 2 = H1/H2
+HtmlScaleX:     db 1                    ; 1 = normal 8-px-wide cell, 2 = 16-px-
+                                        ; wide cell with horizontal pixel-doubling
+                                        ; (H1 only; H2 keeps ScaleX=1 so its
+                                        ; ScaleY=2 stretches the cell tall but
+                                        ; not wide, matching the historic
+                                        ; "narrow doubled" look the user wants
+                                        ; to keep for H2 specifically).
 HtmlInAnchor:   db 0                    ; 1 while inside an <a>..</a>
 HtmlFocusLink:  db 0xFF                 ; index of Tab-focused link (0xFF = none)
 HtmlPre:        db 0                    ; 1 while inside <pre>
