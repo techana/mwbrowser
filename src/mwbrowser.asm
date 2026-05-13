@@ -6214,8 +6214,16 @@ LN_dir:         db 0
 
 ; LineBidiReorder: UAX#9 L2 at a single level.
 ;   HtmlDir = 0 (LTR): reverse each contiguous CELL_RTL run.
-;   HtmlDir = 1 (RTL): reverse whole line, then reverse each non-RTL run
-;     to restore logical LTR order of embedded Latin text.
+;   HtmlDir = 1 (RTL): reverse the whole line. Embedded Latin / digit
+;     sub-runs are intentionally LEFT in their post-reverse order so the
+;     paragraph reads consistently right-to-left at the cell level --
+;     "7. MSX foo" in an Arabic heading lands with "7" at the right
+;     edge and the Latin glyphs running leftward in logical order
+;     (Arabic readers encounter them in the same direction as the
+;     surrounding Arabic). Standard UAX#9 would un-reverse Latin runs
+;     to keep them visually LTR, but the in-line Arabic-typography
+;     convention this codebase targets keeps the whole heading
+;     RTL-flowing; see SECTION6_BUG.md for the user's worked example.
 LineBidiReorder:
     ld      a, [HtmlDir]
     and     CELL_RTL
@@ -6262,51 +6270,14 @@ LineBidiReorder:
     jr      .ltrScan
 
 .rtlPara:
-    ; Reverse whole line.
+    ; Reverse whole line and return. Latin / digit sub-runs do NOT get
+    ; un-reversed -- the entire RTL paragraph reads right-to-left at
+    ; cell granularity, including embedded Latin atoms.
     xor     a
     ld      [BR_lo], a
     ld      a, [LineLen]
     ld      [BR_hi], a
-    call    ReverseRangeStatic
-    ; Reverse each non-RTL run.
-    xor     a
-    ld      [BR_i], a
-.rScan:
-    ld      a, [BR_i]
-    ld      b, a
-    ld      a, [LineLen]
-    cp      b
-    ret     z
-    ld      a, [BR_i]
-    call    LGet_Attr
-    and     CELL_RTL
-    jr      nz, .rAdv
-    ld      a, [BR_i]
-    ld      [BR_s], a
-.rFind:
-    ld      a, [BR_i]
-    inc     a
-    ld      [BR_i], a
-    ld      b, a
-    ld      a, [LineLen]
-    cp      b
-    jr      z, .rRev
-    ld      a, [BR_i]
-    call    LGet_Attr
-    and     CELL_RTL
-    jr      z, .rFind
-.rRev:
-    ld      a, [BR_s]
-    ld      [BR_lo], a
-    ld      a, [BR_i]
-    ld      [BR_hi], a
-    call    ReverseRangeStatic
-    jr      .rScan
-.rAdv:
-    ld      a, [BR_i]
-    inc     a
-    ld      [BR_i], a
-    jr      .rScan
+    jp      ReverseRangeStatic
 
 BR_i:           db 0
 BR_s:           db 0
@@ -19539,7 +19510,7 @@ AboutLine4:     db "F1 Help  F2 Back  F3 Fwd", 0
 AboutLine5:     db "F4 Clear  F5 Reload  F6 Save", 0
 AboutLine6:     db "M/Space PgDn  N PgUp", 0
 AboutLine7:     db "Stop Halt  Esc Quit", 0
-AboutFooter:    db "v0.83 Demo", 0
+AboutFooter:    db "v0.84 Demo", 0
 
 ; Screen-6 icon bitmaps (4 px/byte, 11=black, 01=bg/lgray).
 
