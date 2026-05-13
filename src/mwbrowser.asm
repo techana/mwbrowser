@@ -19513,7 +19513,7 @@ AboutLine4:     db "F1 Help  F2 Back  F3 Fwd", 0
 AboutLine5:     db "F4 Clear  F5 Reload  F6 Save", 0
 AboutLine6:     db "M/Space PgDn  N PgUp", 0
 AboutLine7:     db "Stop Halt  Esc Quit", 0
-AboutFooter:    db "v0.81 Demo", 0
+AboutFooter:    db "v0.82 Demo", 0
 
 ; Screen-6 icon bitmaps (4 px/byte, 11=black, 01=bg/lgray).
 
