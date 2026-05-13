@@ -4629,11 +4629,12 @@ LoadFileChunk:
     jr      nz, .lfcSeqLoop
     jr      .lfcDone
 
-    ; -- doc_offset != 0: RDRND-per-record, manually bumping R0..R2 --
-    ; (Phase 5 hooks here once EnsureWindow-driven backward fetches
-    ; arrive. Today no caller takes this path; the code is in place
-    ; so the primitive is complete and Phase 5 doesn't touch
-    ; LoadFileChunk at all.)
+    ; -- doc_offset != 0: RDRND-per-record, manually bumping R0..R2.
+    ; MSX-DOS 1.03 does NOT advance FCB+33..35 for the caller, and
+    ; DOS_READ-after-RDRND ended up re-reading the same record on the
+    ; AX-370 stack (chunk-2 first bytes appeared twice in FileBuf).
+    ; Keep the explicit per-record bump; the per-call overhead is the
+    ; price of MSX-DOS 1's random I/O contract.
 .lfcRandom:
     ; Load 24-bit DocOffset into A:HL (high byte in A, low word in HL),
     ; then right-shift 7 to convert byte_offset to record_index. Result
@@ -4696,7 +4697,67 @@ LoadFileChunk:
     jr      nz, .lfcRndLoop
 
 .lfcDone:
+    ; Clamp WindowLen to a word boundary if a full chunk was read (so
+    ; there are more bytes ahead in the file -- the slide will reach
+    ; them on the next PageDown). Otherwise the chunk-1 viewport ends
+    ; mid-word at FileBuf[WindowLen-1] ("inside the game ROM. Track")
+    ; and chunk-2 starts with the orphan suffix ("ks from..."). With
+    ; the clamp, chunk-1 ends right after the last whitespace before
+    ; WindowLen and chunk-2's SlideTarget = DocOffset + WindowLen
+    ; lands at the next word.
+    call    ClampWindowLenToWordBoundary
     xor     a
+    ret
+
+; ClampWindowLenToWordBoundary: when WindowLen == FILE_BUF_SIZE (a full
+; chunk was loaded; the next byte after the buffer is still in the
+; file), scan FileBuf backward from the buffer end for the last
+; whitespace cell and set WindowLen there. The bytes past the clamp
+; are kept in FileBuf (cheap memory) but the parser stops at the
+; clamp, so the visible viewport never tears a word in half across a
+; chunk-slide boundary. No-op when WindowLen < FILE_BUF_SIZE (last
+; chunk of file, the natural end-of-file boundary is fine).
+; Clobbers A, BC, DE, HL.
+ClampWindowLenToWordBoundary:
+    ld      hl, [WindowLen]
+    ld      de, FILE_BUF_SIZE
+    or      a
+    sbc     hl, de
+    ret     nz                          ; WindowLen != FILE_BUF_SIZE -> EOF, skip
+    ; Scan backward from FileBuf[FILE_BUF_SIZE-1] for whitespace.
+    ; Limit the scan to the last 1 KB so a chunk that's all one giant
+    ; cell (an SC6 dump or similar) doesn't waste the whole chunk.
+    ld      hl, FileBuf + FILE_BUF_SIZE - 1
+    ld      bc, 1024                    ; max scanback
+.cwbScan:
+    ld      a, [hl]
+    cp      ' '
+    jr      z, .cwbFound
+    cp      0x0A
+    jr      z, .cwbFound
+    cp      0x09
+    jr      z, .cwbFound
+    cp      0x0D
+    jr      z, .cwbFound
+    dec     hl
+    dec     bc
+    ld      a, b
+    or      c
+    jr      nz, .cwbScan
+    ret                                 ; no whitespace in 1 KB -> leave WindowLen
+.cwbFound:
+    ; HL points at the whitespace cell. Set WindowLen = (HL - FileBuf)
+    ; so the parser stops AT the whitespace (the whitespace itself is
+    ; the last emitted cell, neatly closing the line). Chunk-2's
+    ; SlideTarget = DocOffset + WindowLen then lands at the whitespace
+    ; -- the slide's 128-byte align in EnsureWindowLocal.ewlSlide
+    ; rounds it down toward FileBuf[whitespace], so the first byte of
+    ; chunk-2 is the next word's first letter (or the whitespace
+    ; itself; either way no mid-word tear on screen).
+    ld      de, FileBuf
+    or      a
+    sbc     hl, de
+    ld      [WindowLen], hl
     ret
 
 ; ============================================================================
@@ -4791,7 +4852,19 @@ EnsureWindowLocal:
     sbc     a, 0
     jr      c, .ewlAlreadyIn             ; (target - DocOffset) < WindowLen -> in-window
 .ewlSlide:
-    ; Align SlideTarget down to a 128-byte record boundary in place.
+    ; SlideTarget came in pointing at the word-boundary byte the
+    ; chunk-1 PFC stopped at (ClampWindowLenToWordBoundary trims
+    ; WindowLen back to the last whitespace; SlideForwardLocal then
+    ; uses DocOffset + WindowLen as SlideTarget). DOS_RDRND wants
+    ; 128-byte alignment though, so we stash the slack
+    ; (target - aligned_target) into SlideSkip and tell
+    ; LoadFileChunk's caller to memmove FileBuf left by that many
+    ; bytes after the read finishes -- chunk-2 then logically begins
+    ; at the word boundary (no orphan "rtridges" tail showing as the
+    ; first cells on the new chunk).
+    ld      a, [SlideTarget]
+    and     0x7F
+    ld      [SlideSkip], a               ; 0..127 bytes to discard
     ld      a, [SlideTarget]
     and     0x80
     ld      [SlideTarget], a
@@ -4831,6 +4904,9 @@ EnsureWindowLocal:
     ld      de, Fcb
     call    BDOS_ENTRY
     pop     af
+    or      a
+    jr      nz, .ewlExit                 ; read failed -> bail without skip
+    call    DropLeadOrphans              ; consume SlideSkip leading bytes
 
 .ewlExit:
     pop     hl
@@ -4845,6 +4921,61 @@ EnsureWindowLocal:
 .ewlOpenFail:
     or      1
     jr      .ewlExit
+
+; DropLeadOrphans: after a slide loads FileBuf at the 128-byte boundary
+; just below SlideTarget, shift FileBuf left by SlideSkip bytes so the
+; cells at FileBuf[0..SlideSkip-1] (already drawn on the previous
+; chunk's tail) are discarded. WindowLen shrinks and DocOffset rises
+; by the same amount, so the slide-into-position math (HtmlLineCount,
+; ScrollLine, scroll thumb) sees a buffer that logically starts at
+; SlideTarget. No-op when SlideSkip == 0 (target was already
+; 128-aligned). Uses LDIR; src > dst keeps it overlap-safe.
+DropLeadOrphans:
+    ld      a, [SlideSkip]
+    or      a
+    ret     z
+    push    bc
+    push    de
+    push    hl
+
+    ld      e, a
+    ld      d, 0                         ; DE = skip count
+
+    ; new_WindowLen = WindowLen - skip
+    ld      hl, [WindowLen]
+    or      a
+    sbc     hl, de
+    ld      [WindowLen], hl              ; HL = byte count to keep
+
+    ld      b, h
+    ld      c, l                         ; BC = byte count to ldir
+    ld      a, b
+    or      c
+    jr      z, .dloDocOff                ; chunk fully orphaned -> just bump DocOff
+
+    ld      hl, FileBuf
+    add     hl, de                       ; HL = src = FileBuf + skip
+    push    de
+    ld      de, FileBuf                  ; DE = dst
+    ldir
+    pop     de
+
+.dloDocOff:
+    ; DocOffset += skip (24-bit add). DE holds skip; high byte 0.
+    ld      hl, [DocOffset]
+    add     hl, de
+    ld      [DocOffset], hl
+    jr      nc, .dloDone
+    ld      hl, DocOffset + 2
+    inc     [hl]
+.dloDone:
+    pop     hl
+    pop     de
+    pop     bc
+    xor     a                            ; preserve A=0 success contract
+    ret
+
+SlideSkip:      db 0
 
 ; ============================================================================
 ; Step 3: HTML 2.0 parser + renderer
