@@ -4796,6 +4796,17 @@ EnsureWindowLocal:
     and     0x80
     ld      [SlideTarget], a
 
+    ; Rebuild the FCB from the doc URL before reopening. <img> tags
+    ; dispatched during the previous render reuse the same Fcb (see
+    ; ImgStreamOpenName -> BuildFcbFromHL), so by slide time it points
+    ; at the LAST image file we streamed (e.g. MSXCOMP.SC6 for the
+    ; section-2 figure in MSX_Story.htm). Without this, DOS_OPEN
+    ; reopens that image file and LoadFileChunk reads pixel bytes from
+    ; offset SlideTarget into FileBuf -- the parser then walks those
+    ; SC6 bitmap bytes as HTML and the screen fills with glyph soup
+    ; (every section past the first slide boundary).
+    call    BuildFcbFromUrl
+
     ; Reopen FCB.
     call    ResetFcbTail
     ld      c, DOS_OPEN
@@ -19528,7 +19539,7 @@ AboutLine4:     db "F1 Help  F2 Back  F3 Fwd", 0
 AboutLine5:     db "F4 Clear  F5 Reload  F6 Save", 0
 AboutLine6:     db "M/Space PgDn  N PgUp", 0
 AboutLine7:     db "Stop Halt  Esc Quit", 0
-AboutFooter:    db "v0.82 Demo", 0
+AboutFooter:    db "v0.83 Demo", 0
 
 ; Screen-6 icon bitmaps (4 px/byte, 11=black, 01=bg/lgray).
 
