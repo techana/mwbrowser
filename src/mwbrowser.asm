@@ -9348,16 +9348,30 @@ TagTitle:
 
 ; <ul>: bullet list. Open indents by 16 px and switches bullet style.
 ; Close restores. No nesting state beyond a single level.
+;
+; Ordering note: the +16 indent and HtmlListKind=1 MUST be set BEFORE
+; EmitBlankLine, not after, even though the blank line itself doesn't
+; care about either value. EmitBlankLine calls EmitNewline which calls
+; LineCacheMaybeAppend, which snapshots the LIVE parser state alongside
+; a doc_offset that already points past the <ul> tag. If we did the
+; blank line first and the snapshot fired there, the cached slot would
+; carry HtmlIndent=0 / HtmlListKind=0 but the offset would land inside
+; the list scope. A later PageDown that restores from that slot then
+; walks straight to the matching </ul>, which runs `sub 16` against
+; HtmlIndent=0 and underflows to 0xF0 -- pushing every block that
+; follows ~240 px right (the "section 3 list collapses into a narrow
+; right column" bug). Setting the state first keeps the snapshot
+; consistent with its offset.
 TagUl:
     ld      a, [HtmlIsClose]
     or      a
     jr      nz, .close
-    call    EmitBlankLine
     ld      a, 1                        ; kind 1 = bullet '*' (see EmitListBullet)
     ld      [HtmlListKind], a
     ld      a, [HtmlIndent]
     add     a, 16
     ld      [HtmlIndent], a
+    call    EmitBlankLine
     ; Inherit dir / align from the <ul ...> attributes so
     ; <ul dir="rtl"> actually right-aligns its <li> rows (default
     ; right-align comes from ApplyBlockAttrs's dir=rtl branch).
@@ -9382,11 +9396,11 @@ TagUl:
     jp      EmitBlankLine
 
 ; <ol>: ordered list. Same as <ul> but bullet style 2 and a counter.
+; State-before-blank ordering rationale: see TagUl head comment.
 TagOl:
     ld      a, [HtmlIsClose]
     or      a
     jr      nz, .close
-    call    EmitBlankLine
     ld      a, 2
     ld      [HtmlListKind], a
     xor     a
@@ -9394,6 +9408,7 @@ TagOl:
     ld      a, [HtmlIndent]
     add     a, 16
     ld      [HtmlIndent], a
+    call    EmitBlankLine
     jp      ApplyBlockAttrs             ; pick up dir="rtl" / align=
 .close:
     xor     a
@@ -9475,15 +9490,15 @@ TagPre:
     jp      EmitBlankLine
 
 ; <blockquote>: widen the left indent by 32 px for the block.
+; State-before-blank ordering: see TagUl head comment.
 TagBlockquote:
     ld      a, [HtmlIsClose]
     or      a
     jr      nz, .close
-    call    EmitBlankLine
     ld      a, [HtmlIndent]
     add     a, 32
     ld      [HtmlIndent], a
-    ret
+    jp      EmitBlankLine
 .close:
     ; Flush the buffered last line at the wider indent BEFORE
     ; dropping HtmlIndent -- same shape as TagUl/TagOl close, see
