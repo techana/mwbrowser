@@ -65,3 +65,10 @@
 # on fresh clones.
 !tools/root/
 !tools/root/.gitkeep
+
+# CLAUDE.md / claude-code memory live local-only. Even with the
+# "whitelist after `*`" shape above, listing them here makes the
+# intent explicit so a future "!*.md" or similar broad whitelist
+# can't accidentally re-include them.
+CLAUDE.md
+.claude/
