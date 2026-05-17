@@ -1433,6 +1433,7 @@ UrlEncIsSafe:
 
 ; UrlAppendEncA: like UrlAppendA, but percent-encodes A when it isn't
 ; an unreserved char. Uses HexDigits below for the hex nybbles.
+; Preserves: AF.
 UrlAppendEncA:
     push    af
     call    UrlEncIsSafe
@@ -1987,6 +1988,7 @@ VdpSetReadAddr:
 ; T-states / byte) to `out / djnz` (24 T-states / byte) -- ~52 %
 ; faster on the only bulk caller (ClearContent's 27 KB startup
 ; paint, which now finishes ~195 ms earlier on a 3.58 MHz Z80).
+; Preserves: AF.
 VdpFill:
     push    af
     call    VdpSetWriteAddr
@@ -2173,6 +2175,7 @@ SetVramReadPos:
 ;
 ; The destination page is taken from WritesToPage so the lesson-4
 ; page-flip + prerender still target the back buffer correctly.
+; Preserves: BC.
 FillRect:
     push    bc
     call    PackColour                       ; A = packed colour byte
@@ -2312,6 +2315,8 @@ ClearContent:
     ld      a, COL_WHITE
     jp      FillRect
 
+; VdpSetR14: (auto-annotation, see body for behaviour)
+; Preserves: BC.
 VdpSetR14:
     ; quick_screen_draw / lesson #4: when WritesToPage is set,
     ; add 2 to the front-page R14 base so VRAM writes land in the
@@ -2337,6 +2342,7 @@ VdpSetR14:
 ; sends to the screen. 0 = page 0 (default after CHGMOD 6, R2 = 0x1F),
 ; 1 = page 1 (R2 = 0x3F -- bit 5 selects the higher 32 KB region).
 ;   A = 0 or 1.
+; Preserves: AF.
 VdpSetDisplayPage:
     ; A on return is contract-preserved: RefreshAfterScroll's phase-6
     ; idle-state setup reuses it as `ld [WritesToPage], a`. Without
@@ -3873,6 +3879,7 @@ DrawCharFast:
 ; caller's row loop. BC is preserved across the call (BC carries the
 ; per-row VRAM byte-col + y that the caller passes to SetVramWritePos
 ; on the next iteration).
+; Preserves: BC.
 EmitFontRow:
     push    bc
     ; Horizontal pixel-double is gated on HtmlScaleX (H1 only), not
@@ -3924,6 +3931,7 @@ SpreadTable:
 ; EmitStyledByte: split A (= 2bpp pixel byte) into high/low nibble, map each
 ; through FontLUT, and send both bytes to the VDP data port. HL and A are
 ; clobbered; BC, DE preserved.
+; Preserves: AF.
 EmitStyledByte:
     push    af
     and     0xF0
@@ -3961,6 +3969,7 @@ BuildFcbFromUrl:
 ; BuildFcbFromHL: same as BuildFcbFromUrl but HL on entry points at the
 ; NUL-terminated filename/path to parse. Used by the external <img>
 ; loaders (src="foo.sc6" etc.) without stomping on UrlBuf.
+; Preserves: HL.
 BuildFcbFromHL:
     push    hl
     ld      hl, Fcb
@@ -4374,6 +4383,7 @@ LuiTries: db 0
 ; component of a URL like "http://127.0.0.1/SERPOC.COM" instead of
 ; the whole string (BuildFcbFromUrl stops at the first '.' in the
 ; host, producing FCB ext from random URL bytes).
+; Preserves: HL.
 FindUrlBasename:
     push    hl
     ld      d, h
@@ -4873,6 +4883,7 @@ ClearContentArea:
 ; juggling that A:HL register-pair conventions would force across
 ; all the BDOS calls below; the slide path is rare enough that the
 ; ~6-byte cost (load/store) is invisible.
+; Preserves: BC, DE, HL.
 EnsureWindowLocal:
     push    bc
     push    de
@@ -5680,6 +5691,7 @@ EmitSink:
 ; go straight to EmitRaw as a single glyph (ASCII stays as-is; upper ISO
 ; bytes are looked up in IsoMap[.Isolated]).
 ; ----------------------------------------------------------------------------
+; Preserves: BC, HL, DE.
 EmitIsoByte:
     push    bc
     push    hl
@@ -6004,6 +6016,7 @@ LamAlefLigature:
 ;   A  = char
 ; Wraps at CONTENT_X_END and is a no-op while HtmlLineSkip > 0 (scrolled lines).
 ; Picks up the cell attr byte from EmitCellAttr (ArFlush sets CELL_RTL there).
+; Preserves: HL, BC.
 EmitRaw:
     push    hl
     push    bc
@@ -7505,6 +7518,7 @@ LIST_WRAP_INDENT equ 24                     ; 3 cell-widths past HtmlIndent
 ;     CountTableRow add at the END of the row instead of adding
 ;     per-wrap (so HtmlLineSkip stays in sync with the row's
 ;     pixel advance which also happens once per row).
+; Preserves: AF, BC, DE, HL.
 CellNewline:
     push    af
     push    bc
@@ -7820,6 +7834,7 @@ LineCacheMaybeAppend:
 ; compacting them into slots 0..15. Halves LineCacheCount. Called by
 ; LineCacheMaybeAppend just after stride doubles, so the cache stays
 ; evenly spread across the doc as more lines arrive.
+; Preserves: AF, BC, DE, HL.
 LineCacheDecimate:
     push    af
     push    bc
@@ -8106,6 +8121,7 @@ Cmp24:
 ; an exact match or one line shy of the target. Either way the
 ; subsequent parser walks at most ~1 cell rather than re-walking
 ; the full prefix from byte 0.
+; Preserves: DE, BC, HL.
 LineCacheLookupLine:
     push    de
     push    bc
@@ -8168,6 +8184,7 @@ LineCacheLookupLine:
 ; Walks every populated slot once -- LineCacheMax = 32 so the linear
 ; scan finishes in <~1000 T-states (24-bit compare is more expensive
 ; than 16-bit, but called rarely, once per slide).
+; Preserves: HL, DE, BC.
 LineCacheLookupOffset:
     push    hl
     push    de
@@ -8247,6 +8264,7 @@ LineCacheLookupOffset:
 ; In:  SlideTarget pre-set (24-bit).
 ; Out: SlideTarget = entry.doc_offset on cache hit (else unchanged).
 ;      PendingRestoreSlot = slot index or 0xFF.
+; Preserves: DE, BC, HL.
 SlideAlignTarget:
     push    de
     push    bc
@@ -11911,6 +11929,7 @@ DataMsxPrefixLen equ $ - DataMsxPrefix
 ; full-image buffer; each decoded byte is OUT'd straight to VRAM.
 ; Format: byte0 = width in bytes (pixels/4), byte1 = height in rows,
 ; then width_bytes * height raw Screen-6 2bpp bytes.
+; Preserves: HL.
 RenderImageDataUri:
     ; Flush anything the current paragraph has accumulated so the image
     ; doesn't overdraw pending text.
@@ -12948,6 +12967,7 @@ SetTableColLayout:
 ; bound-compare. Tag matching is case-insensitive via `and 0xDF` (works
 ; for ASCII letters; punctuation stays distinct enough that '/' and
 ; whitespace don't masquerade as a 'T'/'D'/'H'/'R').
+; Preserves: HL, DE, BC.
 MeasureTableCols:
     push    hl
     push    de
@@ -14216,6 +14236,7 @@ FormTypeIsFocusable:
 ; finalised so centered / right-aligned paragraphs still produce
 ; correct hit-test + in-place-paint coordinates. Stores delta/line-Y
 ; in scratch vars up-front so the inner loop can stay simple.
+; Preserves: BC, DE, HL.
 FormApplyLineOffset:
     push    bc
     push    de
@@ -14721,6 +14742,7 @@ TagTbl:
 ; HL is advanced past the closing ';'; on failure HL is left at '&'+1 so the
 ; caller sees the original stream.
 ; ----------------------------------------------------------------------------
+; Preserves: HL.
 ParseEntity:
     ; Save entry HL so we can bail out if this isn't a real entity.
     push    hl
@@ -17376,6 +17398,7 @@ FindAvailableDestName:
 ; file exists (and immediately closes it), CF=0 if not. Resets the
 ; FCB tail each probe so a previous failed open doesn't leak state
 ; into the next attempt.
+; Preserves: BC.
 ProbeDestExists:
     push    bc
     call    ResetSaveDestFcbTail
@@ -17538,6 +17561,7 @@ StrCopy:
 ; (floor). Max value 0xFFFF -> "63.9 KB". Returns DE past the last
 ; char. Doesn't NUL-terminate -- caller does, so this composes with
 ; StrCopy.
+; Preserves: BC.
 FormatKB:
     push    bc
 
@@ -17687,6 +17711,7 @@ ClickInSavePopup:
 ; Leaves the SetTextColours pair on BLACK-on-LGRAY so the caller can
 ; immediately DrawString body lines without re-setting colours.
 ; ----------------------------------------------------------------------------
+; Preserves: HL, BC, AF.
 DrawPopupFrame:
     push    hl                          ; save title ptr
     push    bc                          ; save title-bar bg colour (B)
@@ -18662,6 +18687,8 @@ SerialProbeOnce:
 ProbeReq:
     db      "GET PROBE", 0
 
+; SerialWrite: (auto-annotation, see body for behaviour)
+; Preserves: AF, BC.
 SerialWrite:    ; send byte in A; bounded poll for TxRDY so a stuck
                 ; UART (no cartridge / dead bridge) drops the byte
                 ; instead of locking the browser. Roughly a quarter
@@ -18699,6 +18726,7 @@ SerialWrite:    ; send byte in A; bounded poll for TxRDY so a stuck
 ; BIOS GRPPRT, which is happy to run with VBLANK masked -- no interrupt
 ; involvement, just VDP I/O.
 ; ---------------------------------------------------------------------------
+; Preserves: AF.
 BusyHeartbeat:
     push    af
     ; Only animate when caller is actually loading. PrintFileContent
@@ -18873,6 +18901,7 @@ SerialWriteZ:   ; HL -> NUL-terminated string.
 ; HasScheme (legacy): kept around for the few places that still want the
 ; "any ':/' anywhere in the URL" answer. New routing decisions go
 ; through IsLocalUrl below.
+; Preserves: HL.
 HasScheme:
     push    hl
 .hs:
@@ -18918,6 +18947,7 @@ IsLocalUrl:
 ; (case-insensitive), NZ otherwise. Used by LoadFile to route the
 ; hybrid bitmap pipeline. The match is "v","i","e","w",":" -- five
 ; chars, no whitespace allowed before.
+; Preserves: HL, BC.
 IsViewUrl:
     push    hl
     push    bc
@@ -18956,6 +18986,7 @@ IvuPattern: db "view:", 0
 
 ; UrlStripViewPrefix: shift UrlBuf left by 5 bytes (drop "view:")
 ; in place. Caller has confirmed the prefix exists via IsViewUrl.
+; Preserves: HL, DE, BC.
 UrlStripViewPrefix:
     push    hl
     push    de
@@ -18983,6 +19014,8 @@ UrlStripViewPrefix:
 ; Returns CF=1 on ERR / parse failure.
 RgGet:          db "GET ", 0
 RgGetView:      db "GET VIEW ", 0       ; hybrid bitmap pipeline
+; RemoteGet: (auto-annotation, see body for behaviour)
+; Preserves: HL.
 RemoteGet:
     push    hl
     ld      hl, RgGet
@@ -19305,6 +19338,7 @@ RemoteLoadFile:
 ; chunks already in FileBuf, so the user sees there's more to scroll
 ; before the auto-MORE fetch fires. When SerialPage == SerialPageTotal
 ; the multiplier collapses to 0 and TotalLines = HtmlLineCount exactly.
+; Preserves: BC, DE.
 StoreTotalLinesWithPages:
     push    bc
     push    de
