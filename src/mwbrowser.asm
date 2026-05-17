@@ -774,7 +774,7 @@ OnContent:
     jp      z, DoFormReset
     cp      ' '
     jp      z, DoFormReset
-    jr      .ocNoForm
+    ; Fall through to .ocNoForm.
 .ocNoForm:
     ld      a, b
     cp      KEY_ENTER
@@ -850,8 +850,7 @@ TabReverse:
     cp      0xFF
     jr      z, .trFormToLink
     ld      [HtmlFormFocus], a
-    call    RefreshContentInPlace
-    ret
+    jp      RefreshContentInPlace
 .trFormToLink:
     ; Past the first form slot. Clear form focus; go to last link if any.
     ld      a, 0xFF
@@ -861,8 +860,7 @@ TabReverse:
     jr      z, .trDropAll
     dec     a
     ld      [HtmlFocusLink], a
-    call    RefreshContentInPlace
-    ret
+    jp      RefreshContentInPlace
 .trLinkBack:
     ld      a, [HtmlFocusLink]
     cp      0xFF
@@ -871,8 +869,7 @@ TabReverse:
     jr      z, .trDropLink
     dec     a
     ld      [HtmlFocusLink], a
-    call    RefreshContentInPlace
-    ret
+    jp      RefreshContentInPlace
 .trDropLink:
     ld      a, 0xFF
     ld      [HtmlFocusLink], a
@@ -880,8 +877,7 @@ TabReverse:
 .trDropAll:
     ; No link / form to focus -- hand off to the toolbar cycle.
     call    CycleFocusBack
-    call    PaintToolbar
-    ret
+    jp      PaintToolbar
 
 ; CycleFocusBack: rotate Focus one step backward through the toolbar
 ; states (inverse of CycleFocus). Wraps at FOC_BACK.
@@ -2074,9 +2070,9 @@ VDP_RIND       equ 0x9B          ; indirect-register-write port (R17 selects sta
 ; runs; callers that need to block until the blit is complete
 ; should `call VdpCmdWait` after.
 VdpCmd:
-    push    hl
-    call    VdpCmdWait                  ; finish any in-flight blit first
-    pop     hl
+    call    VdpCmdWait                  ; finish any in-flight blit
+                                        ; first; VdpCmdWait only
+                                        ; touches A, so HL survives
     di
     ld      a, 32                       ; start at R32
     out     (VDP_CMD), a
@@ -3236,7 +3232,7 @@ DrawWidgetGlyph:
     ld      c, a
     ld      d, 2                            ; 2 bytes/row (8 px wide)
     ld      e, WG_HEIGHT
-    jr      DrawBitmap
+    ; Fall through to DrawBitmap.
 
 ; DrawBitmap: blit packed Screen-6 bitmap to VRAM at (B*4, C), D bytes * E rows.
 ;   B = byte column (x/4)
@@ -5344,7 +5340,7 @@ PrintFileContent:
     jr      z, .tag
     cp      '&'
     jr      z, .entity
-    jr      .emit
+    ; Fall through to .emit -- the byte is a plain glyph.
 
 .emit:
     ; EmitText / TitleAppend / EmitRaw all clobber HL for VRAM or buffer
@@ -6296,8 +6292,7 @@ SwapCellsAtIJ:
     ld      a, [SW_ai]
     ld      b, a
     ld      a, [SW_j]
-    call    LSet_Attr
-    ret
+    jp      LSet_Attr
 
 SW_i:           db 0
 SW_j:           db 0
@@ -6414,10 +6409,9 @@ RtlPunctClass:
     ld      b, a
     ld      a, [RPC_i]
     call    LSet_Glyph
-    jp      .rpcTag                      ; also tag CELL_RTL so BiDi
-                                         ; pulls the bracket into the
-                                         ; RTL flow with the rest of
-                                         ; the punctuation
+    ; Fall through to .rpcTag so the bracket cell is also tagged
+    ; CELL_RTL -- BiDi then pulls it into the RTL flow along with
+    ; the rest of the punctuation.
 .rpcTag:
     ld      a, [RPC_i]
     push    af
@@ -7670,8 +7664,7 @@ EmitNewline:
     xor     a
     ld      [HtmlWsPending], a
     ld      [HtmlLineHasWidget], a      ; consume: next line starts clean
-    call    LineCacheMaybeAppend
-    ret
+    jp      LineCacheMaybeAppend
 
 ; LineCacheMaybeAppend: append (HtmlLineCount, current_doc_offset) to
 ; LineCache if the conditions are right:
@@ -9842,9 +9835,9 @@ TagLi:
 ; line above and below; the inner <dt>/<dd> children do the actual
 ; layout, similar to <ul>/<li>.
 TagDl:
-    ld      a, [HtmlIsClose]
-    or      a
-    jp      z, EmitBlankLine
+    ; Open <dl> and close </dl> both emit a single blank line; the
+    ; HtmlIsClose check is irrelevant -- the unconditional jp covers
+    ; both cases.
     jp      EmitBlankLine
 
 ; <dt>: definition term. Renders flush-left on its own line, no extra
@@ -12323,12 +12316,12 @@ TagFont:
     ld      hl, HtmlFgStack
     add     hl, de
     ld      a, [hl]
-    jp      SetHtmlFg
+    ; Fall through to SetHtmlFg.
 
 ; SetHtmlFg: A = palette index (0..3). Updates HtmlFg + CurrentFontLUT.
 SetHtmlFg:
     ld      [HtmlFg], a
-    jp      SetLutFromPalette
+    ; Fall through to SetLutFromPalette.
 
 ; SetLutFromPalette: A = palette index (0..3). Writes CurrentFontLUT to
 ; match. Does NOT touch HtmlFg, so callers that need a one-off LUT swap
@@ -13102,8 +13095,7 @@ TagP:
     jr      nz, .pClose
     call    EnsureLineStart
     call    EmitHalfLineGap
-    call    ApplyBlockAttrs
-    ret
+    jp      ApplyBlockAttrs
 .pClose:
     ; </p>: terminate the line and add a half-line gap (modern browsers
     ; render a paragraph bottom margin). The next block tag still does
@@ -13111,8 +13103,7 @@ TagP:
     ; typical HTML paragraph spacing without inflating scroll math too much.
     call    EmitNewline
     call    EmitHalfLineGap
-    call    ResetBlockAttrs
-    ret
+    jp      ResetBlockAttrs
 
 ; ApplyBlockAttrs: copy HtmlNextAlign / HtmlNextDir (if set) into the live
 ; HtmlAlign / HtmlDir globals. Called from block-tag open handlers right
@@ -13172,8 +13163,7 @@ TagCenter:
     ret
 .close:
     call    EmitNewline
-    call    ResetBlockAttrs
-    ret
+    jp      ResetBlockAttrs
 
 TagHr:
     ; Inside a <table> (e.g. <tr><th colspan="5"><hr></th></tr> as a
@@ -15238,7 +15228,7 @@ CopyHrefToUrlBuf:
 NavigateAndFocusContent:
     ld      a, FOC_CONTENT
     ld      [Focus], a
-    jp      NavigateToCurrentUrl
+    ; Fall through to NavigateToCurrentUrl.
 
 ; NavigateToCurrentUrl: load whatever is in UrlBuf and, on success, push
 ; it onto the ring-buffered history. Uses Busy to flip the toolbar to
@@ -15948,7 +15938,7 @@ PageUp:
     ld      [ScrollLine], hl
     jp      RefreshAfterScroll
 .puMaybeBack:
-    jp      MaybeSlideBackward
+    ; Fall through to MaybeSlideBackward.
 
 ; MaybeSlideBackward: at ScrollLine == 0, attempt to load the chunk
 ; immediately before the current window so the user lands on adjacent
@@ -16151,8 +16141,7 @@ PageDown:
     add     hl, bc
     ld      [ScrollLine], hl
     call    RefreshAfterScroll
-    call    StoreTotalLinesWithPages
-    ret
+    jp      StoreTotalLinesWithPages
 .pdRemoteSlid:
     ; Accumulate the old window's line count into DocLinesBefore so
     ; the scroll thumb keeps growing monotonically across the slide
@@ -16180,7 +16169,7 @@ PageDown:
     ld      hl, 0
     ld      [ScrollLine], hl
     call    RefreshAfterScroll
-    jp      KeyDrain
+    ; Fall through to KeyDrain.
 
 ; KeyDrain: consume any queued keystrokes via DOS_DIRIN until DOS_CONST
 ; reports an empty buffer. Used at the end of a chunk-slide so the
@@ -16361,8 +16350,7 @@ ScrollDown:
     inc     hl
     ld      [ScrollLine], hl
     call    RefreshAfterScroll
-    call    StoreTotalLinesWithPages
-    ret
+    jp      StoreTotalLinesWithPages
 .sdRemoteSlid:
     ld      hl, 0
     ld      [ScrollLine], hl
@@ -16824,7 +16812,7 @@ ToggleShowImages:
     xor     1
     ld      [ShowImages], a
     call    DrawImgCheckbox
-    jp      SyncBridgeImgState
+    ; Fall through to SyncBridgeImgState.
 
 ; SyncBridgeImgState: tell the bridge whether to mint imNN.pcx handles.
 ; No-op when no remote session has been opened yet (bridge isn't on the

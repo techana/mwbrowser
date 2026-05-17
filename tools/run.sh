@@ -18,7 +18,22 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-OPENMSX="/Applications/openMSX.app/Contents/MacOS/openmsx"
+# OPENMSX lookup order:
+#   1. $OPENMSX env override (full path)
+#   2. /Applications/openMSX.app/...  (macOS app bundle, default install)
+#   3. `openmsx` on $PATH            (Linux distros, MSYS2, Homebrew brew)
+# Bail with a helpful message if none of those land.
+OPENMSX="${OPENMSX:-/Applications/openMSX.app/Contents/MacOS/openmsx}"
+if [[ ! -x "$OPENMSX" ]]; then
+    if command -v openmsx >/dev/null 2>&1; then
+        OPENMSX=$(command -v openmsx)
+    else
+        echo "openMSX not found." >&2
+        echo "  Tried: $OPENMSX" >&2
+        echo "  Set OPENMSX=/path/to/openmsx, or install openMSX on PATH." >&2
+        exit 2
+    fi
+fi
 MACHINE="Sony_HB-F1XD"
 DISK="MSX-DOS/MSX-DOS v1.03.DSK"
 
