@@ -452,6 +452,25 @@ MainLoop:
     ld      c, DOS_DIRIN
     call    BDOS_ENTRY                  ; A = char, no echo
     ld      b, a                        ; save key in B for dispatch
+    call    DispatchKey                 ; dispatch the key; handlers
+                                        ; end in `ret` (or fall
+                                        ; through to DispatchKey's
+                                        ; tail) so control comes
+                                        ; back here naturally
+    jp      MainLoop
+
+; ============================================================================
+; DispatchKey: route the current key (in B) through popup swallows, the
+; Esc / Stop / F-key shortcuts, the Tab-cycling chain, and the per-focus
+; sub-dispatchers. Returns when the key has been handled (or ignored).
+; MainLoop calls into here per keystroke; every handler -- popup close,
+; tab walk, OnContent / OnAddress, scroll keys, form keys -- terminates
+; via `ret`. Was previously inlined into MainLoop with 32 `jp MainLoop`
+; exits scattered across the keyboard chain; lifting the chain out
+; replaces those jumps with natural returns and lets the dispatcher fit
+; on a screen.
+; ============================================================================
+DispatchKey:
 
     ; When the About popup is open everything except Esc is swallowed.
     ld      a, [AboutOpen]
@@ -462,7 +481,7 @@ MainLoop:
     jr      nz, .popupSwallow
     call    CloseAbout
 .popupSwallow:
-    jp      MainLoop
+    ret
 
 .checkSavePopup:
     ; Same swallow + Esc-closes contract for the Save-file popup. Esc
@@ -474,8 +493,7 @@ MainLoop:
     ld      a, b
     cp      KEY_ESC
     jr      nz, .popupSwallow
-    call    CloseSave
-    jp      MainLoop
+    jp      CloseSave
 
 .noPopup:
     ld      a, b
@@ -505,15 +523,13 @@ MainLoop:
     ; character (query strings!) so it can't double as a shortcut.
     cp      KEY_F1
     jr      nz, .notOpenAbout
-    call    OpenAbout
-    jp      MainLoop
+    jp      OpenAbout
 .notOpenAbout:
 
     ; F6 mirrors the titlebar "[]" save-page click.
     cp      KEY_F6
     jr      nz, .notOpenSave
-    call    OpenSaveFromTitlebar
-    jp      MainLoop
+    jp      OpenSaveFromTitlebar
 .notOpenSave:
 
     cp      KEY_TAB
@@ -524,8 +540,7 @@ MainLoop:
     ; the same chain backwards.
     call    IsShiftDown
     jr      nz, .tabForward
-    call    TabReverse
-    jp      MainLoop
+    jp      TabReverse
 .tabForward:
     ld      a, [Focus]
     cp      FOC_CONTENT
@@ -547,15 +562,13 @@ MainLoop:
     jr      .tabTryLinkStart
 .tabFormStart:
     ld      [HtmlFormFocus], a
-    call    RefreshContentInPlace
-    jp      MainLoop
+    jp      RefreshContentInPlace
 .tabFormAdv:
     call    FormNextFocusableSlot       ; A = next slot, or 0xFF
     cp      0xFF
     jr      z, .tabFormsDone
     ld      [HtmlFormFocus], a
-    call    RefreshContentInPlace
-    jp      MainLoop
+    jp      RefreshContentInPlace
 .tabFormsDone:
     ; Past the last form slot. Drop form focus and walk links next.
     ld      a, 0xFF
@@ -569,8 +582,7 @@ MainLoop:
     jr      nz, .tabLinkAdv
     xor     a                           ; first link
     ld      [HtmlFocusLink], a
-    call    RefreshContentInPlace
-    jp      MainLoop
+    jp      RefreshContentInPlace
 .tabLinkAdv:
     ld      b, a
     ld      a, [LinkCount]
@@ -581,8 +593,7 @@ MainLoop:
     inc     b
     ld      a, b
     ld      [HtmlFocusLink], a
-    call    RefreshContentInPlace
-    jp      MainLoop
+    jp      RefreshContentInPlace
 .tabLinksDone:
     ld      a, 0xFF
     ld      [HtmlFocusLink], a
@@ -590,8 +601,7 @@ MainLoop:
     call    RefreshContentInPlace
 .tabCycle:
     call    CycleFocus
-    call    PaintToolbar
-    jp      MainLoop
+    jp      PaintToolbar
 NotTab:
 
     ; Dispatch by current focus. B already holds the key.
@@ -606,17 +616,16 @@ NotTab:
     jp      z, OnAddress
     cp      FOC_CONTENT
     jp      z, OnContent
-    jp      MainLoop
+    ret
 
 OnBack:
     ld      a, b
     cp      KEY_ENTER
     jr      z, DoBack
     cp      KEY_SPACE
-    jp      nz, MainLoop
+    ret     nz
 DoBack:
-    call    GoBack
-    jp      MainLoop
+    jp      GoBack
 
 ; F4: clear the address bar from anywhere and shift focus to it so the
 ; user can immediately start typing a new URL without aiming the
@@ -625,18 +634,16 @@ DoF4Clear:
     call    UrlClear
     ld      a, FOC_ADDRESS
     ld      [Focus], a
-    call    PaintToolbar
-    jp      MainLoop
+    jp      PaintToolbar
 
 OnForward:
     ld      a, b
     cp      KEY_ENTER
     jr      z, DoForward
     cp      KEY_SPACE
-    jp      nz, MainLoop
+    ret     nz
 DoForward:
-    call    GoForward
-    jp      MainLoop
+    jp      GoForward
 
 OnRefresh:
     ld      a, b
@@ -644,18 +651,16 @@ OnRefresh:
     jr      z, DoGo
     cp      KEY_SPACE
     jr      z, DoGo
-    jp      MainLoop
+    ret
 DoGo:
     ; Refresh acts as a Go button: load URL then shift focus to the view.
-    call    NavigateAndFocusContent
-    jp      MainLoop
+    jp      NavigateAndFocusContent
 
 OnAddress:
     ld      a, b
     cp      KEY_ENTER
     jr      nz, NotAddrEnter
-    call    NavigateAndFocusContent
-    jp      MainLoop
+    jp      NavigateAndFocusContent
 NotAddrEnter:
     ; URL-edit hot path: typing, backspace, cursor arrows, clear --
     ; none of these change the focused element, the button glyphs,
@@ -666,26 +671,22 @@ NotAddrEnter:
     cp      KEY_BACKSPACE
     jr      nz, NotBackspace
     call    UrlBackspace
-    call    PaintAddressBarFocused
-    jp      MainLoop
+    jp      PaintAddressBarFocused
 NotBackspace:
     cp      KEY_LEFT
     jr      nz, NotAddrLeft
     call    UrlCursorLeft
-    call    PaintAddressBarFocused
-    jp      MainLoop
+    jp      PaintAddressBarFocused
 NotAddrLeft:
     cp      KEY_RIGHT
     jr      nz, NotAddrRight
     call    UrlCursorRight
-    call    PaintAddressBarFocused
-    jp      MainLoop
+    jp      PaintAddressBarFocused
 NotAddrRight:
     cp      KEY_CLS                     ; Ctrl+L / MSX CLS
     jr      nz, NotCls
     call    UrlClear
-    call    PaintAddressBarFocused
-    jp      MainLoop
+    jp      PaintAddressBarFocused
 NotCls:
     ; Accept Latin printable (0x20..0x7E) plus the high-half ISO-8859-6
     ; range (0x80..0xFE). On AX-370 the BIOS keyboard ISR debounces the
@@ -696,14 +697,13 @@ NotCls:
     ; the bytes here. 0x7F (DEL) and 0xFF (used as a sentinel elsewhere)
     ; are still ignored.
     cp      0x20
-    jp      c, MainLoop
+    ret     c
     cp      0x7F
-    jp      z, MainLoop
+    ret     z
     cp      0xFF
-    jp      z, MainLoop
+    ret     z
     call    UrlInsert
-    call    PaintAddressBarFocused
-    jp      MainLoop
+    jp      PaintAddressBarFocused
 
 OnContent:
     ; Form-field interaction: routing depends on the focused slot's
@@ -804,19 +804,15 @@ OnContent:
     cp      'n'
     jr      z, DoPageUp
     cp      'N'
-    jp      nz, MainLoop
+    ret     nz
 DoPageUp:
-    call    PageUp
-    jp      MainLoop
+    jp      PageUp
 DoPageDn:
-    call    PageDown
-    jp      MainLoop
+    jp      PageDown
 DoScrollDn:
-    call    ScrollDown
-    jp      MainLoop
+    jp      ScrollDown
 DoScrollUp:
-    call    ScrollUp
-    jp      MainLoop
+    jp      ScrollUp
 
 ; IsShiftDown: return Z set (CF=0 + Z=1) when the Shift key is
 ; pressed, NZ otherwise. Reads MSX keyboard matrix row 6 bit 0 via
