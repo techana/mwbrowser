@@ -9,6 +9,7 @@
 !src/mwbrowser.asm
 !src/iso8859_6.inc
 !src/serial_poc.asm
+!src/font_iso8859_6_ax370.bin
 !dist/
 !dist/mwbro.com
 !dist/mwbro_baseline.com
@@ -39,6 +40,8 @@
 !BITMAP_PIPELINE_DESIGN.md
 !TABLE_RENDER_BUG.md
 !SECTION6_BUG.md
+!docs/
+!docs/*.md
 
 !samples/AUTOEXEC.BAT
 

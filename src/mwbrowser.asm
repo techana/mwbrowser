@@ -53,7 +53,6 @@ VDP_PAL        equ 0x9A
 ;   ld ix, NAME      ; 4 B
 ;   call CALSLT      ; 3 B   (CALSLT pages the BIOS slot into page 0)
 BIOS_CHGMOD    equ 0x005F      ; change screen mode (A = mode)
-BIOS_RDSLT     equ 0x000C      ; read byte from a slot
 CALSLT         equ 0x001C      ; inter-slot call target
 EXPTBL         equ 0xFCC0      ; main BIOS slot table (read by CALSLT)
 
@@ -63,11 +62,15 @@ EXPTBL         equ 0xFCC0      ; main BIOS slot table (read by CALSLT)
         call    CALSLT
     ENDM
 
-; Work-area pointer CGPNT (0xF91F) is a 3-byte record that tells us where the
-; live MSX font lives: byte 0 = slot specifier, bytes 1..2 = address in that
-; slot. Using CGPNT instead of hardcoding 0x1BBF keeps ExtractFont portable
-; across MSX variants (each machine's BIOS sets CGPNT during init).
-CGPNT          equ 0xF91F      ; slot (1B) + address (2B, LE) of font table
+; --- Removed: BIOS_RDSLT (0x000C) and CGPNT (0xF91F) ---------------------
+; Earlier versions extracted the active MSX BIOS font at boot via per-byte
+; RDSLT calls into the slot CGPNT pointed at. The renderer is hardcoded
+; around the AX-370 Arabic ROM's ISO-8859-6 layout (IsoMap / IsoJoin /
+; ShapePick expect specific glyphs at 0xA0+), so on any non-AX-370 boot
+; that extraction populated FontBuf with the local machine's Japanese or
+; Latin glyphs, which produced garbage at 0xA0+. The Arabic ROM dump now
+; ships embedded as font_iso8859_6_ax370.bin and FontBuf points at it
+; directly -- see FontBuf below for the full rationale + how to revert.
 
 ; ---- palette slots ----
 ; MSX2 Screen 6 has a quirk: pixel value 0 renders with pair-palette dithering
@@ -257,7 +260,8 @@ Main:
 
     call    Force212Lines               ; some BIOSes leave R#9 LN=0
 
-    call    ExtractFont                 ; pull BIOS font into FontBuf (once)
+    ; FontBuf is now the embedded AX-370 ISO-8859-6 font (see
+    ; FontData INCBIN below); no runtime extraction step.
     call    BuildFastLut                ; populate FastLutHi/Lo from FontLUT
     call    BuildTransposedFont         ; row-major mirror of FontBuf
     call    SetPalette
@@ -3493,13 +3497,14 @@ SetTextColours:
     ret
 
 ; ============================================================================
-; Step 2: Font extraction + direct-blit text rendering
+; Step 2: Direct-blit text rendering against the embedded font
 ;
 ; The BIOS GRPPRT path is slot-switched per character (CALSLT on every glyph)
 ; and runs at roughly 40 K cycles/char under openMSX. We replace it with:
 ;
-;   1. ExtractFont  -- one-off byte-by-byte copy of the main-ROM's CGTABL
-;                      (256 glyphs * 8 rows = 2 KB) into FontBuf.
+;   1. FontData  -- 2 KB AX-370 ISO-8859-6 ROM dump, INCBIN'd into the .COM
+;                   (see src/font_iso8859_6_ax370.bin). FontBuf is just an
+;                   alias for FontData -- nothing copies the font at boot.
 ;   2. DrawCharFast -- per glyph, set the VRAM write pointer once per row and
 ;                      emit two packed Screen-6 bytes straight to port 0x98.
 ;                      A 16-entry LUT expands a 4-bit font nibble to one
@@ -3535,33 +3540,52 @@ FontLUT_DGrayOnLgray:                   ; fg = DGRAY (pair 00), bg = LGRAY (pair
     db  0x55, 0x54, 0x51, 0x50, 0x45, 0x44, 0x41, 0x40
     db  0x15, 0x14, 0x11, 0x10, 0x05, 0x04, 0x01, 0x00
 
-; ExtractFont: copy the 2 KB font into FontBuf using the live CGPNT pointer.
-; CGPNT[0]   = slot specifier holding the font
-; CGPNT[1..2] = address of the font within that slot (little-endian)
-; One RDSLT call per byte; the ~60 ms total is a one-time startup cost.
-ExtractFont:
-    ld      a, [CGPNT]                  ; CGPNT[0] = slot
-    ld      [FastCgSlot], a
-    ld      hl, [CGPNT + 1]             ; CGPNT[1..2] = font address in slot
-    ld      de, FontBuf
-    ld      bc, FONT_BUF_SIZE
-.loop:
-    push    bc
-    push    de
-    push    hl
-    ld      a, [FastCgSlot]
-    CALLBIOS BIOS_RDSLT
-    pop     hl
-    pop     de
-    ld      [de], a
-    inc     hl
-    inc     de
-    pop     bc
-    dec     bc
-    ld      a, b
-    or      c
-    jr      nz, .loop
-    ret
+; FontData: 2 KB AX-370 ISO-8859-6 ROM font, embedded at link time so
+; the program needs no runtime extraction (and works on machines whose
+; BIOS font has no Arabic glyphs). FontBuf is just an alias for this.
+;
+; ----------------------------------------------------------------------
+; HISTORY -- if you ever want to go back to extracting from the live
+; BIOS font, here is the routine that used to do it. Put it back, add
+; `call ExtractFont` between Force212Lines and BuildFastLut, restore
+; the BIOS_RDSLT / CGPNT equates near the top of the file, restore
+; FastCgSlot in the BSS block, and turn FontBuf back into a 2 KB RAM
+; region (FontBuf equ 0xC200 ; ImgBuf equ FontBuf + FONT_BUF_SIZE):
+;
+;     ExtractFont:
+;         ld      a, [CGPNT]                  ; CGPNT[0] = slot
+;         ld      [FastCgSlot], a
+;         ld      hl, [CGPNT + 1]             ; CGPNT[1..2] = font addr
+;         ld      de, FontBuf
+;         ld      bc, FONT_BUF_SIZE
+;     .loop:
+;         push    bc
+;         push    de
+;         push    hl
+;         ld      a, [FastCgSlot]
+;         CALLBIOS BIOS_RDSLT
+;         pop     hl
+;         pop     de
+;         ld      [de], a
+;         inc     hl
+;         inc     de
+;         pop     bc
+;         dec     bc
+;         ld      a, b
+;         or      c
+;         jr      nz, .loop
+;         ret
+;
+; That version produced AX-370 Arabic glyphs at 0xA0+ on AX-370, but
+; on a Sony / Panasonic / generic MSX2 it pulled THAT machine's font,
+; which has katakana or other glyphs at the same code points -- so
+; Arabic content rendered as garbage. The embedded blob below avoids
+; that machine-specific failure.
+; ----------------------------------------------------------------------
+FontData:
+    INCBIN  "font_iso8859_6_ax370.bin"
+FontDataEnd:
+    ASSERT (FontDataEnd - FontData) == FONT_BUF_SIZE
 
 ; BuildFastLut: populate the page-aligned bifurcated glyph LUT from
 ; the existing 16-entry nibble->byte FontLUT (BLACK fg variant).
@@ -20761,7 +20785,9 @@ MAP_AREA_MAX    equ 8
 AreaCoords:     dw 0, 0, 0, 0           ; x1, y1, x2, y2 from coords="…"
 PendingAreaCount: db 0
 LinkCount:      db 0                    ; number of live link rects
-FastCgSlot:     db 0                    ; cached CGPNT[0] for ExtractFont
+; FastCgSlot removed alongside ExtractFont -- see history block above
+; FontData for the rationale and how to restore the runtime extraction
+; path if you ever need it back.
 
 ; Multi-step back/forward history. Ring buffer of HISTORY_MAX URL slots.
 ; The cursor points at the "current" entry; new navigations push at
@@ -20923,13 +20949,16 @@ TailAttr:           ds LINE_BUF_MAX
 RuntimeRamEnd:
 
 ; ──────────────────────────────────────────────────────────────────
-; FileBuf / FontBuf / ImgBuf are runtime-only RAM regions placed
-; ABOVE the runtime-RAM block (and therefore ABOVE the .COM image
-; loaded from disk). Declared via `equ` so no bytes are emitted to
-; the .COM -- every consumer writes before reading:
+; FileBuf / ImgBuf are runtime-only RAM regions placed ABOVE the
+; runtime-RAM block (and therefore ABOVE the .COM image loaded from
+; disk). Declared via `equ` so no bytes are emitted to the .COM --
+; every consumer writes before reading:
 ;     FileBuf  -> LoadFile / RemoteLoadFile / TryFetchMore
-;     FontBuf  -> ExtractFont (called once at startup)
 ;     ImgBuf   -> ImgStream (DMA scratch, written before each read)
+;
+; FontBuf USED to live here too as a 2 KB RAM region populated by
+; ExtractFont at boot. It now aliases the FontData INCBIN block
+; (see the comment by FontData for the rationale + how to revert).
 ;
 ; Bug history: pre-move, `ORG 0x6800 / ds FILE_BUF_SIZE / ...` mixed
 ; FileBuf into the same address space as the inline `ds` globals.
@@ -20944,30 +20973,27 @@ FILEBUF_BASE   equ (RuntimeRamEnd + 0xFF) & 0xFF00
                                        ; grows.
 
 FileBuf        equ FILEBUF_BASE
-; FontBuf is PINNED, not auto-computed from FileBuf+FILE_BUF_SIZE.
-; History: when FontBuf floated up to 0xC300 (because BSS additions
-; pushed FILEBUF_BASE to 0xA200) HB-F1XD froze at boot with "DI; HALT
-; detected" -- ExtractFont's 2 KB write into 0xC300..0xCB00 happens
-; to trip the disk BIOS / slot 3 expansion into a state where IFF
-; never re-enables. 0xC200 has been the working address since the
-; fix_char_corruption work (commit 370d6fb); pinning it guarantees
-; future BSS / code growth doesn't accidentally walk into the haunted
-; page boundary.
-;
-; The price: FILE_BUF_SIZE is now whatever fits between FILEBUF_BASE
-; and 0xC200 (currently 0x2000 = 8 KB). The bridge already chunks
-; pages larger than that via GET CHUNK <offset>, so the cap on
-; in-memory page size is enforced upstream.
-FontBuf        equ 0xC200
-ImgBuf         equ FontBuf + FONT_BUF_SIZE
+; FontBuf now points at the read-only ROM image embedded by INCBIN
+; (see FontData). DrawCharFast / BuildTransposedFont only READ from
+; this region, so a code-segment address works the same as the
+; former 0xC200 RAM region. No runtime extraction, no FileBuf-to-
+; FontBuf clobber risk, the previous "FontBuf must stay at 0xC200
+; or HB-F1XD freezes at boot" hardware quirk is moot.
+FontBuf        equ FontData
 
-; Build-time guard: FileBuf must end at or before FontBuf -- otherwise
-; ExtractFont's 2 KB write into FontBuf would clobber the FileBuf
-; tail. The auto-computed FILEBUF_BASE shifts up as BSS grows; if it
-; grows past FontBuf-FILE_BUF_SIZE this assert catches it. The fix is
-; to shrink FILE_BUF_SIZE; do NOT raise FontBuf (the address is
-; pinned for hardware reasons, see the comment block above).
-    ASSERT FILEBUF_BASE + FILE_BUF_SIZE <= FontBuf
+; ImgBuf was previously `FontBuf + FONT_BUF_SIZE` = 0xCA00. Now
+; pinned explicitly at the same address it used to occupy so the
+; 768 bytes between ImgBuf and TransposedFontBuf (= ImgBuf + 0x300)
+; stay laid out exactly the way the image decoders expect.
+ImgBuf         equ 0xCA00
+
+; Build-time guard: FileBuf must end at or before ImgBuf. The 2 KB
+; window at 0xC200..0xC9FF that the old runtime FontBuf occupied is
+; now formally unused -- ImgBuf still sits at 0xCA00, so reclaiming
+; the gap as a larger FILE_BUF_SIZE is a future option (would have
+; to lift SERIAL_CHUNK_RANGE_BYTES on the bridge to match). For this
+; pass we keep the layout stable to minimise blast radius.
+    ASSERT FILEBUF_BASE + FILE_BUF_SIZE <= ImgBuf
 
 ; quick_screen_draw / lesson #1: bifurcated page-aligned glyph LUT.
 ; FastLutHi[font_byte] = high VRAM byte (left 4 px); FastLutLo[font_byte]
