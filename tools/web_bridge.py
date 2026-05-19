@@ -5048,6 +5048,17 @@ class MsxSession:
             url, dw, dh = entry
             return self._fetch_image_to_pcx(url, dw, dh)
 
+        # Self-proxy short-circuit: links rendered by the bridge carry
+        # a `proxy_host` of "msx-serial" -- e.g. <a href="http://msx-
+        # serial/p/https://x4o.org/foo">. Clicking such a link makes
+        # the on-MSX side send the full proxy URL back to the bridge
+        # via serial. We can't actually resolve "msx-serial" as a real
+        # DNS name on the user's host, so recognise the wrapper and
+        # extract the inner URL directly.
+        proxied = self._maybe_unwrap_self_proxy(target)
+        if proxied is not None:
+            return self._fetch_page(proxied)
+
         # Self-host short-circuit: when the requested URL is the bridge
         # itself (127.0.0.1, localhost, or the LAN IP we're listening on),
         # serve from CFG['root'] directly instead of round-tripping
@@ -5062,6 +5073,41 @@ class MsxSession:
         if "." in target or target.startswith("/"):
             return self._fetch_page("http://" + target.lstrip("/"))
         return ("404", None)
+
+    def _maybe_unwrap_self_proxy(self, target):
+        """Recognise the self-proxy URLs the bridge emits in rendered
+        pages ("http://msx-serial/p/<inner_url>", with /p1/ being the
+        retired CP-1256 variant) and return the inner URL. Returns
+        None when target isn't one of those.
+
+        Without this, a click on a proxied link sends a request the
+        bridge can't resolve: `msx-serial` is a stand-in label, not a
+        DNS name, so `requests.get('http://msx-serial/...')` fails
+        with NameResolutionError on every machine that doesn't have
+        msx-serial in /etc/hosts."""
+        url = target.strip()
+        low = url.lower()
+        for prefix in ("http://", "https://"):
+            if low.startswith(prefix):
+                url = url[len(prefix):]
+                low = low[len(prefix):]
+                break
+        slash = url.find("/")
+        if slash < 0:
+            return None
+        host_part, path_part = url[:slash], "/" + url[slash + 1:]
+        host = host_part.split(":", 1)[0].lower()
+        if host not in {"msx-serial", "msx-serial.local"}:
+            return None
+        for proxy_prefix in ("/p/", "/p1/"):
+            if path_part.startswith(proxy_prefix):
+                inner = path_part[len(proxy_prefix):]
+                if not inner:
+                    return None
+                if not inner.lower().startswith(("http://", "https://")):
+                    inner = "https://" + inner
+                return inner
+        return None
 
     def _maybe_serve_self_host(self, target):
         """If ``target`` resolves to the bridge's own host (loopback or

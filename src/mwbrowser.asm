@@ -4431,7 +4431,12 @@ UrlIsBinary:
     ; AFTER the final '/' (so the dots in "127.0.0.1" don't confuse
     ; URLs like "http://127.0.0.1/" -- the trailing slash resets DE
     ; and the classifier treats the URL as having no extension =
-    ; displayable directory listing).
+    ; displayable directory listing). UibSawSlash records whether the
+    ; URL contained any '/' at all; if not, the URL is a bare host
+    ; like "frogfind.com" (where '.' is part of the hostname, not an
+    ; extension) and we force the displayable branch.
+    xor     a
+    ld      [UibSawSlash], a
     ld      hl, UrlBuf
     ld      de, 0
 .uibScan:
@@ -4447,10 +4452,17 @@ UrlIsBinary:
     jr      .uibNextChar
 .uibResetDot:
     ld      de, 0
+    ld      a, 1
+    ld      [UibSawSlash], a
 .uibNextChar:
     inc     hl
     jr      .uibScan
 .uibScanDone:
+    ; Bare hostname (no '/' anywhere) -> displayable. Any dot we
+    ; captured belongs to the host part, not a filename extension.
+    ld      a, [UibSawSlash]
+    or      a
+    jr      z, .uibNoDot
     ld      a, d
     or      e
     jr      z, .uibNoDot                    ; no '.' anywhere -> displayable
@@ -4512,6 +4524,7 @@ UrlIsBinary:
     xor     a                               ; Z = binary, fire save popup
     ret
 UibExtLen: db 0
+UibSawSlash: db 0
 
 ; LoadFileChunk: fill FileBuf starting at the given document offset
 ; with up to byte_count bytes from the FCB-open file. Sets DocOffset
@@ -15553,8 +15566,10 @@ HistoryPush:
     ret
 
 ; HistoryLoadAtCursor: copy HistoryBuf[cursor] into UrlBuf; recompute
-; UrlLen by scanning for NUL; repaint the toolbar so the address bar
-; shows the restored URL.
+; UrlLen by scanning for NUL; pin UrlCursor to the new end-of-URL so
+; the caret doesn't sit on stale whitespace from the previous (longer)
+; entry. Then repaint the toolbar so the address bar shows the
+; restored URL.
 HistoryLoadAtCursor:
     ld      a, [HistoryOldest]
     ld      b, a
@@ -15578,6 +15593,11 @@ HistoryLoadAtCursor:
 .scanDone:
     ld      a, b
     ld      [UrlLen], a
+    ; Anchor the edit caret at the end of the restored URL. Without
+    ; this, navigating Back from a long URL to a short one leaves the
+    ; cursor at the old longer position, painting blank space between
+    ; the URL text and the visible caret.
+    ld      [UrlCursor], a
     jp      PaintToolbar
 
 ; HistoryUpdateFlags: refresh HasPrev / HasNext from cursor+count so the
