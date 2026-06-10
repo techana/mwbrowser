@@ -5315,9 +5315,10 @@ PrintFileContent:
     jr      .loop
 
 .entity:
-    push    hl
-    call    ArFlush
-    pop     hl
+    ; No ArFlush here: EmitIsoByte flushes the pending Arabic word on
+    ; boundary bytes itself, and flushing per-entity broke the joining
+    ; forms of Arabic written as numeric entities (every letter came
+    ; out isolated).
     call    ParseEntity                 ; returns A = char (0 if invalid)
     push    hl
     or      a
@@ -7347,6 +7348,16 @@ SmartWrap:
 ; column. No-op outside lists and inside tables (the table cell wrap
 ; path lands at CellStartX, which is independent of HtmlIndent).
 .swWrapContSetup:
+    ; The wrapped-onto line immediately receives the re-emitted tail
+    ; and/or the wrap-triggering glyph, so it is never visually empty.
+    ; Clear the leading-whitespace trim that CellNewline / EmitNewline
+    ; armed: without this, the next source-stream space (a real word
+    ; separator following the re-emitted tail) is mistaken for leading
+    ; whitespace and eaten -- "sharp on" rendered as "sharpon" inside
+    ; narrow table cells whenever the wrap trigger was a word's last
+    ; letter.
+    xor     a
+    ld      [HtmlLineEmpty], a
     ld      a, [HtmlInTable]
     or      a
     ret     nz
@@ -9855,6 +9866,17 @@ TagImgAltOnly:
     jp      TagImgBody.altFallback
 
 TagImgBody:
+    ; Inside a <table> cell the bitmap decoders are unusable: they
+    ; paint at TextX/TextY with their own width, ignoring CellStartX /
+    ; CellEndX and the row-height bookkeeping, so the image bleeds
+    ; over the table borders and whatever follows (see TBLTEST2 #3).
+    ; Until cell-aware image layout exists, fall back to the [alt]
+    ; text placeholder, which flows through the normal cell-text
+    ; machinery.
+    ld      a, [HtmlInTable]
+    or      a
+    jp      nz, .altText
+
     ; In-place re-render (Tab focus change, keystroke widget repaint):
     ; VRAM wasn't cleared, so the image bytes are still where the first
     ; render left them. Skip the fetch/decode and just reserve the
@@ -12343,6 +12365,13 @@ TagTableTag:
 
     ; Leading blank line + top rule + row-gap before the first cell text.
     call    EmitBlankLine
+    ; Honour dir= / align= on the <table> tag itself (ScanBlockAttrs
+    ; already captured them into HtmlNextDir / HtmlNextAlign). Without
+    ; this, <table dir="rtl"> neither mirrored its columns (TagTd's
+    ; (count-1)-index flip keys off HtmlDir) nor right-aligned its
+    ; cell text (FlushPendingCell's CellEndX path). The close handler
+    ; calls ResetBlockAttrs to fall back to the document defaults.
+    call    ApplyBlockAttrs
     ld      a, [HtmlNextBorder]
     ld      [HtmlTableBorder], a        ; latch for the duration of the table
 
@@ -12405,6 +12434,7 @@ TagTableTag:
 .ttSkipAdv:
     xor     a
     ld      [HtmlInTable], a
+    call    ResetBlockAttrs             ; undo the table's own dir/align
     jp      EmitBlankLine
 
 ; DrawTableVerticals: draw the four full-height vertical borders that
@@ -14551,7 +14581,7 @@ ParseEntity:
 
 .numeric:
     inc     hl                          ; past '#'
-    ld      bc, 0                       ; accumulator
+    ld      bc, 0                       ; BC = 16-bit accumulator
 .numLoop:
     ld      a, [hl]
     cp      0x3B                        ; semicolon
@@ -14561,27 +14591,62 @@ ParseEntity:
     cp      '9' + 1
     jr      nc, .fail
     sub     '0'
+    ; BC = BC * 10 + digit, full 16-bit so Unicode Arabic codepoints
+    ; (&#1575; etc.) survive. The old byte-wide accumulator silently
+    ; wrapped mod 256.
+    push    hl
+    ld      h, b
+    ld      l, c
+    add     hl, hl                      ; *2
+    ld      d, h
+    ld      e, l
+    add     hl, hl                      ; *4
+    add     hl, hl                      ; *8
+    add     hl, de                      ; *10
     ld      e, a
-    ; BC = BC * 10 + E, clamped to a byte.
-    ld      a, c
-    add     a, a                        ; *2
-    ld      c, a
-    add     a, a                        ; *4
-    add     a, a                        ; *8
-    add     a, c                        ; *10
-    add     a, e
-    ld      c, a
+    ld      d, 0
+    add     hl, de                      ; + digit
+    ld      b, h
+    ld      c, l
+    pop     hl
     inc     hl
     jr      .numLoop
 .numDone:
     inc     hl                          ; consume ';'
     pop     de                          ; discard saved start; HL = source now
+    ; Accepted ranges:
+    ;   0x0020..0x007E  ASCII, returned as-is
+    ;   0x00A0..0x00FE  ISO-8859-6 byte values (&#199; = teh marbuta
+    ;                   etc.), returned as-is -- the old code rejected
+    ;                   everything >= 0x7F, which made Arabic-as-
+    ;                   entities render as nothing at all
+    ;   0x0621..0x0652  Unicode Arabic block; ISO-8859-6 deliberately
+    ;                   mirrors it at codepoint - 0x560, so the map is
+    ;                   a single add
+    ld      a, b
+    or      a
+    jr      nz, .numHigh
     ld      a, c
-    ; Only pass printable ASCII through.
     cp      0x20
     jr      c, .numFail
     cp      0x7F
-    jr      nc, .numFail
+    jr      c, .numByteOk               ; printable ASCII
+    cp      0xA0
+    jr      c, .numFail                 ; 0x7F..0x9F: no glyphs
+    cp      0xFF
+    jr      z, .numFail                 ; 0xFF reserved as sentinel
+.numByteOk:
+    ret
+.numHigh:
+    ld      a, b
+    cp      0x06
+    jr      nz, .numFail                ; only the U+06xx page maps
+    ld      a, c
+    cp      0x21
+    jr      c, .numFail
+    cp      0x53
+    jr      nc, .numFail                ; U+0621..U+0652 only
+    add     a, 0xA0                     ; - 0x560 within the 06xx page
     ret
 .numFail:
     ; Numeric entity was syntactically valid but out of range. HL is already
