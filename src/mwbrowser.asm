@@ -8426,6 +8426,8 @@ ScanBlockAttrs:
     xor     a
     ld      [HtmlNextBorder], a         ; default: no <table> border
     ld      [HtmlNextWidth100], a       ; default: width != 100%
+    ld      [HtmlNextWidthPx], a        ; default: no pixel width
+    ld      [HtmlNextWidthPx + 1], a
 .sba_loop:
     ld      a, [hl]
     cp      '>'
@@ -8585,26 +8587,57 @@ ScanBlockAttrs:
     jr      nz, .sba_wVal
     inc     hl
 .sba_wVal:
+    ; Parse a decimal number (16-bit, BC). "100%" -> the full-width
+    ; flag; any other "%" value is ignored (treated as auto); a bare
+    ; number is a pixel width, honoured by SetTableColLayout and
+    ; clamped to the page there.
+    ld      bc, 0
+.sba_wDig:
     ld      a, [hl]
-    cp      '1'
-    jr      nz, .sba_missW
+    sub     '0'
+    jr      c, .sba_wNumDone
+    cp      10
+    jr      nc, .sba_wNumDone
+    push    hl
+    ld      h, b
+    ld      l, c
+    add     hl, hl                      ; *2
+    ld      d, h
+    ld      e, l
+    add     hl, hl                      ; *4
+    add     hl, hl                      ; *8
+    add     hl, de                      ; *10
+    ld      e, a
+    ld      d, 0
+    add     hl, de                      ; + digit
+    ld      b, h
+    ld      c, l
+    pop     hl
     inc     hl
-    ld      a, [hl]
-    cp      '0'
-    jr      nz, .sba_missW
-    inc     hl
-    ld      a, [hl]
-    cp      '0'
-    jr      nz, .sba_missW
-    inc     hl
+    jr      .sba_wDig
+.sba_wNumDone:
     ld      a, [hl]
     cp      '%'
-    jr      nz, .sba_missW
+    jr      nz, .sba_wPixels
+    ; percent form: only 100% means anything to this engine
+    ld      a, b
+    or      a
+    jr      nz, .sba_wDone
+    ld      a, c
+    cp      100
+    jr      nz, .sba_wDone
     ld      a, 1
     ld      [HtmlNextWidth100], a
+.sba_wDone:
     pop     af                          ; drop saved HL; keep current
     inc     hl
     jp      .sba_loop
+.sba_wPixels:
+    ld      a, b
+    or      c
+    jr      z, .sba_wDone               ; width=0 / junk -> auto
+    ld      [HtmlNextWidthPx], bc
+    jr      .sba_wDone
 .sba_missW:
     pop     hl
     inc     hl
@@ -12441,6 +12474,8 @@ TagTableTag:
     ld      [HtmlTableBorder], a        ; latch for the duration of the table
     ld      a, [HtmlNextWidth100]
     ld      [HtmlTableWidth100], a      ; latch width=100% the same way
+    ld      hl, [HtmlNextWidthPx]
+    ld      [HtmlTableWidthPx], hl      ; latch numeric width (0 = auto)
 
     ; Pick a column layout from the cell count in the first <tr>. Without
     ; this prescan, every table fell back to the static icon-layout (col 0
@@ -12845,49 +12880,57 @@ FlushPendingCell:
 ; margin on both sides of the content area: left pad = 12 px, right edge
 ; of the last cell = pixel 480 (11 px from the frame). Byte alignment
 ; forces small rounding, so the actual numbers are 12 / 11.
-TABLE_LEFT_PX  equ 12
-TABLE_RIGHT_PX equ 480
-; Five fixed layouts indexed by HtmlTableColCount-1. Each layout is a
-; pair of word arrays: 5 column-start X values followed by 5 column-end
-; X values, all multiples of 4 so the inner divider strokes land on
-; byte boundaries. Slots past the live column count read as zeros (or
-; previous values) -- TagTd clamps the index at 4 anyway.
-;
-; The original single layout was sized for Apache directory listings
-; (icon | name | date | size | desc) with col 0 only 24 px wide. That
-; was wrong for general 3-column data tables: the first cell's text
-; (e.g. "Apples") spilled past col 0's 24 px slot and the second cell
-; landed at X=40 INSIDE the first cell's text. The bench/test4 pages
-; rendered as "Apl3s" / "Itendty" until this fix.
+; Full-width tables span 4..488: the border bars (4 px wide, drawn at
+; left-4 and right..right+3) then sit flush with the content area's
+; 0..491 edges, leaving no dead margin around a width=100% table.
+TABLE_LEFT_PX  equ 4
+TABLE_RIGHT_PX equ 488
+MAX_TBL_COLS   equ 8
+
+; Eight fixed layouts indexed by HtmlTableColCount-1. Each layout is a
+; pair of word arrays: MAX_TBL_COLS column-start X values followed by
+; MAX_TBL_COLS column-end X values, all multiples of 4 so the divider
+; strokes land on byte boundaries. Slots past the live column count
+; read as zeros -- TagTd clamps the index anyway.
 ;
 ; Layout choice happens at <table> open after MeasureTableCols counts
 ; cells in the first <tr>; SetTableColLayout copies pointers into
 ; TableColStartXPtr / TableColEndXPtr so TagTd / DrawTableVerticals
 ; can read column geometry through them.
 TblLayout1:
-    dw  TABLE_LEFT_PX,  0,    0,    0,    0
-    dw  TABLE_RIGHT_PX, 0,    0,    0,    0
+    dw  4,   0,   0,   0,   0,   0,   0,   0
+    dw  488, 0,   0,   0,   0,   0,   0,   0
 TblLayout2:
-    dw  TABLE_LEFT_PX,  244,  0,    0,    0
-    dw  240,            TABLE_RIGHT_PX, 0, 0, 0
+    dw  4,   248, 0,   0,   0,   0,   0,   0
+    dw  244, 488, 0,   0,   0,   0,   0,   0
 TblLayout3:
-    dw  TABLE_LEFT_PX,  168,  324,  0,    0
-    dw  164,            320,  TABLE_RIGHT_PX, 0, 0
+    dw  4,   164, 328, 0,   0,   0,   0,   0
+    dw  160, 324, 488, 0,   0,   0,   0,   0
 TblLayout4:
-    dw  TABLE_LEFT_PX,  132,  248,  364,  0
-    dw  128,            244,  360,  TABLE_RIGHT_PX, 0
+    dw  4,   124, 244, 368, 0,   0,   0,   0
+    dw  120, 240, 364, 488, 0,   0,   0,   0
 TblLayout5:
-    dw  TABLE_LEFT_PX,  108,  204,  300,  396
-    dw  104,            200,  296,  392,  TABLE_RIGHT_PX
+    dw  4,   100, 196, 292, 392, 0,   0,   0
+    dw  96,  192, 288, 388, 488, 0,   0,   0
+TblLayout6:
+    dw  4,   84,  164, 244, 324, 408, 0,   0
+    dw  80,  160, 240, 320, 404, 488, 0,   0
+TblLayout7:
+    dw  4,   72,  140, 208, 276, 348, 420, 0
+    dw  68,  136, 204, 272, 344, 416, 488, 0
+TblLayout8:
+    dw  4,   64,  124, 184, 244, 304, 364, 428
+    dw  60,  120, 180, 240, 300, 360, 424, 488
 
 TableLayoutPtrs:
-    dw  TblLayout1, TblLayout2, TblLayout3, TblLayout4, TblLayout5
+    dw  TblLayout1, TblLayout2, TblLayout3, TblLayout4
+    dw  TblLayout5, TblLayout6, TblLayout7, TblLayout8
 
 ; Live layout pointers, refreshed at every <table> open. Defaults point
 ; at the 5-column layout so even if SetTableColLayout never fires (a
 ; degenerate render path) the table still has a reasonable geometry.
 TableColStartXPtr: dw TblLayout5
-TableColEndXPtr:   dw TblLayout5 + 10     ; second half of the layout
+TableColEndXPtr:   dw TblLayout5 + MAX_TBL_COLS * 2   ; second half of the layout
 
 ; SetTableColLayout: choose the table geometry for the table that just
 ; opened. Two modes:
@@ -12911,6 +12954,69 @@ SetTableColLayout:
     or      a
     jp      nz, .stlRom                    ; width=100% -> full width
 
+    ; width=<pixels>? Clamp to the page (>= avail -> full-width ROM
+    ; layout); otherwise overwrite TblColPx with an equal split of the
+    ; requested width and let the dynamic builder below lay it out.
+    ld      hl, [HtmlTableWidthPx]
+    ld      a, h
+    or      l
+    jr      z, .stlMeasured                ; 0 = auto -> measured widths
+    ld      de, TABLE_RIGHT_PX - TABLE_LEFT_PX
+    or      a
+    sbc     hl, de
+    jp      nc, .stlRom                    ; W >= page -> full width
+    ; W' = W - 4*(N-1)
+    ld      hl, [HtmlTableWidthPx]
+    ld      a, [HtmlTableColCount]
+    dec     a
+    add     a, a
+    add     a, a                           ; 4*(N-1)
+    ld      e, a
+    ld      d, 0
+    or      a
+    sbc     hl, de
+    jr      nc, .stlWOk
+    ld      hl, 16                         ; degenerate tiny width
+.stlWOk:
+    ; colw = (W' / N) & ~3, min 16
+    ld      a, [HtmlTableColCount]
+    ld      e, a
+    ld      bc, 0                          ; BC = quotient
+.stlDiv:
+    ld      d, 0
+    ; HL -= N; quotient++ while no borrow
+    push    de
+    ld      d, 0
+    or      a
+    sbc     hl, de
+    pop     de
+    jr      c, .stlDivDone
+    inc     bc
+    jr      .stlDiv
+.stlDivDone:
+    ld      a, c
+    and     0xFC                           ; round down to 4 px
+    ld      c, a
+    ; min 16 px per column (b is 0: colw <= 484)
+    cp      16
+    jr      nc, .stlColwOk
+    ld      c, 16
+.stlColwOk:
+    ; fill TblColPx[0..N-1] = colw - 8 (builder re-adds the 8 px pad)
+    ld      a, c
+    sub     8
+    ld      c, a
+    ld      a, [HtmlTableColCount]
+    ld      b, a
+    ld      hl, TblColPx
+.stlFill:
+    ld      [hl], c
+    inc     hl
+    ld      [hl], 0
+    inc     hl
+    djnz    .stlFill
+
+.stlMeasured:
     ; total = sum(TblColPx[i] + 8) + 4 * (N - 1)
     ld      a, [HtmlTableColCount]
     ld      b, a                           ; B = loop count
@@ -12944,6 +13050,7 @@ SetTableColLayout:
 .stlSumNc2:
     ; fits? total <= TABLE_RIGHT_PX - TABLE_LEFT_PX
     ex      de, hl                         ; DE = total
+    ld      [StlTot], de
     ld      hl, TABLE_RIGHT_PX - TABLE_LEFT_PX
     or      a
     sbc     hl, de
@@ -12958,8 +13065,10 @@ SetTableColLayout:
     or      a
     jr      nz, .stlRtl
 
-    ; LTR: walk logical columns 0..N-1 left-to-right from the left margin.
-    ld      hl, TABLE_LEFT_PX
+    ; LTR: walk logical columns 0..N-1 left-to-right. Anchor at the
+    ; left margin, or centre the table when a <center> scope (or the
+    ; tag's own align=center) is active.
+    call    .stlLeftAnchor
     ld      [StlX], hl
 .stlLtrLoop:
     ld      a, [StlI]
@@ -13011,8 +13120,8 @@ SetTableColLayout:
     ld      a, [StlN]
     cp      b
     jr      nz, .stlLtrLoop
-    ; edges: left = margin, right = DynColEnd[N-1]
-    ld      hl, TABLE_LEFT_PX
+    ; edges: left = anchor, right = DynColEnd[N-1]
+    call    .stlLeftAnchor
     ld      [TblLeftPx], hl
     ld      a, [StlN]
     dec     a
@@ -13031,8 +13140,10 @@ SetTableColLayout:
 .stlRtl:
     ; RTL: logical column 0 is the visually RIGHTMOST (TagTd maps
     ; logical b -> visual (N-1)-b). Walk logical 0..N-1 placing from
-    ; the right margin leftwards into visual slots N-1..0.
-    ld      hl, TABLE_RIGHT_PX
+    ; the right edge leftwards into visual slots N-1..0. The right
+    ; edge is the right MARGIN normally, or centred-left + total
+    ; under <center>.
+    call    .stlRightAnchor
     ld      [StlX], hl
 .stlRtlLoop:
     ; w = TblColPx[logical I] + 8
@@ -13096,8 +13207,8 @@ SetTableColLayout:
     ld      a, [StlN]
     cp      b
     jr      nz, .stlRtlLoop
-    ; edges: right = margin, left = DynColStart[0]
-    ld      hl, TABLE_RIGHT_PX
+    ; edges: right = anchor, left = DynColStart[0]
+    call    .stlRightAnchor
     ld      [TblRightPx], hl
     ld      hl, [DynColStart]
     ld      [TblLeftPx], hl
@@ -13106,6 +13217,45 @@ SetTableColLayout:
     ld      [TableColStartXPtr], hl
     ld      hl, DynColEnd
     ld      [TableColEndXPtr], hl
+    ret
+
+.stlRightAnchor:
+    ; HL = the table's right X. The right margin normally; under a
+    ; centre scope it is the centred left anchor + the table's total
+    ; width.
+    ld      a, [HtmlAlign]
+    cp      2
+    jr      z, .sraCenter
+    ld      hl, TABLE_RIGHT_PX
+    ret
+.sraCenter:
+    call    .stlLeftAnchor
+    ld      de, [StlTot]
+    add     hl, de
+    ret
+
+.stlLeftAnchor:
+    ; HL = the table's left X. TABLE_LEFT_PX normally; centred when
+    ; HtmlAlign is centre (a <center> scope or align=center on the
+    ; tag): left = margin + (avail - total)/2, rounded down to a 4 px
+    ; boundary so the border bars stay byte-aligned.
+    ld      a, [HtmlAlign]
+    cp      2
+    jr      z, .slaCenter
+    ld      hl, TABLE_LEFT_PX
+    ret
+.slaCenter:
+    ld      hl, TABLE_RIGHT_PX - TABLE_LEFT_PX
+    ld      de, [StlTot]
+    or      a
+    sbc     hl, de                         ; avail - total (>= 0: fit-tested)
+    srl     h
+    rr      l                              ; / 2
+    ld      a, l
+    and     0xFC                           ; round to 4 px
+    ld      l, a
+    ld      de, TABLE_LEFT_PX
+    add     hl, de
     ret
 
 .stlRom:
@@ -13126,7 +13276,7 @@ SetTableColLayout:
     ld      h, [hl]
     ld      l, a                           ; HL = layout base (start half)
     ld      [TableColStartXPtr], hl
-    ld      de, 10                         ; end half sits 10 bytes (5 words) later
+    ld      de, MAX_TBL_COLS * 2           ; end half sits one slot-array later
     add     hl, de
     ld      [TableColEndXPtr], hl
     ret
@@ -13170,7 +13320,7 @@ MeasureTableCols:
     ld      a, 0xFF
     ld      [MtcCol], a
     ld      hl, TblColPx
-    ld      b, 10
+    ld      b, MAX_TBL_COLS * 2
 .mtcZero:
     ld      [hl], 0
     inc     hl
@@ -13346,9 +13496,9 @@ MeasureTableCols:
     ; at column 0 after a close, collapsing all measurements into
     ; TblColPx[0].
     ld      a, [MtcNext]
-    cp      5
+    cp      MAX_TBL_COLS
     jr      c, .mtcColOk
-    ld      a, 4                        ; clamp to last column slot
+    ld      a, MAX_TBL_COLS - 1         ; clamp to last column slot
 .mtcColOk:
     ld      [MtcCol], a
     ld      a, [MtcNext]
@@ -13430,7 +13580,7 @@ MeasureTableCols:
     push    de
     push    bc
     ld      a, [MtcCol]
-    cp      5
+    cp      MAX_TBL_COLS
     jr      nc, .mfcDone                ; 0xFF (idle) or out of range
     ld      e, a
     ld      d, 0
@@ -13477,9 +13627,9 @@ MeasureTableCols:
     ld      a, 1                        ; degenerate: empty table -> 1 col
     jr      .mtcSetN
 .mtcGotN:
-    cp      6
+    cp      MAX_TBL_COLS + 1
     jr      c, .mtcSetN
-    ld      a, 5                        ; clamp 6+ down to 5 (last layout)
+    ld      a, MAX_TBL_COLS             ; clamp down to the last layout
 .mtcSetN:
     ld      [HtmlTableColCount], a
     pop     bc
@@ -13503,14 +13653,15 @@ MtcT1       equ 0xC206                  ; first 3 uppercased name letters
 MtcT2       equ 0xC207
 MtcT3       equ 0xC208
 MtcNext     equ 0xC209                  ; next column slot for this row
-TblColPx    equ 0xC20A                  ; 5 words: per-column content px
-StlX        equ 0xC214                  ; word: running X during build
-StlI        equ 0xC216                  ; logical column index
-StlN        equ 0xC217                  ; column count
-DynColStart equ 0xC218                  ; 5 words, visual order
-DynColEnd   equ 0xC222                  ; 5 words
-TblLeftPx   equ 0xC22C                  ; word: live table left edge
-TblRightPx  equ 0xC22E                  ; word: live table right edge
+TblColPx    equ 0xC20A                  ; MAX_TBL_COLS words: content px
+StlX        equ 0xC21A                  ; word: running X during build
+StlI        equ 0xC21C                  ; logical column index
+StlN        equ 0xC21D                  ; column count
+StlTot      equ 0xC21E                  ; word: total table width (centering)
+DynColStart equ 0xC220                  ; MAX_TBL_COLS words, visual order
+DynColEnd   equ 0xC230                  ; MAX_TBL_COLS words
+TblLeftPx   equ 0xC240                  ; word: live table left edge
+TblRightPx  equ 0xC242                  ; word: live table right edge
 
 ; DrawTableRuleHere: horizontal DGRAY rule at the current TextY across
 ; the table's width (from TABLE_LEFT_PX to TABLE_RIGHT_PX). Skipped
@@ -21238,6 +21389,8 @@ HtmlNextBorder: db 0                    ; scratch: border= parsed on current tag
 HtmlTableBorder: db 0                   ; live border flag for the open <table>
 HtmlNextWidth100: db 0                  ; scratch: width=100% parsed on current tag
 HtmlTableWidth100: db 0                 ; live width=100% flag for the open <table>
+HtmlNextWidthPx:  dw 0                  ; scratch: width=<pixels> parsed on current tag
+HtmlTableWidthPx: dw 0                  ; live pixel width for the open <table> (0 = auto)
 
 ; ISO-8859-6 -> MSX font mapping + joining flags. Generated from
 ; `ISO-8859-6 font mapping/ISO-8859-6-font-mapping.csv` by
@@ -21273,18 +21426,24 @@ FileEnd:
 ; against the pre-move layout is straightforward to read.
 
 RuntimeRamBase:
-RmbLabelBuf:        ds 31
-BmpPal16:           ds 16
-ImgNameBuf:         ds IMG_NAME_MAX + 1
+; RmbLabelBuf / BmpPal16 / ImgNameBuf moved to the free 0xC200 window
+; (old runtime-FontBuf slot) to keep RuntimeRamEnd under the
+; FILEBUF_BASE budget as the table-layout code grew. All three are
+; write-before-read scratch like the rest of this block.
+RmbLabelBuf         equ 0xC244          ; 31 B
+BmpPal16            equ 0xC264          ; 16 B
+ImgNameBuf          equ 0xC274          ; IMG_NAME_MAX + 1 = 33 B (ends 0xC294)
 ; ExtImgRemap moved to the free 0xC200 window (old FontBuf RAM slot)
 ; to keep RuntimeRamEnd below the FILEBUF_BASE budget after the
 ; shrink-to-fit table scratch landed. Page-aligned at 0xC300 so any
 ; HIGH(ExtImgRemap) indexing keeps working. Initialised once at boot
 ; by BuildExtImgRemap (write-before-read).
 ExtImgRemap         equ 0xC300
-FormScreenX:        ds FORM_MAX * 2
-FormScreenY:        ds FORM_MAX
-FormScreenW:        ds FORM_MAX * 2
+; FormScreenX/Y also live in the 0xC200 window now (write-before-read:
+; FormCaptureRect fills them at render time before any consumer).
+FormScreenX         equ 0xC295          ; FORM_MAX*2 = 40 B (ends 0xC2BC)
+FormScreenY         equ 0xC2BD          ; FORM_MAX   = 20 B (ends 0xC2D0)
+FormScreenW         equ 0xC2D1          ; FORM_MAX*2 = 40 B (ends 0xC2F8)
 TitleDrawBuf:       ds TITLE_BUF_MAX + 1
 UrlBuf:             ds URL_MAX + 1
 ChunkCmdBuf:        ds 16
