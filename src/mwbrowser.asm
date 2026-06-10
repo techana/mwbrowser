@@ -45,6 +45,7 @@ DOS_RDRND      equ 0x21        ; random read: reads the 128-byte record at
 
 VDP_DATA       equ 0x98
 VDP_CMD        equ 0x99
+VDP_RIND       equ 0x9B        ; indirect-register-write port (R17 selects start reg)
 VDP_PAL        equ 0x9A
 
 ; ---- MSX BIOS entry points (invoked via CALLBIOS macro below) ----
@@ -1784,14 +1785,6 @@ UrlCursorRight:
     ld      [UrlCursor], a
     ret
 
-; UrlCursorEnd: park the caret at UrlLen (after the last char). Used
-; whenever a fresh URL gets dropped into UrlBuf (link click, history
-; nav, init) so the user sees the end of it without scrolling.
-UrlCursorEnd:
-    ld      a, [UrlLen]
-    ld      [UrlCursor], a
-    ret
-
 ; ComputeFocusState: A (on entry) = focus index to check.
 ; Returns A = BTN_FOCUSED if [Focus] == A, else A = 0.
 ComputeFocusState:
@@ -1968,92 +1961,6 @@ VdpSetWriteAddr:
     ei
     ret
 
-; VdpSetReadAddr: HL = 14-bit VRAM address; selects read mode (no 0x40 bit).
-VdpSetReadAddr:
-    di
-    ld      a, l
-    out     (VDP_CMD), a
-    ld      a, h
-    and     0x3F                        ; mode = 00 (read)
-    out     (VDP_CMD), a
-    ei
-    ret
-
-; VdpFill: DE bytes of value A, starting at VRAM addr in HL.
-;
-; Inner loop uses DJNZ as the per-iteration counter (8-bit, B reg)
-; with the `LD B,0 -> 256-iter` trick from the MSX Assembly Page,
-; bumping a high-byte counter in C every 256 bytes. Per-byte cost
-; drops from the previous `out / dec de / or-ze test / jr nz` (50
-; T-states / byte) to `out / djnz` (24 T-states / byte) -- ~52 %
-; faster on the only bulk caller (ClearContent's 27 KB startup
-; paint, which now finishes ~195 ms earlier on a 3.58 MHz Z80).
-; Preserves: AF.
-VdpFill:
-    push    af
-    call    VdpSetWriteAddr
-    pop     af
-
-    ; Split DE into (C = full-256 chunks = D, B = remainder = E).
-    ; If E (remainder) is zero, jump straight to the chunk loop;
-    ; otherwise emit the leading remainder via a single djnz pass.
-    ld      c, d                            ; C = high byte of count
-    ld      b, e                            ; B = low byte (== remainder)
-    inc     b
-    dec     b
-    jr      z, .vfChunks                    ; remainder == 0 -> chunks only
-.vfTail:
-    out     (VDP_DATA), a                   ; 11 T
-    djnz    .vfTail                         ; 13 taken / 8 not
-.vfChunks:
-    ; C iterations of 256 bytes (B=0 -> wraps 0xFF..0x01..0x00).
-    inc     c
-    dec     c
-    ret     z                                ; no full chunks left
-    ld      b, 0                            ; B = 0 -> 256 iterations
-.vfNext:
-    out     (VDP_DATA), a
-    djnz    .vfNext
-    dec     c
-    jr      nz, .vfNext
-    ret
-
-; ============================================================================
-; V9938 command engine glue
-;
-; Drives the V9938's built-in 2D blitter (registers R32..R46, status
-; S#2.CE). Today's only caller is the popup save-bg/restore-bg path
-; (SavePopupBg / RestorePopupBg). The plumbing is general-purpose
-; though, so future passes can also point hot CPU-side blits at it
-; for big speedups -- see the TODO block below.
-;
-; TODO (command-engine wins worth chasing):
-;   * FillRect / ClearContentArea / ClearContent
-;       -> HMMV (byte-aligned rectangle fill in hardware).
-;       ClearContentArea is the biggest single CPU hit on every scroll
-;       (~100-150 ms today, ~5-10 ms via HMMV).
-;   * CopyChromeToBack and PrerenderNext's chrome mirror
-;       -> HMMM (byte-aligned VRAM->VRAM rectangle copy).
-;       ~50 ms CPU loop today, ~5 ms via HMMM.
-;   * Bitmap streamers (SC6 / PCX / BMP, RenderImageDataUri)
-;       -> HMMC (CPU->VRAM byte burst). Modest win; the decoders are
-;       still CPU-bound on the dictionary side, not the VDP port.
-;   * Smooth scroll
-;       -> YMMM (shift a VRAM band up/down N rows). Replaces today's
-;       page-flip-only scroll with line-grained scrolling at near-zero
-;       CPU cost.
-;   * Selection / focus / "found" highlight
-;       -> LMMM with LOG=XOR. Toggles a region's pixel polarity in
-;       place without touching CPU buffers; great for transient
-;       overlays that need an obvious revert.
-;
-; All of those drop in with the same VdpCmd / VdpCmdWait helpers and
-; a per-command 15-byte register block (see PopupBgSaveCmd below for
-; the block layout).
-; ============================================================================
-
-VDP_RIND       equ 0x9B          ; indirect-register-write port (R17 selects start reg)
-
 ; VdpCmd: HL = pointer to a 15-byte command-register block:
 ;       +0..1  SX  (source X, 9-bit)        R32-R33
 ;       +2..3  SY  (source Y, 10-bit)       R34-R35
@@ -2145,24 +2052,6 @@ SetVramWritePos:
     ld      l, a
     jp      VdpSetWriteAddr
 
-; SetVramReadPos: same layout as above but points VDP at read mode.
-SetVramReadPos:
-    ld      a, c
-    rlca
-    ld      a, 0
-    adc     a, 0
-    call    VdpSetR14
-    ld      a, c
-    and     0x7F
-    ld      h, a
-    ld      l, 0
-    srl     h
-    rr      l
-    ld      a, l
-    add     a, b
-    ld      l, a
-    jp      VdpSetReadAddr
-
 ; FillRect(B=x/4, C=y, D=w/4, E=h, A=colour). Byte-aligned.
 ;
 ; Hardware path: kicks off a V9938 HMMV (high-speed move-VRAM-value)
@@ -2180,7 +2069,6 @@ FillRect:
     push    bc
     call    PackColour                       ; A = packed colour byte
     pop     bc
-    ld      [PackedColour], a                ; kept for ClearContent's bulk VdpFill
     ld      [FillRectCmd + 12], a            ; HMMV CLR
 
     ; DX = x_byte_col * 4 (convert to pixel-X).
@@ -2226,8 +2114,6 @@ FillRectCmd:
     db      0                                ; +12     CLR <- patched
     db      0                                ; +13     ARG
     db      0xC0                             ; +14     CMD = HMMV
-
-PackedColour:  db 0                          ; ClearContent's bulk fill reads this
 
 DrawHLine:
     ld      e, 1
@@ -2773,33 +2659,6 @@ ExtrapolateHtmlLineCountIfShort:
     ld      hl, 0xFFFF
     ld      [TotalLines], hl
     ld      [HtmlLineCount], hl
-    ret
-
-; CountTotalLines: walk FileBuf[0..WindowLen-1] counting LF bytes; stores into
-; TotalLines (saturated at 255). Called after every successful load so the
-; thumb math has a fresh denominator.
-CountTotalLines:
-    ld      hl, FileBuf
-    ld      bc, [WindowLen]
-    ld      de, 0                       ; DE = 16-bit line count
-.loop:
-    ld      a, b
-    or      c
-    jr      z, .done
-    ld      a, [hl]
-    inc     hl
-    dec     bc
-    cp      0x0A
-    jr      nz, .loop
-    ; Saturate the count at 0xFFFF so a gigantic text file can't wrap.
-    inc     de
-    ld      a, d
-    or      e
-    jr      nz, .loop
-    dec     de
-    jr      .loop
-.done:
-    ld      [TotalLines], de
     ret
 
 ; ComputeThumb: set ThumbTop + ThumbHeight from EffectiveScroll and
@@ -3641,7 +3500,7 @@ BuildFastLut:
 ; multiplication. Called once at startup right after ExtractFont +
 ; BuildFastLut.
 BuildTransposedFont:
-    ld      a, 0                         ; outer loop: char_code 0..255
+    xor     a                            ; outer loop: char_code 0..255
 .btfChar:
     ld      h, 0
     ld      l, a
@@ -3798,7 +3657,7 @@ DrawCharFast:
     jr      .sNoItalic
 .iBottom:
     pop     af
-    sla     a                           ; shift pixels left by 1
+    add     a, a                        ; shift pixels left by 1 (4T vs sla's 8T)
 .sNoItalic:
 
     ; ---- Strike on row 3 (RowsLeft == 5) ----
@@ -10126,6 +9985,12 @@ TagImgBody:
 
 TagImgWord:      db "img", 0
 DataMsxPrefix:   db "data:msx;base64,"
+DataMsxPrefixLen equ $ - DataMsxPrefix  ; = 16; MUST sit right after the
+                                        ; string. A stray copy of this equ
+                                        ; once lived ~2.4 KB further down,
+                                        ; measured 0x995, truncated to 149
+                                        ; in `ld b,` and silently broke
+                                        ; data-URI image recognition.
 ExtSc6:          db ".sc6", 0
 
 ; <map>: groups <area> rects that belong to the <img usemap="#name">
@@ -11021,8 +10886,10 @@ RenderBmpFile:
     ld      a, l
     or      a
     jp      z, .bmpFail
-    cp      SC6_VISIBLE_B * 4 + 1
-    jp      nc, .bmpFail
+    ; No upper-bound cp needed here: the high-byte check above already
+    ; rejected width > 255, comfortably under the 492-px visible limit.
+    ; (The old `cp SC6_VISIBLE_B*4+1` truncated 493 to 237 and wrongly
+    ; rejected 237..255-px-wide BMPs.)
     ld      [BmpWidth], a
 
     ; height -- must be positive and <= CONTENT_Y1 - CONTENT_Y0 + 1.
@@ -11935,7 +11802,6 @@ RmbDrawLabel:
 ; area when a local file fails to load. URL loads that fail come back
 ; from the serial bridge as ERR and are handled the same way.
 NotFoundMsg:    db "404 File Not Found", 0
-DataMsxPrefixLen equ $ - DataMsxPrefix
 
 ; RenderImageDataUri: HL points at the first base64 char of a
 ; "data:msx;base64,..." value inside FileBuf. Streaming decoder: no
@@ -12805,42 +12671,6 @@ TagTd:
     ld      [HtmlTableCol], a
     ret
 
-; FlushInline: draw whatever is in LineBuf at the pixel X where the line
-; actually started (= TextX - LineLen * 8) without advancing TextY. Used
-; right before an inline style swap (e.g. <font color>) so cells emitted
-; under the previous style get rendered under that style, not the new
-; one -- LineDrawCells reads one global style for the whole flush.
-FlushInline:
-    call    ArFlush
-    ld      a, [LineLen]
-    or      a
-    ret     z
-    push    hl
-    push    de
-    push    bc
-    ld      hl, [TextX]
-    ld      a, [LineLen]
-    add     a, a
-    add     a, a
-    add     a, a                        ; A = LineLen * 8 pixels emitted
-    ld      e, a
-    ld      d, 0
-    and     a
-    sbc     hl, de                      ; HL = start pixel X
-    srl     h
-    rr      l
-    srl     h
-    rr      l                           ; HL = start byte col
-    ld      a, l
-    ld      [LineStartColOverride], a
-    call    LineFlush
-    ld      a, 0xFF
-    ld      [LineStartColOverride], a
-    pop     bc
-    pop     de
-    pop     hl
-    ret
-
 ; FlushPendingCell: drain anything currently in LineBuf onto VRAM at the
 ; previous cell's saved start X (CellStartX), then clear the buffer.
 ; Always folds CellWrapCount into RowMaxWrap and resets CellWrapCount,
@@ -13095,32 +12925,6 @@ DrawTableRuleHere:
     ld      d, (TABLE_RIGHT_PX - TABLE_LEFT_PX + 4) / 4
     ld      a, COL_DGRAY
     jp      DrawHLine
-
-; DrawCellDividerAt_HL: HL = pixel X (16-bit, multiple of 4). Draws a
-; 1-byte (4 px) DGRAY vertical line at that X across the current row
-; (HtmlRowTopY for TEXT_LINE_H rows). Skipped while LineSkip is non-zero.
-DrawCellDividerAt_HL:
-    ld      a, [HtmlTableBorder]
-    or      a
-    ret     z                           ; border=0 -> no inner column dividers
-    push    hl
-    ld      a, [HtmlLineSkip]
-    ld      b, a
-    ld      a, [HtmlLineSkip + 1]
-    or      b
-    pop     hl
-    ret     nz
-    srl     h
-    rr      l
-    srl     h
-    rr      l                           ; HL = byte col (X / 4)
-    ld      b, l                        ; B = byte col (top byte is 0 for X < 512)
-    ld      a, [HtmlRowTopY]
-    ld      c, a
-    ld      d, 1
-    ld      e, TEXT_LINE_H
-    ld      a, COL_DGRAY
-    jp      FillRect
 
 ; <th>: like <td> but toggles bold around the cell.
 TagTh:
@@ -13381,6 +13185,14 @@ HxDispatch:
 ; Inline style tags: <b>, <i>, <u>, <s> all do the same thing -- set
 ; a single bit in HtmlStyleFlags on open, clear it on close. Each entry
 ; loads the tag's bit mask into C and falls into the shared dispatcher.
+; <address>: HTML 2.0 block element, conventionally rendered in
+; italics on its own line. Open: break the line, set italic. Close:
+; clear italic, break again so following text starts fresh.
+TagAddress:
+    call    EnsureLineStart
+    ld      c, STYLE_ITALIC
+    jr      StyleBitDispatch
+
 TagB:
     ld      c, STYLE_BOLD
     jr      StyleBitDispatch
@@ -14099,69 +13911,6 @@ FormGetNamePtr:
     add     hl, de
     ret
 
-; FormFirstEditableSlot: scan FormFields for the first text or password
-; slot. Returns A = slot index (CF=0), or 0xFF (CF=1) if there's none.
-; Clobbers BC, HL.
-FormFirstEditableSlot:
-    ld      a, [FormCount]
-    or      a
-    jr      z, .ffeNone
-    ld      b, a
-    ld      hl, FormType
-    ld      c, 0
-.ffeLoop:
-    ld      a, [hl]
-    cp      'T'
-    jr      z, .ffeHit
-    cp      'P'
-    jr      z, .ffeHit
-    inc     hl
-    inc     c
-    dec     b
-    jr      nz, .ffeLoop
-.ffeNone:
-    ld      a, 0xFF
-    scf
-    ret
-.ffeHit:
-    ld      a, c
-    or      a                                ; CF=0
-    ret
-
-; FormNextEditableSlot: advance HtmlFormFocus to the next text/pass slot
-; after the current one. Returns A = next slot, or 0xFF if no more.
-; Clobbers BC, HL.
-FormNextEditableSlot:
-    ld      a, [HtmlFormFocus]
-    inc     a                                ; start from focus+1
-    ld      c, a                             ; C = candidate slot
-.fneCheck:
-    ld      a, [FormCount]
-    cp      c
-    jr      z, .fneNone
-    jr      c, .fneNone
-    ld      b, 0
-    ld      a, c
-    ld      e, a
-    ld      d, b
-    ld      hl, FormType
-    add     hl, de
-    ld      a, [hl]
-    cp      'T'
-    jr      z, .fneHit
-    cp      'P'
-    jr      z, .fneHit
-    inc     c
-    jr      .fneCheck
-.fneNone:
-    ld      a, 0xFF
-    scf
-    ret
-.fneHit:
-    ld      a, c
-    or      a
-    ret
-
 ; FormFirstFocusableSlot: scan FormFields for the first slot whose type
 ; is interactive (text, pass, checkbox, radio, submit, reset/button).
 ; Hidden ('H') and image ('I') slots are skipped. Returns A = slot
@@ -14385,32 +14134,6 @@ FormPrevFocusableSlot:
     ld      a, 0xFF
     ret
 .fpsHit:
-    ld      a, c
-    ret
-
-; FormFirstSubmitSlot: find the first slot with type 'S' or 'B' (submit
-; or button). Returns A = slot index, or 0xFF if none. Clobbers BC, HL.
-FormFirstSubmitSlot:
-    ld      a, [FormCount]
-    or      a
-    jr      z, .fssNone
-    ld      b, a
-    ld      hl, FormType
-    ld      c, 0
-.fssLoop:
-    ld      a, [hl]
-    cp      'S'
-    jr      z, .fssHit
-    cp      'B'
-    jr      z, .fssHit
-    inc     hl
-    inc     c
-    dec     b
-    jr      nz, .fssLoop
-.fssNone:
-    ld      a, 0xFF
-    ret
-.fssHit:
     ld      a, c
     ret
 
@@ -14747,6 +14470,33 @@ TagTbl:
     dw  TagTextarea
     db  "ISINDEX", 0
     dw  TagIsIndex
+    ; --- HTML 2.0 coverage aliases (RFC 1866) ---
+    ; CITE / VAR render italic per convention; DIR / MENU are compact
+    ; list types we render as <ul>; LISTING / XMP / PLAINTEXT are
+    ; legacy preformatted blocks approximated by the <pre> handler.
+    ; ADDRESS gets its own handler (italic block on its own line).
+    ; CODE / KBD / SAMP / TT are intentionally absent: the Screen-6
+    ; font is already monospace, so they're visual no-ops and the
+    ; parser's unknown-tag skip is exactly the right behaviour.
+    ; BASE / LINK / META / NEXTID are head-only metadata the parser
+    ; skips; BASE-relative URL resolution is handled bridge-side for
+    ; remote pages.
+    db  "ADDRESS", 0
+    dw  TagAddress
+    db  "CITE", 0
+    dw  TagI
+    db  "VAR", 0
+    dw  TagI
+    db  "DIR", 0
+    dw  TagUl
+    db  "MENU", 0
+    dw  TagUl
+    db  "LISTING", 0
+    dw  TagPre
+    db  "XMP", 0
+    dw  TagPre
+    db  "PLAINTEXT", 0
+    dw  TagPre
     db  0                               ; end marker
 
 ; ----------------------------------------------------------------------------
@@ -17455,25 +17205,6 @@ DestFcbToSaveFilename:
     ld      [de], a
     ret
 
-; FcbNameToDisplay: copy the FCB filename (8 chars at Fcb+1) + "." +
-; extension (3 chars at Fcb+9) into SaveFilename (13 bytes incl NUL).
-; The FCB stores name/ext space-padded; we preserve those spaces so
-; the popup renders the canonical "NAME    .EXT" layout.
-FcbNameToDisplay:
-    ld      hl, Fcb + 1
-    ld      de, SaveFilename
-    ld      bc, 8
-    ldir
-    ld      a, '.'
-    ld      [de], a
-    inc     de
-    ld      hl, Fcb + 9
-    ld      bc, 3
-    ldir
-    xor     a
-    ld      [de], a
-    ret
-
 ; PaintSaveStatusLine: replaces the body's "Size:" / "Progress:" row
 ; with a centred status string based on SaveStatus.
 ; PaintSaveSizeProgress: paint the body's "Size: X.X KB  Progress:
@@ -18918,30 +18649,6 @@ SerialWriteZ:   ; HL -> NUL-terminated string.
     inc     hl
     jr      SerialWriteZ
 
-; HasScheme (legacy): kept around for the few places that still want the
-; "any ':/' anywhere in the URL" answer. New routing decisions go
-; through IsLocalUrl below.
-; Preserves: HL.
-HasScheme:
-    push    hl
-.hs:
-    ld      a, [hl]
-    or      a
-    jr      z, .hsNo
-    inc     hl
-    cp      ':'
-    jr      nz, .hs
-    ld      a, [hl]
-    cp      '/'
-    jr      nz, .hs
-    pop     hl
-    xor     a
-    ret
-.hsNo:
-    pop     hl
-    or      1
-    ret
-
 ; IsLocalUrl: HL -> NUL URL. Returns Z when the URL's second character
 ; is ':' (i.e. looks like an MSX-DOS drive-letter path "X:..."); NZ
 ; otherwise. Anything else routes to the web bridge -- bare names like
@@ -19668,46 +19375,6 @@ TryFetchMore:
     ret
 .tfmNone:
     scf
-    ret
-
-; Format5Decimal: write HL as 5 ASCII decimal digits + NUL at [DE].
-; Always emits exactly 5 digits with leading zeros (the bridge-side
-; int() parser ignores them) so callers don't have to worry about
-; suppression. Range: HL = 0..65535; output buffer must hold >=6 bytes.
-;
-; Strategy: subtract powers of 10 in unsigned 16-bit, counting how many
-; subtractions until the result goes negative. The trailing sbc with
-; CF=0 restores HL after one too many subtracts. Same idiom as a
-; classic CP/M binary-to-decimal printer.
-;
-; Out: DE advanced 6 bytes (5 digits + NUL).
-; Clobbers: A, BC, HL, DE (DE moves forward).
-Format5Decimal:
-    ld      bc, -10000
-    call    .f5dDigit
-    ld      bc, -1000
-    call    .f5dDigit
-    ld      bc, -100
-    call    .f5dDigit
-    ld      bc, -10
-    call    .f5dDigit
-    ld      a, l
-    add     a, '0'
-    ld      [de], a
-    inc     de
-    xor     a
-    ld      [de], a
-    inc     de
-    ret
-.f5dDigit:
-    ld      a, '0' - 1
-.f5dLoop:
-    inc     a
-    add     hl, bc
-    jr      c, .f5dLoop                 ; CF set when subtraction (BC<0) didn't underflow
-    sbc     hl, bc                       ; restore HL after the failing subtract
-    ld      [de], a
-    inc     de
     ret
 
 ; EnsureWindowRemote: replace FileBuf with a fresh window of body bytes
@@ -20789,14 +20456,6 @@ HtmlInScript:   db 0
 ; CHECKED attribute on the current tag. TagInput's checkbox / radio
 ; branches read it to pick WG_CHK_ON / WG_RAD_ON over the _OFF variant.
 HtmlChecked:    db 0
-; HtmlSelectFound is reset by TagSelect at open and set by the first
-; <option> seen inside the select. While the flag is 0 the next OPTION
-; tag opens with HtmlSkipBody=0 so its label flows through into the
-; select's box; once set, all later options stay suppressed. This is a
-; pragmatic stand-in for honouring <option selected> properly (we'd
-; need a 2-pass scan to do that without rolling back already-emitted
-; cells). For now: first option = the visible one.
-HtmlSelectFound: db 0
 ; HtmlOptCurIdx counts <option>s visited in the current <select>
 ; during parse. HtmlOptCapturing gates whether EmitSink should mirror
 ; emitted chars into FormValue[HtmlSelectSlot] so submit carries the
