@@ -8425,6 +8425,7 @@ ScanBlockAttrs:
     ld      [HtmlNextDir], a
     xor     a
     ld      [HtmlNextBorder], a         ; default: no <table> border
+    ld      [HtmlNextWidth100], a       ; default: width != 100%
 .sba_loop:
     ld      a, [hl]
     cp      '>'
@@ -8438,6 +8439,8 @@ ScanBlockAttrs:
     jr      z, .sba_tryD
     cp      'B'
     jp      z, .sba_tryB
+    cp      'W'
+    jp      z, .sba_tryW
     inc     hl
     jp      .sba_loop
 
@@ -8487,7 +8490,9 @@ ScanBlockAttrs:
     xor     a
     jr      .sba_aStore
 .sba_aR:
-    ld      a, 2
+    ld      a, 1                        ; right (was 2/center -- copy-paste
+                                        ; bug that made align="right" render
+                                        ; centered)
     jr      .sba_aStore
 .sba_aC:
     ld      a, 2
@@ -8541,6 +8546,66 @@ ScanBlockAttrs:
     inc     hl
     jp      .sba_loop
 .sba_missD:
+    pop     hl
+    inc     hl
+    jp      .sba_loop
+
+.sba_tryW:
+    ; Match WIDTH=100% (quoted or bare). Any other width value is
+    ; treated as auto -- the engine only distinguishes "force full
+    ; width" from "size to content".
+    push    hl
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'I'
+    jr      nz, .sba_missW
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'D'
+    jr      nz, .sba_missW
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'T'
+    jr      nz, .sba_missW
+    inc     hl
+    ld      a, [hl]
+    and     0xDF
+    cp      'H'
+    jr      nz, .sba_missW
+    inc     hl
+    ld      a, [hl]
+    cp      '='
+    jr      nz, .sba_missW
+    inc     hl
+    ld      a, [hl]
+    cp      0x22                        ; "
+    jr      nz, .sba_wVal
+    inc     hl
+.sba_wVal:
+    ld      a, [hl]
+    cp      '1'
+    jr      nz, .sba_missW
+    inc     hl
+    ld      a, [hl]
+    cp      '0'
+    jr      nz, .sba_missW
+    inc     hl
+    ld      a, [hl]
+    cp      '0'
+    jr      nz, .sba_missW
+    inc     hl
+    ld      a, [hl]
+    cp      '%'
+    jr      nz, .sba_missW
+    ld      a, 1
+    ld      [HtmlNextWidth100], a
+    pop     af                          ; drop saved HL; keep current
+    inc     hl
+    jp      .sba_loop
+.sba_missW:
     pop     hl
     inc     hl
     jp      .sba_loop
@@ -12374,6 +12439,8 @@ TagTableTag:
     call    ApplyBlockAttrs
     ld      a, [HtmlNextBorder]
     ld      [HtmlTableBorder], a        ; latch for the duration of the table
+    ld      a, [HtmlNextWidth100]
+    ld      [HtmlTableWidth100], a      ; latch width=100% the same way
 
     ; Pick a column layout from the cell count in the first <tr>. Without
     ; this prescan, every table fell back to the static icon-layout (col 0
@@ -12454,8 +12521,17 @@ DrawTableVerticals:
     inc     a
     ld      [BorderHeight], a
 
-    ; Left edge.
-    ld      b, (TABLE_LEFT_PX - 4) / 4
+    ; Left edge (4 px before the first column's start).
+    ld      hl, [TblLeftPx]
+    dec     hl
+    dec     hl
+    dec     hl
+    dec     hl
+    srl     h
+    rr      l
+    srl     h
+    rr      l
+    ld      b, l
     call    .dtvBar
 
     ; Inner dividers, one per column boundary (so a 3-col table draws
@@ -12493,7 +12569,12 @@ DrawTableVerticals:
     jr      nz, .dtvInner
 
 .dtvRight:
-    ld      b, TABLE_RIGHT_PX / 4
+    ld      hl, [TblRightPx]
+    srl     h
+    rr      l
+    srl     h
+    rr      l
+    ld      b, l
     ; fall through for the right border
 
 .dtvBar:
@@ -12808,10 +12889,231 @@ TableLayoutPtrs:
 TableColStartXPtr: dw TblLayout5
 TableColEndXPtr:   dw TblLayout5 + 10     ; second half of the layout
 
-; SetTableColLayout: read HtmlTableColCount and steer
-; TableColStartXPtr / TableColEndXPtr at the matching ROM layout. Count
-; is clamped 1..5 by MeasureTableCols, so no extra range-check here.
+; SetTableColLayout: choose the table geometry for the table that just
+; opened. Two modes:
+;
+;   * shrink-to-fit (new): build DynColStart/DynColEnd from the content
+;     widths MeasureTableCols collected in TblColPx. Each column gets
+;     its widest segment + 8 px padding; columns are separated by the
+;     same 4 px gap the ROM layouts use. LTR tables hug the left
+;     margin; RTL tables hug the right margin. TblLeftPx/TblRightPx
+;     are set to the table's actual edges so the border rules and
+;     verticals frame the content, not the full page.
+;
+;   * full width (old behaviour): the fixed ROM layout for N columns.
+;     Chosen when the tag carried width=100%, or when the summed
+;     content widths exceed the available span (long text needs the
+;     room and the per-column equal split + wrap of the ROM layouts).
+;
+; Count is clamped 1..5 by MeasureTableCols, so no extra range-check.
 SetTableColLayout:
+    ld      a, [HtmlTableWidth100]
+    or      a
+    jp      nz, .stlRom                    ; width=100% -> full width
+
+    ; total = sum(TblColPx[i] + 8) + 4 * (N - 1)
+    ld      a, [HtmlTableColCount]
+    ld      b, a                           ; B = loop count
+    ld      c, a                           ; C = N (kept)
+    ld      hl, 0                          ; HL = running total
+    ld      de, TblColPx
+.stlSum:
+    ld      a, [de]
+    add     a, l
+    ld      l, a
+    inc     de
+    ld      a, [de]
+    adc     a, h
+    ld      h, a
+    inc     de
+    ld      a, l
+    add     a, 8                           ; + per-column padding
+    ld      l, a
+    jr      nc, .stlSumNc
+    inc     h
+.stlSumNc:
+    djnz    .stlSum
+    ld      a, c
+    dec     a
+    add     a, a
+    add     a, a                           ; 4 * (N-1), N <= 5
+    add     a, l
+    ld      l, a
+    jr      nc, .stlSumNc2
+    inc     h
+.stlSumNc2:
+    ; fits? total <= TABLE_RIGHT_PX - TABLE_LEFT_PX
+    ex      de, hl                         ; DE = total
+    ld      hl, TABLE_RIGHT_PX - TABLE_LEFT_PX
+    or      a
+    sbc     hl, de
+    jp      c, .stlRom                     ; content overflows -> full width
+
+    ; ---- dynamic build ----
+    ld      a, [HtmlTableColCount]
+    ld      [StlN], a
+    xor     a
+    ld      [StlI], a
+    ld      a, [HtmlDir]
+    or      a
+    jr      nz, .stlRtl
+
+    ; LTR: walk logical columns 0..N-1 left-to-right from the left margin.
+    ld      hl, TABLE_LEFT_PX
+    ld      [StlX], hl
+.stlLtrLoop:
+    ld      a, [StlI]
+    ld      e, a
+    ld      d, 0
+    ld      hl, TblColPx
+    add     hl, de
+    add     hl, de
+    ld      a, [hl]
+    add     a, 8                           ; w = content + padding
+    ld      c, a
+    inc     hl
+    ld      a, [hl]
+    adc     a, 0
+    ld      b, a                           ; BC = w
+    ; DynColStart[i] = X
+    ld      hl, DynColStart
+    add     hl, de
+    add     hl, de
+    push    de
+    ld      de, [StlX]
+    ld      [hl], e
+    inc     hl
+    ld      [hl], d
+    ; X += w ; DynColEnd[i] = X
+    ex      de, hl                         ; HL = X
+    add     hl, bc
+    ld      [StlX], hl
+    pop     de
+    push    hl                             ; save end X
+    ld      hl, DynColEnd
+    add     hl, de
+    add     hl, de
+    pop     bc                             ; BC = end X
+    ld      [hl], c
+    inc     hl
+    ld      [hl], b
+    ; X += 4 (inter-column gap)
+    ld      hl, [StlX]
+    inc     hl
+    inc     hl
+    inc     hl
+    inc     hl
+    ld      [StlX], hl
+    ld      a, [StlI]
+    inc     a
+    ld      [StlI], a
+    ld      b, a
+    ld      a, [StlN]
+    cp      b
+    jr      nz, .stlLtrLoop
+    ; edges: left = margin, right = DynColEnd[N-1]
+    ld      hl, TABLE_LEFT_PX
+    ld      [TblLeftPx], hl
+    ld      a, [StlN]
+    dec     a
+    ld      e, a
+    ld      d, 0
+    ld      hl, DynColEnd
+    add     hl, de
+    add     hl, de
+    ld      a, [hl]
+    inc     hl
+    ld      h, [hl]
+    ld      l, a
+    ld      [TblRightPx], hl
+    jr      .stlDynPtrs
+
+.stlRtl:
+    ; RTL: logical column 0 is the visually RIGHTMOST (TagTd maps
+    ; logical b -> visual (N-1)-b). Walk logical 0..N-1 placing from
+    ; the right margin leftwards into visual slots N-1..0.
+    ld      hl, TABLE_RIGHT_PX
+    ld      [StlX], hl
+.stlRtlLoop:
+    ; w = TblColPx[logical I] + 8
+    ld      a, [StlI]
+    ld      e, a
+    ld      d, 0
+    ld      hl, TblColPx
+    add     hl, de
+    add     hl, de
+    ld      a, [hl]
+    add     a, 8
+    ld      c, a
+    inc     hl
+    ld      a, [hl]
+    adc     a, 0
+    ld      b, a                           ; BC = w
+    ; visual slot v = (N-1) - I
+    ld      a, [StlN]
+    dec     a
+    ld      e, a
+    ld      a, [StlI]
+    ld      d, a
+    ld      a, e
+    sub     d
+    ld      e, a
+    ld      d, 0                           ; DE = v
+    ; DynColEnd[v] = X
+    ld      hl, DynColEnd
+    add     hl, de
+    add     hl, de
+    push    de
+    ld      de, [StlX]
+    ld      [hl], e
+    inc     hl
+    ld      [hl], d
+    ; X -= w ; DynColStart[v] = X
+    ex      de, hl                         ; HL = X
+    or      a
+    sbc     hl, bc
+    ld      [StlX], hl
+    pop     de
+    push    hl
+    ld      hl, DynColStart
+    add     hl, de
+    add     hl, de
+    pop     bc                             ; BC = start X
+    ld      [hl], c
+    inc     hl
+    ld      [hl], b
+    ; X -= 4 (gap)
+    ld      hl, [StlX]
+    dec     hl
+    dec     hl
+    dec     hl
+    dec     hl
+    ld      [StlX], hl
+    ld      a, [StlI]
+    inc     a
+    ld      [StlI], a
+    ld      b, a
+    ld      a, [StlN]
+    cp      b
+    jr      nz, .stlRtlLoop
+    ; edges: right = margin, left = DynColStart[0]
+    ld      hl, TABLE_RIGHT_PX
+    ld      [TblRightPx], hl
+    ld      hl, [DynColStart]
+    ld      [TblLeftPx], hl
+.stlDynPtrs:
+    ld      hl, DynColStart
+    ld      [TableColStartXPtr], hl
+    ld      hl, DynColEnd
+    ld      [TableColEndXPtr], hl
+    ret
+
+.stlRom:
+    ; Fixed full-width ROM layout (original behaviour).
+    ld      hl, TABLE_LEFT_PX
+    ld      [TblLeftPx], hl
+    ld      hl, TABLE_RIGHT_PX
+    ld      [TblRightPx], hl
     ld      a, [HtmlTableColCount]
     dec     a                              ; 0..4
     add     a, a                           ; *2 (word-sized pointer table)
@@ -12829,6 +13131,9 @@ SetTableColLayout:
     ld      [TableColEndXPtr], hl
     ret
 
+; (Shrink-to-fit scratch + layout arrays live in the 0xC200 window --
+; see the equ block by MeasureTableCols.)
+
 ; MeasureTableCols: walk forward from [ParserCursor] (the byte right
 ; after the open <table...>'s '>') counting <td>/<th> opens until we
 ; hit </tr>, </table>, or the end of FileBuf. Result is clamped to
@@ -12841,96 +13146,371 @@ SetTableColLayout:
 ; for ASCII letters; punctuation stays distinct enough that '/' and
 ; whitespace don't masquerade as a 'T'/'D'/'H'/'R').
 ; Preserves: HL, DE, BC.
+; MeasureTableCols: one prescan over the whole table (ParserCursor ..
+; </table> or HtmlEnd) that produces:
+;   * HtmlTableColCount  -- cell count of the FIRST row (1..5), as before
+;   * TblColPx[0..4]     -- per logical column, the widest content
+;                           segment in pixels (chars * 8, capped at 60
+;                           chars). Entities count as one glyph; <img>
+;                           counts as 5 ("[img]" placeholder); <br>
+;                           splits a cell into separately-measured
+;                           segments; whitespace runs collapse to one.
+; SetTableColLayout turns TblColPx into a shrink-to-fit layout when the
+; total fits, or falls back to the fixed full-width ROM layouts.
 MeasureTableCols:
     push    hl
     push    de
     push    bc
+    xor     a
+    ld      [MtcRun], a
+    ld      [MtcWsPend], a
+    ld      [MtcRow1], a
+    ld      [MtcCells], a
+    ld      [MtcNext], a
+    ld      a, 0xFF
+    ld      [MtcCol], a
+    ld      hl, TblColPx
+    ld      b, 10
+.mtcZero:
+    ld      [hl], 0
+    inc     hl
+    djnz    .mtcZero
+
     ld      hl, [ParserCursor]
     ld      de, [HtmlEnd]
-    ; BC = HtmlEnd - cursor (== bytes available to scan)
     push    hl
     ex      de, hl
     or      a
     sbc     hl, de
     ld      b, h
-    ld      c, l
+    ld      c, l                        ; BC = bytes available
     pop     hl
-    ld      d, 0                           ; D = cell count
 .mtcLoop:
     ld      a, b
     or      c
-    jr      z, .mtcDone
+    jp      z, .mtcEnd
     ld      a, [hl]
     inc     hl
     dec     bc
     cp      '<'
-    jr      nz, .mtcLoop
-    ld      a, b
-    or      c
-    jr      z, .mtcDone
-    ld      a, [hl]
-    inc     hl
-    dec     bc
-    cp      '/'
-    jr      z, .mtcCloseTag
-    and     0xDF
-    cp      'T'
-    jr      nz, .mtcLoop
-    ld      a, b
-    or      c
-    jr      z, .mtcDone
-    ld      a, [hl]
-    inc     hl
-    dec     bc
-    and     0xDF
-    cp      'D'
-    jr      z, .mtcCount
-    cp      'H'
-    jr      nz, .mtcLoop
-.mtcCount:
-    inc     d
-    ld      a, d
-    cp      8
-    jr      c, .mtcLoop                    ; sanity cap; clamp below
-    jr      .mtcDone
-.mtcCloseTag:
-    ld      a, b
-    or      c
-    jr      z, .mtcDone
-    ld      a, [hl]
-    inc     hl
-    dec     bc
-    and     0xDF
-    cp      'T'
-    jr      nz, .mtcLoop
-    ld      a, b
-    or      c
-    jr      z, .mtcDone
-    ld      a, [hl]
-    inc     hl
-    dec     bc
-    and     0xDF
-    cp      'R'
-    jr      z, .mtcDone                    ; </tr -> end of first row
-    cp      'A'
-    jr      z, .mtcDone                    ; </ta(ble) -> end of table
+    jp      z, .mtcTag
+    cp      '&'
+    jr      z, .mtcEntity
+    ; plain text byte
+    ld      e, a
+    ld      a, [MtcCol]
+    cp      0xFF
+    jr      z, .mtcLoop                 ; outside a cell -> ignore
+    ld      a, e
+    cp      ' ' + 1
+    jr      c, .mtcWs                   ; <= 0x20: whitespace / control
+    ld      a, [MtcWsPend]
+    or      a
+    jr      z, .mtcChar
+    xor     a
+    ld      [MtcWsPend], a
+    ld      a, [MtcRun]
+    or      a
+    jr      z, .mtcChar                 ; leading ws: drop
+    call    .mtcBump                    ; count the separator space
+.mtcChar:
+    call    .mtcBump
     jr      .mtcLoop
-.mtcDone:
-    ld      a, d
+.mtcWs:
+    ld      a, 1
+    ld      [MtcWsPend], a
+    jr      .mtcLoop
+
+.mtcBump:
+    ; MtcRun++ capped at 60 chars (480 px -- already past any fit test)
+    ld      a, [MtcRun]
+    cp      60
+    ret     nc
+    inc     a
+    ld      [MtcRun], a
+    ret
+
+.mtcEntity:
+    ; swallow "&...;" (bounded), count as one glyph
+    ld      e, 10
+.mtcEntLoop:
+    ld      a, b
+    or      c
+    jp      z, .mtcEnd
+    ld      a, [hl]
+    cp      '<'
+    jr      z, .mtcEntChar              ; malformed: don't eat the tag
+    inc     hl
+    dec     bc
+    cp      ';'
+    jr      z, .mtcEntChar
+    dec     e
+    jr      nz, .mtcEntLoop
+.mtcEntChar:
+    ld      a, [MtcCol]
+    cp      0xFF
+    jp      z, .mtcLoop
+    call    .mtcBump
+    jp      .mtcLoop
+
+.mtcTag:
+    ; read optional '/' + up to 3 uppercased name letters
+    xor     a
+    ld      [MtcClose], a
+    ld      [MtcT2], a
+    ld      [MtcT3], a
+    ld      a, b
+    or      c
+    jp      z, .mtcEnd
+    ld      a, [hl]
+    cp      '/'
+    jr      nz, .mtcName
+    ld      a, 1
+    ld      [MtcClose], a
+    inc     hl
+    dec     bc
+.mtcName:
+    ld      a, b
+    or      c
+    jp      z, .mtcEnd
+    ld      a, [hl]
+    call    .mtcLetter
+    jp      c, .mtcSkipTag              ; no name letter at all
+    ld      [MtcT1], a
+    inc     hl
+    dec     bc
+    ld      a, b
+    or      c
+    jp      z, .mtcEnd
+    ld      a, [hl]
+    call    .mtcLetter
+    jr      c, .mtcClassify
+    ld      [MtcT2], a
+    inc     hl
+    dec     bc
+    ld      a, b
+    or      c
+    jp      z, .mtcEnd
+    ld      a, [hl]
+    call    .mtcLetter
+    jr      c, .mtcClassify
+    ld      [MtcT3], a
+    inc     hl
+    dec     bc
+    jr      .mtcClassify
+
+.mtcLetter:
+    ; uppercased letter in A with CF=0, or CF=1 if not a letter
+    and     0xDF
+    cp      'A'
+    jr      c, .mtcNotLet
+    cp      'Z' + 1
+    jr      nc, .mtcNotLet
+    or      a
+    ret
+.mtcNotLet:
+    scf
+    ret
+
+.mtcClassify:
+    ld      a, [MtcT1]
+    cp      'T'
+    jr      z, .mtcT
+    cp      'B'
+    jp      z, .mtcB
+    cp      'I'
+    jp      z, .mtcI
+    jp      .mtcSkipTag
+.mtcT:
+    ld      a, [MtcT2]
+    cp      'D'
+    jr      z, .mtcCellTag
+    cp      'H'
+    jr      z, .mtcCellTag
+    cp      'R'
+    jr      z, .mtcRowTag
+    cp      'A'
+    jr      z, .mtcTableTag
+    jp      .mtcSkipTag
+.mtcCellTag:
+    ld      a, [MtcT3]
+    or      a
+    jp      nz, .mtcSkipTag             ; THEAD etc. -- not a cell
+    call    .mtcFoldCell
+    ld      a, [MtcClose]
+    or      a
+    jr      nz, .mtcCellClose
+    ; Open <td>/<th>: claim the row's next column slot. MtcNext (not
+    ; MtcCol) carries the position across </td> closes -- the first
+    ; version derived the slot from MtcCol and restarted every cell
+    ; at column 0 after a close, collapsing all measurements into
+    ; TblColPx[0].
+    ld      a, [MtcNext]
+    cp      5
+    jr      c, .mtcColOk
+    ld      a, 4                        ; clamp to last column slot
+.mtcColOk:
+    ld      [MtcCol], a
+    ld      a, [MtcNext]
+    inc     a
+    ld      [MtcNext], a
+    ld      a, [MtcRow1]
+    or      a
+    jr      nz, .mtcSkipTag
+    ld      a, [MtcCells]
+    inc     a
+    ld      [MtcCells], a
+    jr      .mtcSkipTag
+.mtcCellClose:
+    ld      a, 0xFF
+    ld      [MtcCol], a
+    jr      .mtcSkipTag
+.mtcRowTag:
+    ld      a, [MtcT3]
+    or      a
+    jr      nz, .mtcSkipTag
+    call    .mtcFoldCell
+    ld      a, 0xFF
+    ld      [MtcCol], a
+    xor     a
+    ld      [MtcNext], a                ; new row -> back to column 0
+    ld      a, [MtcCells]
+    or      a
+    jr      z, .mtcSkipTag
+    ld      a, 1
+    ld      [MtcRow1], a                ; any <tr>/</tr> after cells ends row 1
+    jr      .mtcSkipTag
+.mtcTableTag:
+    ld      a, [MtcClose]
+    or      a
+    jr      z, .mtcSkipTag              ; nested <table> open: unsupported, skip
+    call    .mtcFoldCell
+    jp      .mtcEnd
+.mtcB:
+    ld      a, [MtcT2]
+    cp      'R'
+    jr      nz, .mtcSkipTag
+    ld      a, [MtcT3]
+    or      a
+    jr      nz, .mtcSkipTag
+    call    .mtcFoldCell                ; <br>: new measured segment, same cell
+    jr      .mtcSkipTag
+.mtcI:
+    ld      a, [MtcT2]
+    cp      'M'
+    jr      nz, .mtcSkipTag
+    ld      a, [MtcT3]
+    cp      'G'
+    jr      nz, .mtcSkipTag
+    ld      a, [MtcCol]
+    cp      0xFF
+    jr      z, .mtcSkipTag
+    ld      a, [MtcRun]
+    add     a, 5                        ; "[img]" placeholder width
+    cp      60
+    jr      c, .mtcImgOk
+    ld      a, 60
+.mtcImgOk:
+    ld      [MtcRun], a
+.mtcSkipTag:
+    ld      a, b
+    or      c
+    jr      z, .mtcEnd
+    ld      a, [hl]
+    inc     hl
+    dec     bc
+    cp      '>'
+    jr      nz, .mtcSkipTag
+    jp      .mtcLoop
+
+.mtcFoldCell:
+    ; TblColPx[MtcCol] = max(TblColPx[MtcCol], MtcRun * 8); reset run.
+    ; No-op when MtcCol is 0xFF. Preserves MtcCol.
+    push    hl
+    push    de
+    push    bc
+    ld      a, [MtcCol]
+    cp      5
+    jr      nc, .mfcDone                ; 0xFF (idle) or out of range
+    ld      e, a
+    ld      d, 0
+    ld      hl, TblColPx
+    add     hl, de
+    add     hl, de                      ; HL -> TblColPx[col]
+    ld      a, [MtcRun]
+    ld      e, a
+    ld      d, 0
+    ex      de, hl
+    add     hl, hl
+    add     hl, hl
+    add     hl, hl                      ; HL = run * 8 px
+    ex      de, hl                      ; DE = px, HL -> slot
+    ld      a, [hl]
+    ld      c, a
+    inc     hl
+    ld      b, [hl]
+    dec     hl                          ; BC = stored max
+    push    hl
+    ld      h, b
+    ld      l, c
+    or      a
+    sbc     hl, de                      ; stored - new
+    pop     hl
+    jr      nc, .mfcDone                ; stored >= new: keep
+    ld      [hl], e
+    inc     hl
+    ld      [hl], d
+.mfcDone:
+    xor     a
+    ld      [MtcRun], a
+    ld      [MtcWsPend], a
+    pop     bc
+    pop     de
+    pop     hl
+    ret
+
+.mtcEnd:
+    call    .mtcFoldCell
+    ld      a, [MtcCells]
     or      a
     jr      nz, .mtcGotN
-    ld      a, 1                           ; degenerate: empty table -> 1 col
-    jr      .mtcSet
+    ld      a, 1                        ; degenerate: empty table -> 1 col
+    jr      .mtcSetN
 .mtcGotN:
     cp      6
-    jr      c, .mtcSet
-    ld      a, 5                           ; clamp 6+ down to 5 (last layout)
-.mtcSet:
+    jr      c, .mtcSetN
+    ld      a, 5                        ; clamp 6+ down to 5 (last layout)
+.mtcSetN:
     ld      [HtmlTableColCount], a
     pop     bc
     pop     de
     pop     hl
     ret
+
+; Prescan scratch (MeasureTableCols) + shrink-to-fit layout RAM.
+; Placed in the free 0xC200..0xC9FF window the old runtime FontBuf
+; vacated when the font moved into the .COM image (see FontData).
+; All write-before-read: MeasureTableCols zeroes / fills everything at
+; each <table> open, SetTableColLayout writes the edges before any
+; border paint, so no load-time init is needed.
+MtcCol      equ 0xC200                  ; current cell slot, 0xFF = outside
+MtcRun      equ 0xC201                  ; current segment length in chars
+MtcWsPend   equ 0xC202                  ; 1 = ws seen since last glyph
+MtcRow1     equ 0xC203                  ; 1 once the first row has closed
+MtcCells    equ 0xC204                  ; first-row cell count
+MtcClose    equ 0xC205                  ; current tag is a closing tag
+MtcT1       equ 0xC206                  ; first 3 uppercased name letters
+MtcT2       equ 0xC207
+MtcT3       equ 0xC208
+MtcNext     equ 0xC209                  ; next column slot for this row
+TblColPx    equ 0xC20A                  ; 5 words: per-column content px
+StlX        equ 0xC214                  ; word: running X during build
+StlI        equ 0xC216                  ; logical column index
+StlN        equ 0xC217                  ; column count
+DynColStart equ 0xC218                  ; 5 words, visual order
+DynColEnd   equ 0xC222                  ; 5 words
+TblLeftPx   equ 0xC22C                  ; word: live table left edge
+TblRightPx  equ 0xC22E                  ; word: live table right edge
 
 ; DrawTableRuleHere: horizontal DGRAY rule at the current TextY across
 ; the table's width (from TABLE_LEFT_PX to TABLE_RIGHT_PX). Skipped
@@ -12950,9 +13530,29 @@ DrawTableRuleHere:
     ld      a, [TextY]
     cp      CONTENT_Y1 - TEXT_LINE_H + 2
     ret     nc
-    ld      c, a
-    ld      b, TABLE_LEFT_PX / 4
-    ld      d, (TABLE_RIGHT_PX - TABLE_LEFT_PX + 4) / 4
+    ld      c, a                        ; C = y
+    ; Width = (TblRightPx - TblLeftPx + 4) / 4 byte cols; X = TblLeftPx/4.
+    ; Dynamic (shrink-to-fit) tables move these edges per table; the
+    ; ROM layouts set them back to the full TABLE_LEFT/RIGHT_PX span.
+    ld      hl, [TblRightPx]
+    ld      de, [TblLeftPx]
+    or      a
+    sbc     hl, de
+    inc     hl
+    inc     hl
+    inc     hl
+    inc     hl
+    srl     h
+    rr      l
+    srl     h
+    rr      l
+    ld      d, l                        ; D = width in byte cols
+    ld      hl, [TblLeftPx]
+    srl     h
+    rr      l
+    srl     h
+    rr      l
+    ld      b, l                        ; B = x byte col
     ld      a, COL_DGRAY
     jp      DrawHLine
 
@@ -20636,6 +21236,8 @@ HtmlNextAlign:  db 0xFF                 ; scratch: align= parsed on current tag 
 HtmlNextDir:    db 0xFF                 ; scratch: dir= parsed on current tag
 HtmlNextBorder: db 0                    ; scratch: border= parsed on current tag (0 = no border)
 HtmlTableBorder: db 0                   ; live border flag for the open <table>
+HtmlNextWidth100: db 0                  ; scratch: width=100% parsed on current tag
+HtmlTableWidth100: db 0                 ; live width=100% flag for the open <table>
 
 ; ISO-8859-6 -> MSX font mapping + joining flags. Generated from
 ; `ISO-8859-6 font mapping/ISO-8859-6-font-mapping.csv` by
@@ -20674,7 +21276,12 @@ RuntimeRamBase:
 RmbLabelBuf:        ds 31
 BmpPal16:           ds 16
 ImgNameBuf:         ds IMG_NAME_MAX + 1
-ExtImgRemap:        ds 256
+; ExtImgRemap moved to the free 0xC200 window (old FontBuf RAM slot)
+; to keep RuntimeRamEnd below the FILEBUF_BASE budget after the
+; shrink-to-fit table scratch landed. Page-aligned at 0xC300 so any
+; HIGH(ExtImgRemap) indexing keeps working. Initialised once at boot
+; by BuildExtImgRemap (write-before-read).
+ExtImgRemap         equ 0xC300
 FormScreenX:        ds FORM_MAX * 2
 FormScreenY:        ds FORM_MAX
 FormScreenW:        ds FORM_MAX * 2

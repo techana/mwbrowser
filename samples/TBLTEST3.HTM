@@ -1,0 +1,44 @@
+<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 3.2//EN">
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=ISO-8859-6">
+<title>Table test 3</title>
+</head>
+<body>
+
+<h2>1. Narrow content, no width attr</h2>
+<table border="1">
+<tr><th>Id</th><th>Name</th></tr>
+<tr><td>1</td><td>Ada</td></tr>
+<tr><td>2</td><td>Borg</td></tr>
+</table>
+
+<h2>2. Same data, width=100%</h2>
+<table border="1" width="100%">
+<tr><th>Id</th><th>Name</th></tr>
+<tr><td>1</td><td>Ada</td></tr>
+<tr><td>2</td><td>Borg</td></tr>
+</table>
+
+<h2>3. Long text forces full width</h2>
+<table border="1">
+<tr><td>This cell carries a deliberately long sentence so the summed content width exceeds the page and the layout falls back to full width with wrapping.</td>
+<td>Second column.</td></tr>
+</table>
+
+<h2>4. Narrow RTL hugs the right margin</h2>
+<table border="1" dir="rtl">
+<tr><th>&#1575;&#1587;&#1605;</th><th>&#1593;&#1583;&#1583;</th></tr>
+<tr><td>&#1571;&#1581;&#1605;&#1583;</td><td>3</td></tr>
+<tr><td>&#1604;&#1610;&#1604;&#1609;</td><td>7</td></tr>
+</table>
+
+<h2>5. Narrow, no border</h2>
+<table border="0">
+<tr><th>k</th><th>v</th></tr>
+<tr><td>x</td><td>42</td></tr>
+</table>
+
+<p>Done.</p>
+</body>
+</html>
